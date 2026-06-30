@@ -31,12 +31,12 @@ CONFIG = {
 
         "east":{
             "enabled":True,
-             "incoming":2,
+            "incoming":2,
             "outgoing":2
         },
 
         "west":{
-            "enabled":False,
+            "enabled":True,
             "incoming":2,
             "outgoing":2
         }
