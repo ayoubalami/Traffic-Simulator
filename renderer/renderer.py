@@ -44,14 +44,52 @@ class Renderer:
 
         self.vehicles = []
         self.spawn_timer = 0
-        self.spawn_interval = .5  # seconds between spawns
+        self.spawn_interval = .25  # seconds between spawns
         # self.vehicles = [Vehicle("north", lane_index=0, distance_from_stop=20)]
 
     
-    def spawn_vehicle(self):
-        """Spawn a new vehicle on a random enabled incoming lane."""
-        import random
+    # def spawn_vehicle(self):
+    #     """Spawn a new vehicle on a random enabled incoming lane."""
+    #     import random
 
+    #     enabled_directions = [
+    #         d for d in ["north", "south", "east", "west"]
+    #         if self.config["roads"][d]["enabled"]
+    #     ]
+    #     if not enabled_directions:
+    #         return
+
+    #     direction = random.choice(enabled_directions)
+    #     road = self.config["roads"][direction]
+    #     lane_index = random.randint(0, road["incoming"] - 1)
+
+    #     # Start far from intersection (near screen edge)
+    #     # distance_from_stop: positive = behind stop line, moving toward intersection
+    #     w = self.config["window"]["width"]
+    #     h = self.config["window"]["height"]
+
+    #     # default distance in case of unexpected direction
+    #     distance = 0
+
+    #     if direction == "north":
+    #         # Vehicle at top edge, moving down toward intersection
+    #         # stop_y is around h//2, so distance ≈ h//2 puts vehicle near y=0
+    #         distance = h * 0.45  # near top edge
+    #     elif direction == "south":
+    #         distance = h * 0.45  # near bottom edge
+    #     elif direction == "west":
+    #         distance = w * 0.45  # near left edge
+    #     elif direction == "east":
+    #         distance = w * 0.45  # near right edge
+
+    #     vehicle = Vehicle(self.config, direction, lane_index, distance)
+    #     self.vehicles.append(vehicle)
+        
+        
+    def spawn_vehicle(self):
+        """Spawn a new vehicle. Tries multiple lanes if first choice is blocked."""
+        import random
+        distance = 0   
         enabled_directions = [
             d for d in ["north", "south", "east", "west"]
             if self.config["roads"][d]["enabled"]
@@ -59,29 +97,38 @@ class Renderer:
         if not enabled_directions:
             return
 
-        direction = random.choice(enabled_directions)
-        road = self.config["roads"][direction]
-        lane_index = random.randint(0, road["incoming"] - 1)
-
-        # Start far from intersection (near screen edge)
-        # distance_from_stop: positive = behind stop line, moving toward intersection
         w = self.config["window"]["width"]
         h = self.config["window"]["height"]
 
-        if direction == "north":
-            # Vehicle at top edge, moving down toward intersection
-            # stop_y is around h//2, so distance ≈ h//2 puts vehicle near y=0
-            distance = h * 0.45  # near top edge
-        elif direction == "south":
-            distance = h * 0.45  # near bottom edge
-        elif direction == "west":
-            distance = w * 0.45  # near left edge
-        elif direction == "east":
-            distance = w * 0.45  # near right edge
+        # Try up to 10 times to find a clear spawn spot
+        for _ in range(10):
+            direction = random.choice(enabled_directions)
+            road = self.config["roads"][direction]
+            lane_index = random.randint(0, road["incoming"] - 1)
 
-        vehicle = Vehicle(self.config, direction, lane_index, distance)
-        self.vehicles.append(vehicle)
-    
+            if direction == "north":
+                distance = h * 0.45
+            elif direction == "south":
+                distance = h * 0.45
+            elif direction == "west":
+                distance = w * 0.45
+            elif direction == "east":
+                distance = w * 0.45
+
+            # Check if spawn area is clear using safe following distance
+            blocked = False
+            for vehicle in self.vehicles:
+                if vehicle.road_direction == direction and vehicle.lane_index == lane_index:
+                    # Use the vehicle's safe following distance as minimum gap
+                    safe_gap = vehicle.get_safe_following_distance()
+                    if abs(vehicle.distance_from_stop - distance) < safe_gap:
+                        blocked = True
+                        break
+
+            if not blocked:
+                vehicle = Vehicle(self.config, direction, lane_index, distance)
+                self.vehicles.append(vehicle)
+                return  # Success
     
     def is_running(self):
         return self.running
@@ -94,6 +141,7 @@ class Renderer:
             if event.type == pygame.QUIT:
                 self.running = False
 
+ 
     def update(self, dt):
         self.light_controller.update(dt)
         
@@ -103,14 +151,25 @@ class Renderer:
             self.spawn_timer = 0
             self.spawn_vehicle()
 
-        # Update vehicles
-        for vehicle in self.vehicles:
-            vehicle.update(dt)
+        # Group vehicles by (direction, lane)
+        from collections import defaultdict
+        lanes = defaultdict(list)
+        for v in self.vehicles:
+            lanes[(v.road_direction, v.lane_index)].append(v)
 
-        # Remove off-screen vehicles
-        self.vehicles = [v for v in self.vehicles if not v.is_off_screen(self.config)]
-        # self.distance_from_stop -= self.speed * dt
+        # Sort each lane by distance_from_stop (ascending: closest to intersection first)
+        for key in lanes:
+            lanes[key].sort(key=lambda v: v.distance_from_stop)
 
+        # Update vehicles with awareness of vehicle ahead
+        for key, vehicles_in_lane in lanes.items():
+            for i, vehicle in enumerate(vehicles_in_lane):
+                vehicle_ahead = vehicles_in_lane[i - 1] if i > 0 else None
+                light_state = self.light_controller.get_state(vehicle.road_direction)
+                vehicle.update(dt, light_state, vehicle_ahead)
+
+        # Remove off-screen
+        self.vehicles = [v for v in self.vehicles if not v.is_off_screen()]
 
     def render(self):
 
@@ -539,7 +598,7 @@ class Renderer:
             surf = timer_font.render(text, True, timer_text_color)
             text_w, text_h = surf.get_size()
             pad = 4
-
+            bg_x, bg_y, bg_w, bg_h = 0, 0, 0, 0
             if direction == "north":
                 bg_x = x - text_w - pad * 2 - 6
                 bg_y = y + (box_long - text_h) // 2 - pad
@@ -790,46 +849,27 @@ class Renderer:
         import math
 
         for vehicle in self.vehicles:
-            rect = vehicle.get_rect(self.config)
+            rect = vehicle.get_rect()
             
-            # Draw vehicle body
-            pygame.draw.rect(self.screen, vehicle.color, rect)
-            pygame.draw.rect(self.screen, (20, 40, 80), rect, 1)  # outline
+            # Color: normal blue, darker if stopped
+            body_color = (150, 150, 200) if vehicle.stopped else vehicle.color
+            pygame.draw.rect(self.screen, body_color, rect)
+            pygame.draw.rect(self.screen, (20, 40, 80), rect, 1)
 
-            # Draw front indicator (small white triangle pointing forward)
+            points=[]
+            # Front indicator (white triangle)
             if vehicle.road_direction == "north":
-                # Moving down: front is bottom edge
-                front_x = rect.centerx
-                front_y = rect.bottom
-                pygame.draw.polygon(self.screen, (220, 220, 220), [
-                    (front_x, front_y + 4),
-                    (front_x - 4, front_y - 3),
-                    (front_x + 4, front_y - 3)
-                ])
+                front_x, front_y = rect.centerx, rect.bottom
+                points = [(front_x, front_y + 4), (front_x - 4, front_y - 3), (front_x + 4, front_y - 3)]
             elif vehicle.road_direction == "south":
-                # Moving up: front is top edge
-                front_x = rect.centerx
-                front_y = rect.top
-                pygame.draw.polygon(self.screen, (220, 220, 220), [
-                    (front_x, front_y - 4),
-                    (front_x - 4, front_y + 3),
-                    (front_x + 4, front_y + 3)
-                ])
+                front_x, front_y = rect.centerx, rect.top
+                points = [(front_x, front_y - 4), (front_x - 4, front_y + 3), (front_x + 4, front_y + 3)]
             elif vehicle.road_direction == "west":
-                # Moving right: front is right edge
-                front_x = rect.right
-                front_y = rect.centery
-                pygame.draw.polygon(self.screen, (220, 220, 220), [
-                    (front_x + 4, front_y),
-                    (front_x - 3, front_y - 4),
-                    (front_x - 3, front_y + 4)
-                ])
+                front_x, front_y = rect.right, rect.centery
+                points = [(front_x + 4, front_y), (front_x - 3, front_y - 4), (front_x - 3, front_y + 4)]
             elif vehicle.road_direction == "east":
-                # Moving left: front is left edge
-                front_x = rect.left
-                front_y = rect.centery
-                pygame.draw.polygon(self.screen, (220, 220, 220), [
-                    (front_x - 4, front_y),
-                    (front_x + 3, front_y - 4),
-                    (front_x + 3, front_y + 4)
-                ])
+                front_x, front_y = rect.left, rect.centery
+                points = [(front_x - 4, front_y), (front_x + 3, front_y - 4), (front_x + 3, front_y + 4)]
+            
+            pygame.draw.polygon(self.screen, (220, 220, 220), points)
+                

@@ -3,9 +3,9 @@ class TrafficLightController:
     
     def __init__(self, config):
         self.config = config
-        self.green_duration = 3.0
+        self.green_duration = 8.0
         self.yellow_duration = 1.0
-        self.red_duration = 3.0
+        self.red_duration = 8.0
         
         self.ns_state = "green"
         self.ew_state = "red"

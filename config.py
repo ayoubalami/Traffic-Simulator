@@ -1,8 +1,8 @@
 CONFIG = {
 
     "window": {
-        "width": 800,
-        "height": 600,
+        "width": 1000,
+        "height": 800,
         "title": "Traffic Simulator"
     },
 
@@ -13,11 +13,19 @@ CONFIG = {
         "yellow": (255,220,0)
     },
 
-    "lane_width": 45,
-    "vehicle_width": 25,
-    "vehicle_length": 50,
-    "vehicle_avg_speed": 60, #km/h
-
+    "lane_width": 40,
+     
+    "simulation": {
+        "pixels_per_meter": 10,  # 10 pixels = 1 meter
+        "time_scale": 1.0        # 1 simulation second = 1 real second
+    },
+    
+    "vehicle_defaults": {
+        "speed_kmh": 60 , # default speed: 50 km/h,
+        "vehicle_width": 20,
+        "vehicle_length": 40,
+    },
+    
     "roads": {
 
         "north":{
