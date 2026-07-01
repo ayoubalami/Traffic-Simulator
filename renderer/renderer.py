@@ -1,6 +1,7 @@
 import pygame
 
-from TrafficLight import TrafficLight
+from TrafficLight import  TrafficLightController
+from renderer.vehicle import Vehicle
 
 
 class Renderer:
@@ -22,21 +23,58 @@ class Renderer:
 
         self.running = True
 
-        # Initialize traffic lights for enabled roads
-        self.traffic_lights = {}
-        for direction in ["north", "south", "east", "west"]:
-            if config["roads"][direction]["enabled"]:
-                self.traffic_lights[direction] = TrafficLight()
+        self.light_controller = TrafficLightController(config)
+        self.traffic_lights = self.light_controller  # for compatibility with 
 
-        # Start north/south green, east/west red
-        if "north" in self.traffic_lights:
-            self.traffic_lights["north"].state = "green"
-        if "south" in self.traffic_lights:
-            self.traffic_lights["south"].state = "green"
-        if "east" in self.traffic_lights:
-            self.traffic_lights["east"].state = "red"
-        if "west" in self.traffic_lights:
-            self.traffic_lights["west"].state = "red"
+        # Initialize traffic lights for enabled roads
+        # self.traffic_lights = {}
+        # for direction in ["north", "south", "east", "west"]:
+        #     if config["roads"][direction]["enabled"]:
+        #         self.traffic_lights[direction] = TrafficLight()
+
+        # # Start north/south green, east/west red
+        # if "north" in self.traffic_lights:
+        #     self.traffic_lights["north"].state = "green"
+        # if "south" in self.traffic_lights:
+        #     self.traffic_lights["south"].state = "green"
+        # if "east" in self.traffic_lights:
+        #     self.traffic_lights["east"].state = "red"
+        # if "west" in self.traffic_lights:
+        #     self.traffic_lights["west"].state = "red"
+
+        self.vehicles = []
+        self.spawn_timer = 0
+        self.spawn_interval = 2.0  # seconds between spawns
+        # self.vehicles = [Vehicle("north", lane_index=0, distance_from_stop=20)]
+
+ 
+    def spawn_vehicle(self):
+        """Spawn a new vehicle on a random enabled incoming lane."""
+        import random
+
+        enabled_directions = [
+            d for d in ["north", "south", "east", "west"]
+            if self.config["roads"][d]["enabled"]
+        ]
+        if not enabled_directions:
+            return
+
+        direction = random.choice(enabled_directions)
+        road = self.config["roads"][direction]
+        lane_index = random.randint(0, road["incoming"] - 1)
+
+        # Start just off-screen so they enter immediately
+        if direction == "north":
+            distance = -self.config["window"]["height"] // 2 + 50  # near top edge, will enter soon
+        elif direction == "south":
+            distance = -self.config["window"]["height"] // 2 + 50
+        elif direction == "west":
+            distance = -self.config["window"]["width"] // 2 + 50
+        elif direction == "east":
+            distance = -self.config["window"]["width"] // 2 + 50
+
+        vehicle = Vehicle(direction, lane_index, distance)
+        self.vehicles.append(vehicle)
 
     def is_running(self):
         return self.running
@@ -45,41 +83,26 @@ class Renderer:
         pygame.quit()
 
     def handle_events(self):
-
         for event in pygame.event.get():
-
             if event.type == pygame.QUIT:
                 self.running = False
 
     def update(self, dt):
-        # Update all traffic lights
-        for light in self.traffic_lights.values():
-            light.update(dt)
-
-        # Simple paired logic: north/south share a cycle, east/west share opposite
-        # Check if we need to sync the pairs
-        ns_states = set()
-        ew_states = set()
+        self.light_controller.update(dt)
         
-        for direction, light in self.traffic_lights.items():
-            if direction in ["north", "south"]:
-                ns_states.add(light.state)
-            else:
-                ew_states.add(light.state)
+        # Spawn vehicles
+        self.spawn_timer += dt
+        if self.spawn_timer >= self.spawn_interval:
+            self.spawn_timer = 0
+            self.spawn_vehicle()
 
-        # If north/south just turned red, start east/west green
-        if ns_states == {"red"} and "green" not in ew_states and "yellow" not in ew_states:
-            for direction in ["east", "west"]:
-                if direction in self.traffic_lights:
-                    self.traffic_lights[direction].state = "green"
-                    self.traffic_lights[direction].timer = 0
+        # Update vehicles
+        for vehicle in self.vehicles:
+            vehicle.update(dt)
 
-        # If east/west just turned red, start north/south green
-        if ew_states == {"red"} and "green" not in ns_states and "yellow" not in ns_states:
-            for direction in ["north", "south"]:
-                if direction in self.traffic_lights:
-                    self.traffic_lights[direction].state = "green"
-                    self.traffic_lights[direction].timer = 0
+        # Remove off-screen vehicles
+        self.vehicles = [v for v in self.vehicles if not v.is_off_screen(self.config)]
+    
     def render(self):
 
         colors = self.config["colors"]
@@ -89,6 +112,8 @@ class Renderer:
         self.draw_roads()
         self.draw_lane_markings()
         self.draw_stop_lines()      # ← add this
+        self.draw_lane_arrows()     # ← add this
+        self.draw_vehicles()        # ← add this
         self.draw_traffic_lights()
 
         pygame.display.flip()
@@ -197,7 +222,6 @@ class Renderer:
                 )
             )
             
-     
     def draw_lane_markings(self):
 
         colors = self.config["colors"]
@@ -422,8 +446,7 @@ class Renderer:
                 gap_length=10,
                 width=2
             ) 
-       
-       
+
 
     def draw_traffic_lights(self):
         """Draw 3-color traffic light controllers on the right side of each road.
@@ -477,14 +500,8 @@ class Renderer:
             "green": (15, 50, 15)
         }
 
-        # State durations (must match TrafficLight.update() timing)
-        state_durations = {"green": 3.0, "yellow": 1.0, "red": 3.0}
-
-        def get_remaining_time(light):
-            """Calculate remaining seconds for current light state."""
-            duration = state_durations[light.state]
-            remaining = duration - light.timer
-            return max(0.0, remaining)
+        # Get remaining time from controller
+        remaining = self.light_controller.get_remaining_time()
 
         def draw_light_box(x, y, direction, light_order, light_state):
             """Draw the light housing and 3 lights."""
@@ -513,26 +530,17 @@ class Renderer:
             surf = timer_font.render(text, True, timer_text_color)
             text_w, text_h = surf.get_size()
             pad = 4
-            bg_x= bg_y = 0  # Initialize to avoid reference before assignment
-            # Place timer on the side away from the road
+
             if direction == "north":
-                # Light is on the LEFT (west) side of road
-                # Timer goes further LEFT, away from road
                 bg_x = x - text_w - pad * 2 - 6
                 bg_y = y + (box_long - text_h) // 2 - pad
             elif direction == "south":
-                # Light is on the RIGHT (east) side of road
-                # Timer goes further RIGHT, away from road
                 bg_x = x + box_short + 6
                 bg_y = y + (box_long - text_h) // 2 - pad
             elif direction == "west":
-                # Light is BELOW (south) the road
-                # Timer goes further DOWN, away from road
                 bg_x = x + (box_long - text_w) // 2 - pad
                 bg_y = y + box_short + 6
             elif direction == "east":
-                # Light is ABOVE (north) the road
-                # Timer goes further UP, away from road
                 bg_x = x + (box_long - text_w) // 2 - pad
                 bg_y = y - text_h - pad * 2 - 6
 
@@ -543,45 +551,45 @@ class Renderer:
             pygame.draw.rect(self.screen, (60, 60, 60), (bg_x, bg_y, bg_w, bg_h), 1)
             self.screen.blit(surf, (bg_x + pad, bg_y + pad))
         
-        
-        for direction, light in self.traffic_lights.items():
+        # Loop through all directions, get state from controller
+        for direction in ["north", "south", "east", "west"]:
             road = roads[direction]
             if not road["enabled"]:
                 continue
 
+            light_state = self.light_controller.get_state(direction)
             total_lanes = road["incoming"] + road["outgoing"]
             road_width = total_lanes * lane_width
-
-            remaining = get_remaining_time(light)
 
             if direction == "north":
                 road_left = cx - road_width / 2
                 box_x = road_left - box_short - side_offset
                 box_y = cy - ix_half_height - box_long - approach_offset
-                draw_light_box(box_x, box_y, direction, ["green", "yellow", "red"], light.state)
+                draw_light_box(box_x, box_y, direction, ["green", "yellow", "red"], light_state)
                 draw_timer(box_x, box_y, direction, remaining)
 
             elif direction == "south":
                 road_right = cx + road_width / 2
                 box_x = road_right + side_offset
                 box_y = cy + ix_half_height + approach_offset
-                draw_light_box(box_x, box_y, direction, ["red", "yellow", "green"], light.state)
+                draw_light_box(box_x, box_y, direction, ["red", "yellow", "green"], light_state)
                 draw_timer(box_x, box_y, direction, remaining)
 
             elif direction == "west":
                 road_bottom = cy + road_width / 2
                 box_x = cx - ix_half_width - box_long - approach_offset
                 box_y = road_bottom + side_offset
-                draw_light_box(box_x, box_y, direction, ["green", "yellow", "red"], light.state)
-                draw_timer(box_x, box_y, direction  , remaining)
+                draw_light_box(box_x, box_y, direction, ["green", "yellow", "red"], light_state)
+                draw_timer(box_x, box_y, direction, remaining)
 
             elif direction == "east":
                 road_top = cy - road_width / 2
                 box_x = cx + ix_half_width + approach_offset
                 box_y = road_top - box_short - side_offset
-                draw_light_box(box_x, box_y, direction, ["red", "yellow", "green"], light.state)
-                draw_timer(box_x, box_y, direction, remaining)
-                
+                draw_light_box(box_x, box_y, direction, ["red", "yellow", "green"], light_state)
+                draw_timer(box_x, box_y, direction, remaining)     
+  
+         
     def draw_stop_lines(self):
         """Draw white stop lines across each incoming lane, just before the intersection."""
         colors = self.config["colors"]
@@ -675,3 +683,144 @@ class Renderer:
                 (stop_x, center_y),
                 line_thickness
             )
+
+    def draw_lane_arrows(self):
+        """Draw straight white arrows on each incoming lane, near the stop line."""
+        import math
+
+        colors = self.config["colors"]
+        w = self.config["window"]["width"]
+        h = self.config["window"]["height"]
+        cx = w // 2
+        cy = h // 2
+        lane_width = self.config["lane_width"]
+        roads = self.config["roads"]
+
+        # Calculate intersection dimensions
+        v_width = 0
+        if roads["north"]["enabled"]:
+            v_width = max(v_width, lane_width * (roads["north"]["incoming"] + roads["north"]["outgoing"]))
+        if roads["south"]["enabled"]:
+            v_width = max(v_width, lane_width * (roads["south"]["incoming"] + roads["south"]["outgoing"]))
+
+        h_width = 0
+        if roads["east"]["enabled"]:
+            h_width = max(h_width, lane_width * (roads["east"]["incoming"] + roads["east"]["outgoing"]))
+        if roads["west"]["enabled"]:
+            h_width = max(h_width, lane_width * (roads["west"]["incoming"] + roads["west"]["outgoing"]))
+
+        ix_half_width = v_width / 2
+        ix_half_height = h_width / 2
+
+        arrow_color = colors["white"]
+        shaft_len = 10
+        head_len = 5
+
+        def draw_straight_arrow(surface, color, center, angle):
+            """Draw a straight arrow centered at (x,y), pointing at angle (degrees)."""
+            rad = math.radians(angle)
+            dx = math.cos(rad)
+            dy = math.sin(rad)
+
+            # Shaft
+            x1 = center[0] - shaft_len * dx
+            y1 = center[1] - shaft_len * dy
+            x2 = center[0] + shaft_len * dx
+            y2 = center[1] + shaft_len * dy
+            pygame.draw.line(surface, color, (x1, y1), (x2, y2), 2)
+
+            # Arrowhead
+            left = math.radians(angle + 150)
+            right = math.radians(angle - 150)
+            pygame.draw.line(surface, color, (x2, y2),
+                            (x2 + head_len * math.cos(left), y2 + head_len * math.sin(left)), 2)
+            pygame.draw.line(surface, color, (x2, y2),
+                            (x2 + head_len * math.cos(right), y2 + head_len * math.sin(right)), 2)
+
+        def draw_road_arrows(direction, road, stop_pos, arrow_offset, lane_start_idx, angle):
+            """Draw straight arrows for all incoming lanes of one road."""
+            if not road["enabled"] or road["incoming"] == 0:
+                return
+
+            total_lanes = road["incoming"] + road["outgoing"]
+            road_width = total_lanes * lane_width
+
+            for i in range(road["incoming"]):
+                lane_idx = lane_start_idx + i
+                lane_center = lane_idx * lane_width + lane_width / 2
+
+                if direction in ("north", "south"):
+                    # Vertical road: lane_center_x is offset from road_left
+                    road_left = cx - road_width / 2
+                    ax = road_left + lane_center
+                    ay = stop_pos + arrow_offset
+                else:
+                    # Horizontal road: lane_center_y is offset from road_top
+                    road_top = cy - road_width / 2
+                    ax = stop_pos + arrow_offset
+                    ay = road_top + lane_center
+
+                draw_straight_arrow(self.screen, arrow_color, (ax, ay), angle)
+
+        # North: move down, arrow points down (90°), above stop line
+        draw_road_arrows("north", roads["north"], cy - ix_half_height, -30, 0, 90)
+
+        # South: move up, arrow points up (-90°), below stop line
+        draw_road_arrows("south", roads["south"], cy + ix_half_height, 30, roads["south"]["outgoing"], -90)
+
+        # West: move right, arrow points right (0°), left of stop line
+        draw_road_arrows("west", roads["west"], cx - ix_half_width, -30, roads["west"]["outgoing"], 0)
+
+        # East: move left, arrow points left (180°), right of stop line
+        draw_road_arrows("east", roads["east"], cx + ix_half_width, 30, 0, 180)
+
+        
+
+    def draw_vehicles(self):
+        """Draw all vehicles as colored rectangles with a front indicator."""
+        import math
+
+        for vehicle in self.vehicles:
+            rect = vehicle.get_rect(self.config)
+            
+            # Draw vehicle body
+            pygame.draw.rect(self.screen, vehicle.color, rect)
+            pygame.draw.rect(self.screen, (20, 40, 80), rect, 1)  # outline
+
+            # Draw front indicator (small white triangle pointing forward)
+            if vehicle.road_direction == "north":
+                # Moving down: front is bottom edge
+                front_x = rect.centerx
+                front_y = rect.bottom
+                pygame.draw.polygon(self.screen, (220, 220, 220), [
+                    (front_x, front_y + 4),
+                    (front_x - 4, front_y - 3),
+                    (front_x + 4, front_y - 3)
+                ])
+            elif vehicle.road_direction == "south":
+                # Moving up: front is top edge
+                front_x = rect.centerx
+                front_y = rect.top
+                pygame.draw.polygon(self.screen, (220, 220, 220), [
+                    (front_x, front_y - 4),
+                    (front_x - 4, front_y + 3),
+                    (front_x + 4, front_y + 3)
+                ])
+            elif vehicle.road_direction == "west":
+                # Moving right: front is right edge
+                front_x = rect.right
+                front_y = rect.centery
+                pygame.draw.polygon(self.screen, (220, 220, 220), [
+                    (front_x + 4, front_y),
+                    (front_x - 3, front_y - 4),
+                    (front_x - 3, front_y + 4)
+                ])
+            elif vehicle.road_direction == "east":
+                # Moving left: front is left edge
+                front_x = rect.left
+                front_y = rect.centery
+                pygame.draw.polygon(self.screen, (220, 220, 220), [
+                    (front_x - 4, front_y),
+                    (front_x + 3, front_y - 4),
+                    (front_x + 3, front_y + 4)
+                ])
