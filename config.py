@@ -13,7 +13,10 @@ CONFIG = {
         "yellow": (255,220,0)
     },
 
-    "lane_width": 50,
+    "lane_width": 45,
+    "vehicle_width": 25,
+    "vehicle_length": 50,
+    "vehicle_avg_speed": 60, #km/h
 
     "roads": {
 

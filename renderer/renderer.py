@@ -44,10 +44,10 @@ class Renderer:
 
         self.vehicles = []
         self.spawn_timer = 0
-        self.spawn_interval = 2.0  # seconds between spawns
+        self.spawn_interval = .5  # seconds between spawns
         # self.vehicles = [Vehicle("north", lane_index=0, distance_from_stop=20)]
 
- 
+    
     def spawn_vehicle(self):
         """Spawn a new vehicle on a random enabled incoming lane."""
         import random
@@ -63,19 +63,26 @@ class Renderer:
         road = self.config["roads"][direction]
         lane_index = random.randint(0, road["incoming"] - 1)
 
-        # Start just off-screen so they enter immediately
+        # Start far from intersection (near screen edge)
+        # distance_from_stop: positive = behind stop line, moving toward intersection
+        w = self.config["window"]["width"]
+        h = self.config["window"]["height"]
+
         if direction == "north":
-            distance = -self.config["window"]["height"] // 2 + 50  # near top edge, will enter soon
+            # Vehicle at top edge, moving down toward intersection
+            # stop_y is around h//2, so distance ≈ h//2 puts vehicle near y=0
+            distance = h * 0.45  # near top edge
         elif direction == "south":
-            distance = -self.config["window"]["height"] // 2 + 50
+            distance = h * 0.45  # near bottom edge
         elif direction == "west":
-            distance = -self.config["window"]["width"] // 2 + 50
+            distance = w * 0.45  # near left edge
         elif direction == "east":
-            distance = -self.config["window"]["width"] // 2 + 50
+            distance = w * 0.45  # near right edge
 
-        vehicle = Vehicle(direction, lane_index, distance)
+        vehicle = Vehicle(self.config, direction, lane_index, distance)
         self.vehicles.append(vehicle)
-
+    
+    
     def is_running(self):
         return self.running
 
@@ -102,7 +109,9 @@ class Renderer:
 
         # Remove off-screen vehicles
         self.vehicles = [v for v in self.vehicles if not v.is_off_screen(self.config)]
-    
+        # self.distance_from_stop -= self.speed * dt
+
+
     def render(self):
 
         colors = self.config["colors"]
