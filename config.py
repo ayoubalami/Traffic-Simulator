@@ -1,57 +1,29 @@
 CONFIG = {
-
     "window": {
-        "width": 1000,
+        "width": 1200,
         "height": 800,
         "title": "Traffic Simulator"
     },
-
     "colors": {
         "background": (60, 150, 60),
         "road": (70, 70, 70),
-        "white": (255,255,255),
-        "yellow": (255,220,0)
+        "white": (255, 255, 255),
+        "yellow": (255, 220, 0)
     },
-
-    "lane_width": 40,
-     
+    "lane_width": 30,
     "simulation": {
-        "pixels_per_meter": 10,  # 10 pixels = 1 meter
-        "time_scale": 1.0        # 1 simulation second = 1 real second
+        "pixels_per_meter": 10,
+        "time_scale": 1.0
     },
-    
     "vehicle_defaults": {
-        "speed_kmh": 70 , # default speed: 50 km/h,
-        "vehicle_width": 20,
-        "vehicle_length": 40,
+        "speed_kmh": 60,
+        "vehicle_width": 15,
+        "vehicle_length": 30
     },
-    
     "roads": {
-
-        "north":{
-            "enabled":True,
-            "incoming":2,
-            "outgoing":2
-        },
-
-        "south":{
-            "enabled":True,
-         "incoming":2,
-            "outgoing":2
-        },
-
-        "east":{
-            "enabled":True,
-            "incoming":2,
-            "outgoing":2
-        },
-
-        "west":{
-            "enabled":False,
-            "incoming":2,
-            "outgoing":2
-        }
-
+        "north": {"enabled": True, "incoming": 2, "outgoing": 2},
+        "south": {"enabled": True, "incoming": 2, "outgoing": 2},
+        "east": {"enabled": True, "incoming": 2, "outgoing": 2},
+        "west": {"enabled": False, "incoming": 2, "outgoing": 2}
     }
-
 }

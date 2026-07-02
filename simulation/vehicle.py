@@ -18,44 +18,31 @@ class Vehicle:
         self.current_speed = self.speed
         self.stopped = False
         
-        # Physics
         self.acceleration = 80.0
         self.min_speed = 0.0
-        self.reaction_time = 0.5  # seconds (human reaction + system delay)
-        self.deceleration = 6.5   # m/s² (comfortable braking, ~0.35g)
+        self.reaction_time = 0.5
+        self.deceleration = 6.5
        
         ppm = self.config.get("simulation", {}).get("pixels_per_meter", 10)
-        self.braking = self.deceleration * ppm  # pixels/s²
+        self.braking = self.deceleration * ppm
        
         self.cleared_intersection = False
-        self.desired_gap = self.length + 10  # desired gap to vehicle ahead in pixels
+        self.desired_gap = self.length + 10
         self.stop_margin = 10
 
     def get_safe_following_distance(self):
-        """Calculate safe following distance based on current speed.
-        d = v * t_reaction + v² / (2 * a_brake)
-        """
-        # Reaction distance: speed * reaction_time
         reaction_dist = self.current_speed * self.reaction_time
-        
-        # Braking distance: v² / (2 * a)
         braking_dist = (self.current_speed ** 2) / (2 * self.braking)
-        
-        # Total safe distance (plus small buffer)
-        return reaction_dist + braking_dist +  self.desired_gap  # 10px buffer
-    
-    
+        return reaction_dist + braking_dist + self.desired_gap
 
     def _kmh_to_pixels_per_second(self, kmh):
         pixels_per_meter = self.config.get("simulation", {}).get("pixels_per_meter", 10)
         meters_per_second = kmh / 3.6
         return meters_per_second * pixels_per_meter
  
- 
     def update(self, dt, light_state, vehicle_ahead=None):
         dist_to_stop = self.distance_from_stop
 
-        # Once cleared intersection, free movement
         if dist_to_stop < -self.length:
             self.cleared_intersection = True
 
@@ -65,22 +52,25 @@ class Vehicle:
             self.distance_from_stop -= self.current_speed * dt
             return
 
-        # --- Distance to vehicle ahead ---
+        if dist_to_stop < 0:
+            self.cleared_intersection = True
+            self.stopped = False
+            self.current_speed = min(self.speed, self.current_speed + self.acceleration * dt)
+            self.distance_from_stop -= self.current_speed * dt
+            return
+
         dist_to_ahead = float('inf')
         ahead_speed = self.speed
         if vehicle_ahead is not None:
             dist_to_ahead = self.distance_from_stop - vehicle_ahead.distance_from_stop - self.length
             ahead_speed = vehicle_ahead.current_speed
 
-        # HARD SAFETY: prevent overlap at all costs
         if vehicle_ahead is not None and dist_to_ahead < 5:
-            # Force stop immediately, snap to safe distance
             self.current_speed = 0
             self.distance_from_stop = vehicle_ahead.distance_from_stop + self.length + 5
             self.stopped = True
-            return  # Skip all other logic
+            return
 
-        # Target speed from traffic light
         target_speed = self.speed
 
         if light_state == "red":
@@ -93,38 +83,31 @@ class Vehicle:
                     target_speed = 0
 
         elif light_state == "yellow":
-        
             dist_to_actual_stop = dist_to_stop - self.stop_margin
             braking_dist = (self.current_speed ** 2) / (2 * self.braking)
             
             if dist_to_stop <= 0:
                 target_speed = self.speed
                 self.cleared_intersection = True
-            elif braking_dist >= dist_to_actual_stop+10:
-                # Cannot stop in time — go through
+            elif braking_dist >= dist_to_actual_stop + 10:
                 target_speed = self.speed
             else:
-                # Can stop — decelerate progressively based on distance
-                # ratio = 0 at stop line, 1 when far away
-                ratio = max(0, min(1, dist_to_actual_stop / (braking_dist * 2+0.000002)))
-                # Target: 0 when close, full speed when far
-                target_speed = self.speed *.5* ratio
+                if dist_to_actual_stop <= braking_dist + 20:
+                    target_speed = 0
+                else:
+                    ratio = max(0, min(1, dist_to_actual_stop / (braking_dist * 2 + 0.000002)))
+                    target_speed = self.speed * 0.5 * ratio
 
-        # --- Vehicle ahead: speed-dependent safe distance ---
         if vehicle_ahead is not None:
             safe_dist = self.get_safe_following_distance()
             
             if dist_to_ahead <= 15:
-                # Very close: stop
                 target_speed = 0
             elif dist_to_ahead < safe_dist:
-                # Within safe distance: slow down proportionally
                 ratio = max(0, (dist_to_ahead - 15) / (safe_dist - 15))
-                # Target: ahead_speed when ratio=0, full speed when ratio=1
                 follow_speed = ahead_speed + (self.speed - ahead_speed) * ratio
                 target_speed = min(target_speed, follow_speed)
 
-        # Apply acceleration/braking
         if self.current_speed < target_speed:
             self.current_speed = min(target_speed, self.current_speed + self.acceleration * dt)
             self.stopped = False
@@ -132,11 +115,8 @@ class Vehicle:
             self.current_speed = max(target_speed, self.current_speed - self.braking * dt)
             self.stopped = self.current_speed == 0
 
-        # Move
         self.distance_from_stop -= self.current_speed * dt
 
-        # Hard clamp at stop line
-        # *******************
         if (light_state == "red" 
             and 0 < self.distance_from_stop < self.stop_margin 
             and not self.cleared_intersection):
@@ -144,9 +124,7 @@ class Vehicle:
             self.current_speed = 0
             self.stopped = True
     
-    # get_rect() and is_off_screen() stay the same as your code
     def get_rect(self):
-        """Compute pygame.Rect based on road geometry and position."""
         w = self.config["window"]["width"]
         h = self.config["window"]["height"]
         cx = w // 2
@@ -204,7 +182,6 @@ class Vehicle:
         return pygame.Rect(0, 0, 0, 0)
 
     def is_off_screen(self):
-        """Check if vehicle has driven past the screen edge."""
         w = self.config["window"]["width"]
         h = self.config["window"]["height"]
         cx = w // 2
