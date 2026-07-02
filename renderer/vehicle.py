@@ -27,10 +27,9 @@ class Vehicle:
         ppm = self.config.get("simulation", {}).get("pixels_per_meter", 10)
         self.braking = self.deceleration * ppm  # pixels/s²
        
-        self.snap_threshold = 1.5
         self.cleared_intersection = False
-        self.desired_gap = self.length 
-        self.stop_margin = 8
+        self.desired_gap = self.length + 10  # desired gap to vehicle ahead in pixels
+        self.stop_margin = 10
 
     def get_safe_following_distance(self):
         """Calculate safe following distance based on current speed.
@@ -85,17 +84,31 @@ class Vehicle:
         target_speed = self.speed
 
         if light_state == "red":
-            if dist_to_stop <= 0:
+            if dist_to_stop <= self.stop_margin:
                 target_speed = 0
             else:
+                dist_to_actual_stop = dist_to_stop - self.stop_margin
                 braking_dist = (self.current_speed ** 2) / (2 * self.braking)
-                if braking_dist >= dist_to_stop:
+                if braking_dist >= dist_to_actual_stop:
                     target_speed = 0
 
         elif light_state == "yellow":
+        
+            dist_to_actual_stop = dist_to_stop - self.stop_margin
             braking_dist = (self.current_speed ** 2) / (2 * self.braking)
-            if braking_dist >= dist_to_stop:
-                target_speed = 0
+            
+            if dist_to_stop <= 0:
+                target_speed = self.speed
+                self.cleared_intersection = True
+            elif braking_dist >= dist_to_actual_stop+10:
+                # Cannot stop in time — go through
+                target_speed = self.speed
+            else:
+                # Can stop — decelerate progressively based on distance
+                # ratio = 0 at stop line, 1 when far away
+                ratio = max(0, min(1, dist_to_actual_stop / (braking_dist * 2+0.000002)))
+                # Target: 0 when close, full speed when far
+                target_speed = self.speed *.5* ratio
 
         # --- Vehicle ahead: speed-dependent safe distance ---
         if vehicle_ahead is not None:
@@ -124,8 +137,10 @@ class Vehicle:
 
         # Hard clamp at stop line
         # *******************
-        if light_state == "red" and self.distance_from_stop < self.stop_margin  and not self.cleared_intersection:
-            # self.distance_from_stop = self.stop_margin
+        if (light_state == "red" 
+            and 0 < self.distance_from_stop < self.stop_margin 
+            and not self.cleared_intersection):
+            self.distance_from_stop = self.stop_margin
             self.current_speed = 0
             self.stopped = True
     

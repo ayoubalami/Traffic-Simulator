@@ -21,7 +21,7 @@ CONFIG = {
     },
     
     "vehicle_defaults": {
-        "speed_kmh": 60 , # default speed: 50 km/h,
+        "speed_kmh": 70 , # default speed: 50 km/h,
         "vehicle_width": 20,
         "vehicle_length": 40,
     },
@@ -47,7 +47,7 @@ CONFIG = {
         },
 
         "west":{
-            "enabled":True,
+            "enabled":False,
             "incoming":2,
             "outgoing":2
         }
