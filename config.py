@@ -13,7 +13,8 @@ CONFIG = {
     "lane_width": 30,
     "simulation": {
         "pixels_per_meter": 10,
-        "time_scale": 1.0
+        "time_scale": 1.0,
+        "right_turn_chance": 0.5
     },
     "vehicle_defaults": {
         "speed_kmh": 60,
