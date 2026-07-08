@@ -14,7 +14,7 @@ CONFIG = {
     "simulation": {
         "pixels_per_meter": 10,
         "time_scale": 1.0,
-        "right_turn_chance": 0.5
+        "right_turn_chance": .5
     },
     "vehicle_defaults": {
         "speed_kmh": 60,
@@ -22,9 +22,9 @@ CONFIG = {
         "vehicle_length": 30
     },
     "roads": {
-        "north": {"enabled": True, "incoming": 2, "outgoing": 2},
-        "south": {"enabled": True, "incoming": 2, "outgoing": 2},
-        "east": {"enabled": True, "incoming": 2, "outgoing": 2},
-        "west": {"enabled": False, "incoming": 2, "outgoing": 2}
+        "north": {"enabled": True, "incoming": 2, "outgoing": 2 ,"inverse": "south"},
+        "south": {"enabled": True, "incoming": 2, "outgoing": 2 ,"inverse": "north"},
+        "east": {"enabled": True, "incoming": 2, "outgoing": 2 ,"inverse": "west"},
+        "west": {"enabled": False, "incoming": 2, "outgoing": 2 ,"inverse": "east"}
     }
 }

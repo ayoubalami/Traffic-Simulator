@@ -50,11 +50,11 @@ class Vehicle:
         self.is_turning_vehicle = False
         self.turn_target_direction = None
 
-        right_turn_chance = config.get("simulation", {}).get("right_turn_chance", 0.15)
+        right_turn_chance = config.get("simulation", {}).get("right_turn_chance", 1)
         roads = config["roads"]
         target_direction = self.RIGHT_TURN_TARGET.get(self.road_direction)
 
-        if target_direction and roads.get(target_direction, {}).get("enabled", False):
+        if target_direction and  roads.get(  roads.get(target_direction, {}).get("inverse", False)).get("enabled", False):
             if self.lane_index == self._right_lane_index(self.road_direction):
                 if random.random() < right_turn_chance:
                     self.is_turning_vehicle = True
@@ -114,18 +114,20 @@ class Vehicle:
         stop line it was already committed to crossing.
         """
         new_direction = self.turn_target_direction
-
         self.road_direction = new_direction
         self.lane_index = self._right_lane_index(new_direction)
 
         ix_half_width, ix_half_height = self._intersection_half_dims()
+
+        # ix_half_width, ix_half_height = ix_half_width , ix_half_height - self.length
+
         # Vertical roads (north/south) are as deep as the horizontal roads
         # are wide, and vice versa.
         half_dim = ix_half_height if new_direction in ("north", "south") else ix_half_width
 
         # Negative distance_from_stop == already past that road's stop line,
         # so it won't re-check that road's light or suddenly brake for it.
-        self.distance_from_stop = -(half_dim + self.length)
+        self.distance_from_stop = -(half_dim + self.length * 2.5)
         self.has_turned = True
  
     def update(self, dt, light_state, vehicle_ahead=None):
@@ -140,7 +142,8 @@ class Vehicle:
             self.distance_from_stop -= self.current_speed * dt
             return
 
-        if dist_to_stop < 0:
+        
+        if dist_to_stop < -self.width :
             if self.is_turning_vehicle and not self.has_turned:
                 self._turn_right()
             self.cleared_intersection = True
@@ -149,6 +152,8 @@ class Vehicle:
             self.distance_from_stop -= self.current_speed * dt
             return
 
+        
+        
         dist_to_ahead = float('inf')
         ahead_speed = self.speed
         if vehicle_ahead is not None:
