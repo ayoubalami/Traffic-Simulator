@@ -27,6 +27,7 @@ class Renderer:
         
         self.draw_roads()
         self.draw_lane_markings()
+        self.draw_crosswalks()
         self.draw_stop_lines()
         self.draw_lane_arrows()
         self.draw_vehicles(render_data["vehicles"])
@@ -37,26 +38,43 @@ class Renderer:
         self.clock.tick(60)
     
     def draw_vehicles(self, vehicles):
+        colors = self.config["colors"]
+        signal_color = colors.get("signal_amber", (255, 220, 0))
+        signal_outline = (80, 45, 0)
+
         for v in vehicles:
             rect = v.get_rect()
             body_color = (150, 150, 200) if v.stopped else v.color
-            pygame.draw.rect(self.screen, body_color, rect)
-            pygame.draw.rect(self.screen, (20, 40, 80), rect, 1)
-            
-            points = []
-            if v.road_direction == "north":
-                fx, fy = rect.centerx, rect.bottom
-                points = [(fx, fy+4), (fx-4, fy-3), (fx+4, fy-3)]
-            elif v.road_direction == "south":
-                fx, fy = rect.centerx, rect.top
-                points = [(fx, fy-4), (fx-4, fy+3), (fx+4, fy+3)]
-            elif v.road_direction == "west":
-                fx, fy = rect.right, rect.centery
-                points = [(fx+4, fy), (fx-3, fy-4), (fx-3, fy+4)]
-            elif v.road_direction == "east":
-                fx, fy = rect.left, rect.centery
-                points = [(fx-4, fy), (fx+3, fy-4), (fx+3, fy+4)]
+
+            corners = v.get_corners() if hasattr(v, "get_corners") else None
+            if corners:
+                pygame.draw.polygon(self.screen, body_color, corners)
+                pygame.draw.polygon(self.screen, (20, 40, 80), corners, 1)
+                points = v.get_front_indicator()
+            else:
+                pygame.draw.rect(self.screen, body_color, rect)
+                pygame.draw.rect(self.screen, (20, 40, 80), rect, 1)
+
+                points = []
+                if v.road_direction == "north":
+                    fx, fy = rect.centerx, rect.bottom
+                    points = [(fx, fy+4), (fx-4, fy-3), (fx+4, fy-3)]
+                elif v.road_direction == "south":
+                    fx, fy = rect.centerx, rect.top
+                    points = [(fx, fy-4), (fx-4, fy+3), (fx+4, fy+3)]
+                elif v.road_direction == "west":
+                    fx, fy = rect.right, rect.centery
+                    points = [(fx+4, fy), (fx-3, fy-4), (fx-3, fy+4)]
+                elif v.road_direction == "east":
+                    fx, fy = rect.left, rect.centery
+                    points = [(fx-4, fy), (fx+3, fy-4), (fx+3, fy+4)]
             pygame.draw.polygon(self.screen, (220, 220, 220), points)
+
+            if hasattr(v, "is_right_signal_on") and v.is_right_signal_on():
+                right_points = v.get_right_indicator() if hasattr(v, "get_right_indicator") else None
+                if right_points:
+                    pygame.draw.polygon(self.screen, signal_color, right_points)
+                    pygame.draw.polygon(self.screen, signal_outline, right_points, 1)
         
     def draw_metrics(self, metrics):
         y = 10
@@ -182,21 +200,7 @@ class Renderer:
 
         roads = self.config["roads"]
 
-        # Calculate intersection dimensions based on enabled perpendicular roads
-        v_width = 0
-        if roads["north"]["enabled"]:
-            v_width = max(v_width, lane_width * (roads["north"]["incoming"] + roads["north"]["outgoing"]))
-        if roads["south"]["enabled"]:
-            v_width = max(v_width, lane_width * (roads["south"]["incoming"] + roads["south"]["outgoing"]))
-        
-        h_width = 0
-        if roads["east"]["enabled"]:
-            h_width = max(h_width, lane_width * (roads["east"]["incoming"] + roads["east"]["outgoing"]))
-        if roads["west"]["enabled"]:
-            h_width = max(h_width, lane_width * (roads["west"]["incoming"] + roads["west"]["outgoing"]))
-        
-        ix_half_width = v_width / 2
-        ix_half_height = h_width / 2
+        ix_half_width, ix_half_height = self._get_intersection_half_dims()
 
         # --------------------------------------------------
         # NORTH
@@ -264,6 +268,72 @@ class Renderer:
   
  
 
+    def draw_crosswalks(self):
+        colors = self.config["colors"]
+        crosswalk_color = colors.get("crosswalk", colors["white"])
+        lane_width = self.config["lane_width"]
+        roads = self.config["roads"]
+        w = self.config["window"]["width"]
+        h = self.config["window"]["height"]
+        cx = w // 2
+        cy = h // 2
+        ix_half_width, ix_half_height = self._get_intersection_half_dims()
+
+        stripe_width = max(6, lane_width // 8)
+        stripe_gap = max(6, lane_width // 4)
+        setback = max(10, lane_width // 1.2)
+        crosswalk_depth = max(35, lane_width // 1.5)
+
+        def draw_horizontal_crosswalk(y, x_start, x_end):
+            x = x_start
+            while x < x_end:
+                width = min(stripe_width, x_end - x)
+                pygame.draw.rect(
+                    self.screen,
+                    crosswalk_color,
+                    (x, y, width, crosswalk_depth),
+                )
+                x += stripe_width + stripe_gap
+
+        def draw_vertical_crosswalk(x, y_start, y_end):
+            y = y_start
+            while y < y_end:
+                height = min(stripe_width, y_end - y)
+                pygame.draw.rect(
+                    self.screen,
+                    crosswalk_color,
+                    (x, y, crosswalk_depth, height),
+                )
+                y += stripe_width + stripe_gap
+
+        if roads["north"]["enabled"]:
+            total_lanes = roads["north"]["incoming"] + roads["north"]["outgoing"]
+            road_width = total_lanes * lane_width
+            road_left = cx - road_width / 2
+            crosswalk_y = cy - ix_half_height - setback - crosswalk_depth
+            draw_horizontal_crosswalk(crosswalk_y, road_left, road_left + road_width)
+
+        if roads["south"]["enabled"]:
+            total_lanes = roads["south"]["incoming"] + roads["south"]["outgoing"]
+            road_width = total_lanes * lane_width
+            road_left = cx - road_width / 2
+            crosswalk_y = cy + ix_half_height + setback
+            draw_horizontal_crosswalk(crosswalk_y, road_left, road_left + road_width)
+
+        if roads["west"]["enabled"]:
+            total_lanes = roads["west"]["incoming"] + roads["west"]["outgoing"]
+            road_width = total_lanes * lane_width
+            road_top = cy - road_width / 2
+            crosswalk_x = cx - ix_half_width - setback - crosswalk_depth
+            draw_vertical_crosswalk(crosswalk_x, road_top, road_top + road_width)
+
+        if roads["east"]["enabled"]:
+            total_lanes = roads["east"]["incoming"] + roads["east"]["outgoing"]
+            road_width = total_lanes * lane_width
+            road_top = cy - road_width / 2
+            crosswalk_x = cx + ix_half_width + setback
+            draw_vertical_crosswalk(crosswalk_x, road_top, road_top + road_width)
+
     def draw_stop_lines(self):
         """Draw white stop lines across each incoming lane, just before the intersection."""
         colors = self.config["colors"]
@@ -274,21 +344,7 @@ class Renderer:
         lane_width = self.config["lane_width"]
         roads = self.config["roads"]
 
-        # Calculate intersection dimensions
-        v_width = 0
-        if roads["north"]["enabled"]:
-            v_width = max(v_width, lane_width * (roads["north"]["incoming"] + roads["north"]["outgoing"]))
-        if roads["south"]["enabled"]:
-            v_width = max(v_width, lane_width * (roads["south"]["incoming"] + roads["south"]["outgoing"]))
-
-        h_width = 0
-        if roads["east"]["enabled"]:
-            h_width = max(h_width, lane_width * (roads["east"]["incoming"] + roads["east"]["outgoing"]))
-        if roads["west"]["enabled"]:
-            h_width = max(h_width, lane_width * (roads["west"]["incoming"] + roads["west"]["outgoing"]))
-
-        ix_half_width = v_width / 2
-        ix_half_height = h_width / 2
+        ix_half_width, ix_half_height = self._get_intersection_half_dims()
 
         line_thickness = 3
 
@@ -371,21 +427,7 @@ class Renderer:
         lane_width = self.config["lane_width"]
         roads = self.config["roads"]
 
-        # Calculate intersection dimensions
-        v_width = 0
-        if roads["north"]["enabled"]:
-            v_width = max(v_width, lane_width * (roads["north"]["incoming"] + roads["north"]["outgoing"]))
-        if roads["south"]["enabled"]:
-            v_width = max(v_width, lane_width * (roads["south"]["incoming"] + roads["south"]["outgoing"]))
-
-        h_width = 0
-        if roads["east"]["enabled"]:
-            h_width = max(h_width, lane_width * (roads["east"]["incoming"] + roads["east"]["outgoing"]))
-        if roads["west"]["enabled"]:
-            h_width = max(h_width, lane_width * (roads["west"]["incoming"] + roads["west"]["outgoing"]))
-
-        ix_half_width = v_width / 2
-        ix_half_height = h_width / 2
+        ix_half_width, ix_half_height = self._get_intersection_half_dims()
 
         arrow_color = colors["white"]
         shaft_len = 10
@@ -438,16 +480,16 @@ class Renderer:
                 draw_straight_arrow(self.screen, arrow_color, (ax, ay), angle)
 
         # North: move down, arrow points down (90°), above stop line
-        draw_road_arrows("north", roads["north"], cy - ix_half_height, -30, 0, 90)
+        draw_road_arrows("north", roads["north"], cy - ix_half_height, -80, 0, 90)
 
         # South: move up, arrow points up (-90°), below stop line
-        draw_road_arrows("south", roads["south"], cy + ix_half_height, 30, roads["south"]["outgoing"], -90)
+        draw_road_arrows("south", roads["south"], cy + ix_half_height, 80, roads["south"]["outgoing"], -90)
 
         # West: move right, arrow points right (0°), left of stop line
-        draw_road_arrows("west", roads["west"], cx - ix_half_width, -30, roads["west"]["outgoing"], 0)
+        draw_road_arrows("west", roads["west"], cx - ix_half_width, -80, roads["west"]["outgoing"], 0)
 
         # East: move left, arrow points left (180°), right of stop line
-        draw_road_arrows("east", roads["east"], cx + ix_half_width, 30, 0, 180)
+        draw_road_arrows("east", roads["east"], cx + ix_half_width, 80, 0, 180)
 
     
     
@@ -460,21 +502,7 @@ class Renderer:
         lane_width = self.config["lane_width"]
         roads = self.config["roads"]
 
-        # Calculate intersection dimensions
-        v_width = 0
-        if roads["north"]["enabled"]:
-            v_width = max(v_width, lane_width * (roads["north"]["incoming"] + roads["north"]["outgoing"]))
-        if roads["south"]["enabled"]:
-            v_width = max(v_width, lane_width * (roads["south"]["incoming"] + roads["south"]["outgoing"]))
-
-        h_width = 0
-        if roads["east"]["enabled"]:
-            h_width = max(h_width, lane_width * (roads["east"]["incoming"] + roads["east"]["outgoing"]))
-        if roads["west"]["enabled"]:
-            h_width = max(h_width, lane_width * (roads["west"]["incoming"] + roads["west"]["outgoing"]))
-
-        ix_half_width = v_width / 2
-        ix_half_height = h_width / 2
+        ix_half_width, ix_half_height = self._get_intersection_half_dims()
 
         box_short = 16
         box_long = 52
@@ -620,6 +648,24 @@ class Renderer:
                 gap_length=10,
                 width=2
             )
+
+    def _get_intersection_half_dims(self):
+        lane_width = self.config["lane_width"]
+        roads = self.config["roads"]
+
+        v_width = 0
+        if roads["north"]["enabled"]:
+            v_width = max(v_width, lane_width * (roads["north"]["incoming"] + roads["north"]["outgoing"]))
+        if roads["south"]["enabled"]:
+            v_width = max(v_width, lane_width * (roads["south"]["incoming"] + roads["south"]["outgoing"]))
+
+        h_width = 0
+        if roads["east"]["enabled"]:
+            h_width = max(h_width, lane_width * (roads["east"]["incoming"] + roads["east"]["outgoing"]))
+        if roads["west"]["enabled"]:
+            h_width = max(h_width, lane_width * (roads["west"]["incoming"] + roads["west"]["outgoing"]))
+
+        return v_width / 2, h_width / 2
     
     
     def _draw_dashed_line(self, color, start_pos, end_pos, dash_length=15, gap_length=10, width=2):
