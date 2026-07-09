@@ -19,7 +19,7 @@ class Vehicle:
         "east": "north",
     }
 
-    def __init__(self, config, road_direction, lane_index, distance_from_stop):
+    def __init__(self, config, road_direction, lane_index, distance_from_stop, vehicle_length=None):
         self.config = config
         self.road_direction = road_direction
         self.lane_index = lane_index
@@ -31,7 +31,8 @@ class Vehicle:
         self.speed_kmh = config["vehicle_defaults"].get("speed_kmh", 50)
 
         self.width = config["vehicle_defaults"].get("vehicle_width", 25)
-        self.length = config["vehicle_defaults"].get("vehicle_length", 50)
+        default_length = config["vehicle_defaults"].get("vehicle_length", 50)
+        self.length = vehicle_length if vehicle_length is not None else default_length
         
         self.speed = self._kmh_to_pixels_per_second(self.speed_kmh)
         # turn_speed_kmh = config["vehicle_defaults"].get("right_turn_speed_kmh", 25)
@@ -43,16 +44,21 @@ class Vehicle:
         self.current_speed = self.speed
         self.stopped = False
         
-        self.acceleration = 80.0
+        base_length = config["vehicle_defaults"].get("vehicle_length", 50)
+        length_scale = max(0.5, min(1.6, self.length / max(1, base_length)))
+
+        # Larger vehicles accelerate and brake a bit more slowly so the
+        # queue feels less "same-speed" and more like mixed traffic.
+        self.acceleration = 80.0 / length_scale
         self.min_speed = 0.0
         self.reaction_time = 0.5
-        self.deceleration = 6.5
+        self.deceleration = 6.5 / length_scale
        
         ppm = self.config.get("simulation", {}).get("pixels_per_meter", 10)
         self.braking = self.deceleration * ppm
        
         self.cleared_intersection = False
-        self.desired_gap = self.length + 10
+        self.desired_gap = 24
         self.stop_margin = self._crosswalk_stop_distance()
 
         # --- right-turn setup ---
@@ -70,8 +76,8 @@ class Vehicle:
         self.draw_center = None
         self.draw_angle = None
 
-        right_turn_chance = config.get("simulation", {}).get("right_turn_chance", 1)
-        left_turn_chance = config.get("simulation", {}).get("left_turn_chance", 0.2)
+        right_turn_chance = config.get("simulation", {}).get("right_turn_chance", 0)
+        left_turn_chance = config.get("simulation", {}).get("left_turn_chance", 0)
         roads = config["roads"]
         turn_options = []
 
@@ -358,11 +364,17 @@ class Vehicle:
         if vehicle_ahead is not None:
             dist_to_ahead = self.distance_from_stop - vehicle_ahead.distance_from_stop - self.length
             ahead_speed = vehicle_ahead.current_speed
+            ahead_is_turning = getattr(vehicle_ahead, "turning", False)
+        else:
+            ahead_is_turning = False
 
-        if vehicle_ahead is not None and dist_to_ahead < 5:
-            self.current_speed = 0
-            self.distance_from_stop = vehicle_ahead.distance_from_stop + self.length + 5
-            self.stopped = True
+        # Keep a real headway to the car in front instead of collapsing the
+        # queue into bumper-to-bumper spacing once vehicles get close.
+        min_gap = self.desired_gap
+        if vehicle_ahead is not None and dist_to_ahead < min_gap and not ahead_is_turning:
+            self.current_speed = min(self.current_speed, ahead_speed)
+            # self.distance_from_stop = vehicle_ahead.distance_from_stop + self.length + min_gap
+            self.stopped = self.current_speed == 0
             return
 
         target_speed = self.speed
@@ -398,7 +410,7 @@ class Vehicle:
             safe_dist = self.get_safe_following_distance()
             
             if dist_to_ahead <= 15:
-                target_speed = 0
+                target_speed = 0 if not ahead_is_turning else min(target_speed, ahead_speed)
             elif dist_to_ahead < safe_dist:
                 ratio = max(0, (dist_to_ahead - 15) / (safe_dist - 15))
                 follow_speed = ahead_speed + (self.speed - ahead_speed) * ratio
@@ -530,8 +542,26 @@ class Vehicle:
             (base_x - forward_x * 4, base_y - forward_y * 4),
         ]
 
-    def is_right_signal_on(self):
+    def get_left_indicator(self):
+        cx, cy, forward_x, forward_y, right_x, right_y = self._get_pose_vectors()
+        left_x = -right_x
+        left_y = -right_y
+        tip_x = cx + left_x * (self.width / 2 + 6)
+        tip_y = cy + left_y * (self.width / 2 + 6)
+        base_x = cx + left_x * (self.width / 2 - 1)
+        base_y = cy + left_y * (self.width / 2 - 1)
+
+        return [
+            (tip_x, tip_y),
+            (base_x + forward_x * 4, base_y + forward_y * 4),
+            (base_x - forward_x * 4, base_y - forward_y * 4),
+        ]
+
+    def is_turn_signal_on(self):
         return self.is_turning_vehicle and not self.has_turned and ((pygame.time.get_ticks() // 350) % 2 == 0)
+
+    def is_right_signal_on(self):
+        return self.is_turn_signal_on() and self.turn_side == "right"
 
     def is_off_screen(self):
         w = self.config["window"]["width"]

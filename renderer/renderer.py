@@ -44,7 +44,7 @@ class Renderer:
 
         for v in vehicles:
             rect = v.get_rect()
-            body_color = (150, 150, 200) if v.stopped else v.color
+            body_color = v.color
 
             corners = v.get_corners() if hasattr(v, "get_corners") else None
             if corners:
@@ -70,11 +70,22 @@ class Renderer:
                     points = [(fx-4, fy), (fx+3, fy-4), (fx+3, fy+4)]
             pygame.draw.polygon(self.screen, (220, 220, 220), points)
 
-            if hasattr(v, "is_right_signal_on") and v.is_right_signal_on():
-                right_points = v.get_right_indicator() if hasattr(v, "get_right_indicator") else None
-                if right_points:
-                    pygame.draw.polygon(self.screen, signal_color, right_points)
-                    pygame.draw.polygon(self.screen, signal_outline, right_points, 1)
+            signal_on = False
+            if hasattr(v, "is_turn_signal_on"):
+                signal_on = v.is_turn_signal_on()
+            elif hasattr(v, "is_right_signal_on"):
+                signal_on = v.is_right_signal_on()
+
+            if signal_on:
+                signal_points = None
+                if getattr(v, "turn_side", None) == "left" and hasattr(v, "get_left_indicator"):
+                    signal_points = v.get_left_indicator()
+                elif hasattr(v, "get_right_indicator"):
+                    signal_points = v.get_right_indicator()
+
+                if signal_points:
+                    pygame.draw.polygon(self.screen, signal_color, signal_points)
+                    pygame.draw.polygon(self.screen, signal_outline, signal_points, 1)
         
     def draw_metrics(self, metrics):
         y = 10
@@ -279,9 +290,10 @@ class Renderer:
         cy = h // 2
         ix_half_width, ix_half_height = self._get_intersection_half_dims()
 
-        stripe_width = max(6, lane_width // 8)
-        stripe_gap = max(6, lane_width // 4)
-        setback = max(10, lane_width // 1.2)
+        # lane_width=30
+        stripe_width = max(4, lane_width // 10)
+        stripe_gap = max(6, lane_width // 5)
+        setback = max(10, lane_width // 1.0)
         crosswalk_depth = max(35, lane_width // 1.5)
 
         def draw_horizontal_crosswalk(y, x_start, x_end):

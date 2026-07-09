@@ -10,7 +10,7 @@ class Simulation:
         self.light_controller = TrafficLightController(config)
         self.vehicles = []
         self.spawn_timer = 0
-        self.spawn_interval = 0.25
+        self.spawn_interval = 0.15
         self.metrics = Metrics()
     
     def update(self, dt):
@@ -33,11 +33,15 @@ class Simulation:
         
         w = self.config["window"]["width"]
         h = self.config["window"]["height"]
+        defaults = self.config["vehicle_defaults"]
+        min_length = defaults.get("vehicle_length_min", defaults.get("vehicle_length", 50))
+        max_length = defaults.get("vehicle_length_max", defaults.get("vehicle_length", 50))
         
         for _ in range(10):
             direction = random.choice(enabled)
             road = self.config["roads"][direction]
             lane = random.randint(0, road["incoming"] - 1)
+            vehicle_length = self._choose_vehicle_length(min_length, max_length)
             
             distance = h * 0.45 if direction in ("north", "south") else w * 0.45
             
@@ -49,8 +53,27 @@ class Simulation:
                         break
             
             if not blocked:
-                self.vehicles.append(Vehicle(self.config, direction, lane, distance))
+                self.vehicles.append(Vehicle(self.config, direction, lane, distance, vehicle_length))
                 return
+
+    def _choose_vehicle_length(self, min_length, max_length):
+        defaults = self.config["vehicle_defaults"]
+        weighted_lengths = defaults.get("vehicle_length_weights", [])
+
+        if weighted_lengths:
+            choices = []
+            weights = []
+            for entry in weighted_lengths:
+                length = int(entry.get("length", min_length))
+                weight = float(entry.get("weight", 0))
+                if min_length <= length <= max_length and weight > 0:
+                    choices.append(length)
+                    weights.append(weight)
+
+            if choices:
+                return random.choices(choices, weights=weights, k=1)[0]
+
+        return random.randint(min_length, max_length)
     
     def _update_vehicles(self, dt):
         lanes = defaultdict(list)
