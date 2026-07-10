@@ -40,14 +40,22 @@ CONFIG = {
             {"length": 34, "weight": 20},
             {"length": 38, "weight": 5},
             {"length": 42, "weight": 5},
-            {"length": 45, "weight": 5},
-            {"length": 50, "weight": 5}
+            {"length": 45, "weight": 3},
+            {"length": 50, "weight": 2}
         ]
     },
+    "pedestrian_defaults": {
+        "spawn_interval_min": 0.8,
+        "spawn_interval_max": 1.0,
+        "max_active": 20,
+        "walking_speed_min_mps": 1.5,
+        "walking_speed_max_mps": 2.5,
+        "radius": 7
+    },
     "roads": {
-        "north": {"enabled": True, "incoming": 4, "outgoing": 4 ,"inverse": "south"},
-        "south": {"enabled": True, "incoming": 4, "outgoing": 4 ,"inverse": "north"},
-        "east": {"enabled": True, "incoming": 4, "outgoing": 4 ,"inverse": "west"},
-        "west": {"enabled": True, "incoming": 4 , "outgoing": 4 ,"inverse": "east"}
+        "north": {"enabled": True, "incoming": 2, "outgoing": 2 ,"inverse": "south"},
+        "south": {"enabled": True, "incoming": 2, "outgoing": 2 ,"inverse": "north"},
+        "east": {"enabled": True, "incoming": 2, "outgoing": 2 ,"inverse": "west"},
+        "west": {"enabled": True, "incoming": 2 , "outgoing": 2 ,"inverse": "east"}
     }
 }

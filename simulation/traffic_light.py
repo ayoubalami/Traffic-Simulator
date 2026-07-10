@@ -41,6 +41,10 @@ class TrafficLightController:
         else:
             return self.ew_state
 
+    def get_pedestrian_state(self, crossing):
+        """Pedestrians cross only while traffic through that crosswalk is red."""
+        return "green" if self.get_state(crossing) == "red" else "red"
+
     def get_remaining_time(self):
         """Get remaining seconds for the currently active state."""
         if self.active_pair == "ns":

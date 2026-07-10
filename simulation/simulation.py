@@ -1,6 +1,7 @@
 import random
 from collections import defaultdict
 from .vehicle import Vehicle
+from .pedestrian import Pedestrian
 from .traffic_light import TrafficLightController
 from .metrics import Metrics
 
@@ -9,8 +10,15 @@ class Simulation:
         self.config = config
         self.light_controller = TrafficLightController(config)
         self.vehicles = []
+        self.pedestrians = []
         self.spawn_timer = 0
         self.spawn_interval = 0.05
+        pedestrian_defaults = config["pedestrian_defaults"]
+        self.pedestrian_spawn_timer = 0.0
+        self.pedestrian_spawn_interval = random.uniform(
+            pedestrian_defaults["spawn_interval_min"],
+            pedestrian_defaults["spawn_interval_max"],
+        )
         self.metrics = Metrics()
     
     def update(self, dt):
@@ -18,6 +26,7 @@ class Simulation:
         self._spawn_vehicles(dt)
         self._update_vehicles(dt)
         self._remove_off_screen()
+        self._update_pedestrians(dt)
         self.metrics.update(self.vehicles, self.light_controller)
     
     def _spawn_vehicles(self, dt):
@@ -67,6 +76,29 @@ class Simulation:
                 self.vehicles.append(candidate)
                 return
 
+    def _update_pedestrians(self, dt):
+        self.pedestrian_spawn_timer += dt
+        defaults = self.config["pedestrian_defaults"]
+        if (
+            self.pedestrian_spawn_timer >= self.pedestrian_spawn_interval
+            and len(self.pedestrians) < defaults["max_active"]
+        ):
+            enabled_crossings = [
+                direction for direction in ("north", "south", "east", "west")
+                if self.config["roads"][direction]["enabled"]
+            ]
+            if enabled_crossings:
+                self.pedestrians.append(Pedestrian(self.config, random.choice(enabled_crossings)))
+            self.pedestrian_spawn_timer = 0.0
+            self.pedestrian_spawn_interval = random.uniform(
+                defaults["spawn_interval_min"], defaults["spawn_interval_max"],
+            )
+
+        for pedestrian in self.pedestrians:
+            signal_state = self.light_controller.get_pedestrian_state(pedestrian.crossing)
+            pedestrian.update(dt, signal_state)
+        self.pedestrians = [p for p in self.pedestrians if not p.has_finished()]
+
     def _choose_vehicle_length(self, min_length, max_length):
         defaults = self.config["vehicle_defaults"]
         weighted_lengths = defaults.get("vehicle_length_weights", [])
@@ -109,6 +141,7 @@ class Simulation:
     def get_render_data(self):
         return {
             "vehicles": self.vehicles,
+            "pedestrians": self.pedestrians,
             "lights": self.light_controller,
             "metrics": self.metrics.get_summary()
         }

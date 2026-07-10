@@ -31,7 +31,9 @@ class Renderer:
         self.draw_stop_lines()
         self.draw_lane_arrows()
         self.draw_vehicles(render_data["vehicles"])
+        self.draw_pedestrians(render_data.get("pedestrians", []))
         self.draw_traffic_lights(render_data["lights"])
+        self.draw_pedestrian_lights(render_data["lights"])
         self.draw_metrics(render_data["metrics"])
         
         pygame.display.flip()
@@ -86,6 +88,69 @@ class Renderer:
                 if signal_points:
                     pygame.draw.polygon(self.screen, signal_color, signal_points)
                     pygame.draw.polygon(self.screen, signal_outline, signal_points, 1)
+
+    def draw_pedestrians(self, pedestrians):
+        """Draw each pedestrian as a colored circle with a direction arrow."""
+        for pedestrian in pedestrians:
+            x, y = map(int, pedestrian.position)
+            radius = pedestrian.radius
+            pygame.draw.circle(self.screen, pedestrian.color, (x, y), radius)
+            pygame.draw.circle(self.screen, (25, 25, 25), (x, y), radius, 1)
+
+            if pedestrian.crossing in ("north", "south"):
+                dx, dy = pedestrian.direction * radius, 0
+            else:
+                dx, dy = 0, pedestrian.direction * radius
+
+            tip = (x + dx, y + dy)
+            left = (x - dy // 2, y + dx // 2)
+            right = (x + dy // 2, y - dx // 2)
+            pygame.draw.polygon(self.screen, (255, 255, 255), (tip, left, right))
+
+    def draw_pedestrian_lights(self, light_controller):
+        """Draw one red/green pedestrian signal on the left side of each crossing."""
+        w, h = self.config["window"]["width"], self.config["window"]["height"]
+        cx, cy = w / 2, h / 2
+        lane_width = self.config["lane_width"]
+        roads = self.config["roads"]
+        ix_half_width, ix_half_height = self._get_intersection_half_dims()
+        vehicle_stop_distance = (
+            max(10, lane_width // 1)
+            + max(40, lane_width // 1.5)
+            + max(5, lane_width // 6)
+        )
+
+        def draw_signal(x, y, state, horizontal):
+            width, height = (30, 14) if horizontal else (14, 30)
+            pygame.draw.rect(self.screen, (25, 25, 25), (x, y, width, height), border_radius=2)
+            pygame.draw.rect(self.screen, (80, 80, 80), (x, y, width, height), 1, border_radius=2)
+            if horizontal:
+                red_center, green_center = (x + 8, y + 7), (x + 22, y + 7)
+            else:
+                red_center, green_center = (x + 7, y + 8), (x + 7, y + 22)
+            pygame.draw.circle(self.screen, (255, 0, 0) if state == "red" else (65, 20, 20), red_center, 4)
+            pygame.draw.circle(self.screen, (20, 210, 65) if state == "green" else (15, 55, 25), green_center, 4)
+
+        for crossing in ("north", "south", "west", "east"):
+            if not roads[crossing]["enabled"]:
+                continue
+            state = light_controller.get_pedestrian_state(crossing)
+            road_width = lane_width * (roads[crossing]["incoming"] + roads[crossing]["outgoing"])
+
+            if crossing in ("north", "south"):
+                stop_y = (cy - ix_half_height - vehicle_stop_distance if crossing == "north"
+                          else cy + ix_half_height + vehicle_stop_distance)
+                box_y = stop_y - 4 if crossing == "north" else stop_y
+                box_x = (cx + road_width / 2 if crossing == "north"
+                         else cx - road_width / 2 - 30)
+                draw_signal(box_x, box_y, state, horizontal=True)
+            else:
+                stop_x = (cx - ix_half_width - vehicle_stop_distance if crossing == "west"
+                          else cx + ix_half_width + vehicle_stop_distance)
+                box_x = stop_x - 4 if crossing == "west" else stop_x
+                box_y = (cy - road_width / 2 - 30 if crossing == "west"
+                         else cy + road_width / 2)
+                draw_signal(box_x, box_y, state, horizontal=False)
         
     def draw_metrics(self, metrics):
         y = 10
@@ -398,6 +463,11 @@ class Renderer:
         roads = self.config["roads"]
 
         ix_half_width, ix_half_height = self._get_intersection_half_dims()
+        stop_distance = (
+            max(10, lane_width // 1)
+            + max(40, lane_width // 1.5)
+            + max(5, lane_width // 6)
+        )
 
         line_thickness = 3
 
@@ -406,7 +476,7 @@ class Renderer:
             total_lanes = roads["north"]["incoming"] + roads["north"]["outgoing"]
             road_width = total_lanes * lane_width
             road_left = cx - road_width / 2
-            stop_y = cy - ix_half_height
+            stop_y = cy - ix_half_height - stop_distance
             # Only across incoming lanes (right side of yellow center line = left half)
             incoming_width = roads["north"]["incoming"] * lane_width
             pygame.draw.line(
@@ -422,7 +492,7 @@ class Renderer:
             total_lanes = roads["south"]["incoming"] + roads["south"]["outgoing"]
             road_width = total_lanes * lane_width
             road_left = cx - road_width / 2
-            stop_y = cy + ix_half_height
+            stop_y = cy + ix_half_height + stop_distance
             # Only across incoming lanes (left side of yellow center line = right half)
             incoming_start = road_left + roads["south"]["outgoing"] * lane_width
             incoming_end = incoming_start + roads["south"]["incoming"] * lane_width
@@ -439,7 +509,7 @@ class Renderer:
             total_lanes = roads["west"]["incoming"] + roads["west"]["outgoing"]
             road_width = total_lanes * lane_width
             road_top = cy - road_width / 2
-            stop_x = cx - ix_half_width
+            stop_x = cx - ix_half_width - stop_distance
             # Incoming lanes are BELOW the yellow center line
             center_y = road_top + roads["west"]["outgoing"] * lane_width
             incoming_end = center_y + roads["west"]["incoming"] * lane_width
@@ -456,7 +526,7 @@ class Renderer:
             total_lanes = roads["east"]["incoming"] + roads["east"]["outgoing"]
             road_width = total_lanes * lane_width
             road_top = cy - road_width / 2
-            stop_x = cx + ix_half_width
+            stop_x = cx + ix_half_width + stop_distance
             # Incoming lanes are ABOVE the yellow center line
             center_y = road_top + roads["east"]["outgoing"] * lane_width
             pygame.draw.line(
@@ -533,16 +603,16 @@ class Renderer:
                 draw_straight_arrow(self.screen, arrow_color, (ax, ay), angle)
 
         # North: move down, arrow points down (90°), above stop line
-        draw_road_arrows("north", roads["north"], cy - ix_half_height, -80, 0, 90)
+        draw_road_arrows("north", roads["north"], cy - ix_half_height, -120, 0, 90)
 
         # South: move up, arrow points up (-90°), below stop line
-        draw_road_arrows("south", roads["south"], cy + ix_half_height, 80, roads["south"]["outgoing"], -90)
+        draw_road_arrows("south", roads["south"], cy + ix_half_height, 120, roads["south"]["outgoing"], -90)
 
         # West: move right, arrow points right (0°), left of stop line
-        draw_road_arrows("west", roads["west"], cx - ix_half_width, -80, roads["west"]["outgoing"], 0)
+        draw_road_arrows("west", roads["west"], cx - ix_half_width, -120, roads["west"]["outgoing"], 0)
 
         # East: move left, arrow points left (180°), right of stop line
-        draw_road_arrows("east", roads["east"], cx + ix_half_width, 80, 0, 180)
+        draw_road_arrows("east", roads["east"], cx + ix_half_width, 120, 0, 180)
 
     
     
@@ -562,7 +632,11 @@ class Renderer:
         light_radius = 5
         padding = 3
         side_offset = 15
-        approach_offset = 25
+        vehicle_stop_distance = (
+            max(10, lane_width // 1)
+            + max(40, lane_width // 1.5)
+            + max(5, lane_width // 6)
+        )
 
         timer_font = pygame.font.SysFont("monospace", 14)
         timer_bg_color = (30, 30, 30)
@@ -629,27 +703,27 @@ class Renderer:
             if direction == "north":
                 road_left = cx - road_width / 2
                 box_x = road_left - box_short - side_offset
-                box_y = cy - ix_half_height - box_long - approach_offset
+                box_y = cy - ix_half_height - vehicle_stop_distance - box_long
                 draw_light_box(box_x, box_y, direction, ["green", "yellow", "red"], light_state)
                 draw_timer(box_x, box_y, direction, remaining)
 
             elif direction == "south":
                 road_right = cx + road_width / 2
                 box_x = road_right + side_offset
-                box_y = cy + ix_half_height + approach_offset
+                box_y = cy + ix_half_height + vehicle_stop_distance
                 draw_light_box(box_x, box_y, direction, ["red", "yellow", "green"], light_state)
                 draw_timer(box_x, box_y, direction, remaining)
 
             elif direction == "west":
                 road_bottom = cy + road_width / 2
-                box_x = cx - ix_half_width - box_long - approach_offset
+                box_x = cx - ix_half_width - vehicle_stop_distance - box_long
                 box_y = road_bottom + side_offset
                 draw_light_box(box_x, box_y, direction, ["green", "yellow", "red"], light_state)
                 draw_timer(box_x, box_y, direction, remaining)
 
             elif direction == "east":
                 road_top = cy - road_width / 2
-                box_x = cx + ix_half_width + approach_offset
+                box_x = cx + ix_half_width + vehicle_stop_distance
                 box_y = road_top - box_short - side_offset
                 draw_light_box(box_x, box_y, direction, ["red", "yellow", "green"], light_state)
                 draw_timer(box_x, box_y, direction, remaining)

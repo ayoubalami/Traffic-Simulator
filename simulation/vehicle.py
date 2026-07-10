@@ -65,6 +65,7 @@ class Vehicle:
         self.current_speed = self.speed
         self.stopped = False
         self.yellow_decision = None
+        self.committed_to_cross = False
         self.last_light_state = None
         self.green_start_delay_remaining = 0.0
         self.green_release_pending = False
@@ -438,24 +439,33 @@ class Vehicle:
         # A vehicle that has cleared the intersection no longer obeys this
         # approach's traffic light, but it must still follow its lane leader.
         if not self.cleared_intersection and light_state == "red":
-            # Only the first vehicle stops at the line.  Each following
-            # vehicle uses the rear of the vehicle ahead plus its current
-            # dynamic safe gap as its own stopping point.
-            if vehicle_ahead is not None and not ahead_is_turning:
-                red_stop_distance = max(
-                    red_stop_distance,
-                    vehicle_ahead.distance_from_stop
-                    + vehicle_ahead.length
-                    + self.get_safe_following_distance(),
-                )
-
-            if dist_to_stop <= red_stop_distance:
-                target_speed = 0
+            # A vehicle that entered on yellow must finish clearing the
+            # crosswalk after the light turns red.  A moving vehicle already
+            # beyond the stop point is handled the same way.
+            if self.committed_to_cross or (
+                dist_to_stop < self.stop_margin and not self.stopped
+            ):
+                self.committed_to_cross = True
+                target_speed = self.speed
             else:
-                dist_to_actual_stop = dist_to_stop - red_stop_distance
-                braking_dist = (self.current_speed ** 2) / (2 * self.braking)
-                if braking_dist >= dist_to_actual_stop:
+                # Only the first vehicle stops at the line.  Each following
+                # vehicle uses the rear of the vehicle ahead plus its current
+                # dynamic safe gap as its own stopping point.
+                if vehicle_ahead is not None and not ahead_is_turning:
+                    red_stop_distance = max(
+                        red_stop_distance,
+                        vehicle_ahead.distance_from_stop
+                        + vehicle_ahead.length
+                        + self.get_safe_following_distance(),
+                    )
+
+                if dist_to_stop <= red_stop_distance:
                     target_speed = 0
+                else:
+                    dist_to_actual_stop = dist_to_stop - red_stop_distance
+                    braking_dist = (self.current_speed ** 2) / (2 * self.braking)
+                    if braking_dist >= dist_to_actual_stop:
+                        target_speed = 0
 
         elif not self.cleared_intersection and light_state == "yellow":
             dist_to_actual_stop = dist_to_stop - self.stop_margin
@@ -469,6 +479,9 @@ class Vehicle:
                     braking_dist = (self.current_speed ** 2) / (2 * self.braking)
                     can_stop_comfortably = braking_dist + 10 <= dist_to_actual_stop
                     self.yellow_decision = "stop" if can_stop_comfortably else "go"
+
+                if self.yellow_decision == "go":
+                    self.committed_to_cross = True
 
             if self.yellow_decision == "stop":
                 # The maximum speed that can stop exactly at the stop
@@ -516,7 +529,8 @@ class Vehicle:
 
         if (light_state == "red" 
             and 0 < self.distance_from_stop < red_stop_distance
-            and not self.cleared_intersection):
+            and not self.cleared_intersection
+            and not self.committed_to_cross):
             # self.distance_from_stop = red_stop_distance
             self.current_speed = 0
             self.stopped = True
