@@ -10,7 +10,7 @@ class Simulation:
         self.light_controller = TrafficLightController(config)
         self.vehicles = []
         self.spawn_timer = 0
-        self.spawn_interval = 0.15
+        self.spawn_interval = 0.05
         self.metrics = Metrics()
     
     def update(self, dt):
@@ -44,16 +44,27 @@ class Simulation:
             vehicle_length = self._choose_vehicle_length(min_length, max_length)
             
             distance = h * 0.45 if direction in ("north", "south") else w * 0.45
+            candidate = Vehicle(self.config, direction, lane, distance, vehicle_length)
             
             blocked = False
             for v in self.vehicles:
                 if v.road_direction == direction and v.lane_index == lane:
-                    if abs(v.distance_from_stop - distance) < 120:
+                    # A fixed spawn distance is unsafe when a newly spawned
+                    # fast vehicle is behind a slower one.  Use the candidate
+                    # vehicle's actual moving gap plus its closing-speed
+                    # reaction buffer, matching the following behavior.
+                    gap_to_vehicle = distance - v.distance_from_stop - v.length
+                    closing_speed = max(0.0, candidate.current_speed - v.current_speed)
+                    required_gap = (
+                        candidate.get_safe_following_distance()
+                        + closing_speed * candidate.reaction_time
+                    )
+                    if gap_to_vehicle < required_gap:
                         blocked = True
                         break
             
             if not blocked:
-                self.vehicles.append(Vehicle(self.config, direction, lane, distance, vehicle_length))
+                self.vehicles.append(candidate)
                 return
 
     def _choose_vehicle_length(self, min_length, max_length):

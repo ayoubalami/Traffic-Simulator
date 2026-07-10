@@ -28,12 +28,33 @@ class Vehicle:
         self.color = (250, 200, 200)
         self.active = True
         
-        self.speed_kmh = config["vehicle_defaults"].get("speed_kmh", 50)
-
         self.width = config["vehicle_defaults"].get("vehicle_width", 25)
         default_length = config["vehicle_defaults"].get("vehicle_length", 50)
         self.length = vehicle_length if vehicle_length is not None else default_length
         
+        base_length = config["vehicle_defaults"].get("vehicle_length", 50)
+        length_scale = max(0.5, min(1.6, self.length / max(1, base_length)))
+
+        # The configured speed is for a vehicle of the default length.
+        # Larger vehicles receive a lower maximum speed; the lower bound
+        # prevents unusually long vehicles from becoming unrealistically slow.
+        base_speed_kmh = config["vehicle_defaults"].get("speed_kmh", 50)
+        reduction = config["vehicle_defaults"].get(
+            "size_speed_reduction_per_length_ratio", 0.30,
+        )
+        min_speed_multiplier = config["vehicle_defaults"].get(
+            "min_size_speed_multiplier", 0.70,
+        )
+        self.speed_multiplier = max(
+            min_speed_multiplier,
+            min(1.0, 1.0 - (length_scale - 1.0) * reduction),
+        )
+        speed_variation = max(
+            0.0,
+            config["vehicle_defaults"].get("speed_variation_ratio", 0.05),
+        )
+        self.speed_variation = random.uniform(-speed_variation, speed_variation)
+        self.speed_kmh = base_speed_kmh * self.speed_multiplier * (1 + self.speed_variation)
         self.speed = self._kmh_to_pixels_per_second(self.speed_kmh)
         # turn_speed_kmh = config["vehicle_defaults"].get("right_turn_speed_kmh", 25)
         self.right_turn_speed = self._kmh_to_pixels_per_second(self.speed_kmh / 1.75)
@@ -43,22 +64,24 @@ class Vehicle:
         )
         self.current_speed = self.speed
         self.stopped = False
-        
-        base_length = config["vehicle_defaults"].get("vehicle_length", 50)
-        length_scale = max(0.5, min(1.6, self.length / max(1, base_length)))
+        self.yellow_decision = None
+        self.last_light_state = None
+        self.green_start_delay_remaining = 0.0
+        self.green_release_pending = False
 
         # Larger vehicles accelerate and brake a bit more slowly so the
         # queue feels less "same-speed" and more like mixed traffic.
         self.acceleration = 80.0 / length_scale
         self.min_speed = 0.0
-        self.reaction_time = 0.5
+        self.reaction_time = 0.8
         self.deceleration = 6.5 / length_scale
        
         ppm = self.config.get("simulation", {}).get("pixels_per_meter", 10)
         self.braking = self.deceleration * ppm
        
         self.cleared_intersection = False
-        self.desired_gap = 24
+        self.desired_gap = config["vehicle_defaults"].get("safe_distance", 24)
+        self.moving_gap_multiplier = config["vehicle_defaults"].get("safe_distance_moving_multiplier", 1.0)
         self.stop_margin = self._crosswalk_stop_distance()
 
         # --- right-turn setup ---
@@ -165,9 +188,15 @@ class Vehicle:
         return crosswalk_setback + crosswalk_depth + safety_buffer
 
     def get_safe_following_distance(self):
+        if self.current_speed <= 0 or self.moving_gap_multiplier <= 1:
+            return self.desired_gap
+
+        extra_scale = self.moving_gap_multiplier - 1
         reaction_dist = self.current_speed * self.reaction_time
         braking_dist = (self.current_speed ** 2) / (2 * self.braking)
-        return reaction_dist + braking_dist + self.desired_gap
+        moving_gap = self.desired_gap * self.moving_gap_multiplier
+
+        return moving_gap + (reaction_dist + braking_dist) * extra_scale
 
     def _kmh_to_pixels_per_second(self, kmh):
         pixels_per_meter = self.config.get("simulation", {}).get("pixels_per_meter", 10)
@@ -271,12 +300,29 @@ class Vehicle:
 
     def _start_turn(self):
         new_direction = self.turn_target_direction
+        assert new_direction is not None
         new_lane = self._turn_lane_index(new_direction)
         start = self._center_for_distance(self.road_direction, self.lane_index, self.distance_from_stop)
         ix_half_width, ix_half_height = self._intersection_half_dims()
         half_dim = ix_half_height if new_direction in ("north", "south") else ix_half_width
         end_distance = -(half_dim + self.length * 2.5)
         end = self._center_for_distance(new_direction, new_lane, end_distance)
+
+        # Preserve the compact curve used by narrow roads.  On a wide road,
+        # only extend the exit point enough to put it at least one lane ahead
+        # of the entry point in the new travel direction; extending it across
+        # the whole intersection makes the turn unnecessarily wide.
+        forward = {
+            "north": (0, 1),
+            "south": (0, -1),
+            "west": (1, 0),
+            "east": (-1, 0),
+        }[new_direction]
+        forward_progress = (end[0] - start[0]) * forward[0] + (end[1] - start[1]) * forward[1]
+        min_forward_progress = self.config["lane_width"]
+        if forward_progress < min_forward_progress:
+            end_distance -= min_forward_progress - forward_progress
+            end = self._center_for_distance(new_direction, new_lane, end_distance)
 
         if self.road_direction in ("north", "south"):
             control = (start[0], end[1])
@@ -329,6 +375,37 @@ class Vehicle:
         self._update_turn_draw_state()
  
     def update(self, dt, light_state, vehicle_ahead=None):
+        if light_state != "yellow":
+            self.yellow_decision = None
+
+        # Drivers do not all react the instant their light turns green.  A
+        # queued vehicle begins its own delay only after the vehicle ahead
+        # starts moving, producing a natural start-up wave down the queue.
+        green_start_wait = False
+        if (
+            light_state == "green"
+            and self.last_light_state in ("red", "yellow")
+            and not self.cleared_intersection
+            and (self.stopped or self.current_speed <= 1.0)
+        ):
+            defaults = self.config["vehicle_defaults"]
+            min_delay = max(0.0, defaults.get("green_start_delay_min", 0.15))
+            max_delay = max(min_delay, defaults.get("green_start_delay_max", 0.60))
+            self.green_start_delay_remaining = random.uniform(min_delay, max_delay)
+            self.green_release_pending = True
+
+        if light_state == "green" and self.green_release_pending:
+            leader_started = vehicle_ahead is None or vehicle_ahead.current_speed > 1.0
+            if leader_started:
+                self.green_start_delay_remaining = max(0.0, self.green_start_delay_remaining - dt)
+                self.green_release_pending = self.green_start_delay_remaining > 0
+            green_start_wait = self.green_release_pending
+        elif light_state != "green":
+            self.green_start_delay_remaining = 0.0
+            self.green_release_pending = False
+
+        self.last_light_state = light_state
+
         if self.turning:
             self._update_turn(dt)
             return
@@ -343,79 +420,81 @@ class Vehicle:
         if dist_to_stop < -self.length:
             self.cleared_intersection = True
 
-        if self.cleared_intersection:
-            self.stopped = False
-            self.current_speed = min(self.speed, self.current_speed + self.acceleration * dt)
-            self.distance_from_stop -= self.current_speed * dt
-            return
-
-        
-        if dist_to_stop < -self.width :
+        if dist_to_stop < -self.width:
             self.cleared_intersection = True
-            self.stopped = False
-            self.current_speed = min(self.speed, self.current_speed + self.acceleration * dt)
-            self.distance_from_stop -= self.current_speed * dt
-            return
 
-        
-        
         dist_to_ahead = float('inf')
         ahead_speed = self.speed
         if vehicle_ahead is not None:
-            dist_to_ahead = self.distance_from_stop - vehicle_ahead.distance_from_stop - self.length
+            dist_to_ahead = self.distance_from_stop - vehicle_ahead.distance_from_stop - vehicle_ahead.length
             ahead_speed = vehicle_ahead.current_speed
             ahead_is_turning = getattr(vehicle_ahead, "turning", False)
         else:
             ahead_is_turning = False
 
-        # Keep a real headway to the car in front instead of collapsing the
-        # queue into bumper-to-bumper spacing once vehicles get close.
-        min_gap = self.desired_gap
-        if vehicle_ahead is not None and dist_to_ahead < min_gap and not ahead_is_turning:
-            self.current_speed = min(self.current_speed, ahead_speed)
-            # self.distance_from_stop = vehicle_ahead.distance_from_stop + self.length + min_gap
-            self.stopped = self.current_speed == 0
-            return
+        target_speed = 0.0 if green_start_wait else self.speed
+        red_stop_distance = self.stop_margin
 
-        target_speed = self.speed
+        # A vehicle that has cleared the intersection no longer obeys this
+        # approach's traffic light, but it must still follow its lane leader.
+        if not self.cleared_intersection and light_state == "red":
+            # Only the first vehicle stops at the line.  Each following
+            # vehicle uses the rear of the vehicle ahead plus its current
+            # dynamic safe gap as its own stopping point.
+            if vehicle_ahead is not None and not ahead_is_turning:
+                red_stop_distance = max(
+                    red_stop_distance,
+                    vehicle_ahead.distance_from_stop
+                    + vehicle_ahead.length
+                    + self.get_safe_following_distance(),
+                )
 
-        if light_state == "red":
-            if dist_to_stop <= self.stop_margin:
+            if dist_to_stop <= red_stop_distance:
                 target_speed = 0
             else:
-                dist_to_actual_stop = dist_to_stop - self.stop_margin
+                dist_to_actual_stop = dist_to_stop - red_stop_distance
                 braking_dist = (self.current_speed ** 2) / (2 * self.braking)
                 if braking_dist >= dist_to_actual_stop:
                     target_speed = 0
 
-        elif light_state == "yellow":
+        elif not self.cleared_intersection and light_state == "yellow":
             dist_to_actual_stop = dist_to_stop - self.stop_margin
-            braking_dist = (self.current_speed ** 2) / (2 * self.braking)
-            
-            if dist_to_stop <= 0:
-                target_speed = self.speed
-                self.cleared_intersection = True
-            elif braking_dist >= dist_to_actual_stop + 10:
-                target_speed = self.speed
-            else:
-                if dist_to_actual_stop <= braking_dist + 20:
-                    target_speed = 0
+
+            if self.yellow_decision is None:
+                if dist_to_stop <= self.stop_margin:
+                    # A vehicle already at the line must continue through on
+                    # yellow rather than beginning a late stop.
+                    self.yellow_decision = "go"
                 else:
-                    ratio = max(0, min(1, dist_to_actual_stop / (braking_dist * 2 + 0.000002)))
-                    target_speed = self.speed * 0.5 * ratio
+                    braking_dist = (self.current_speed ** 2) / (2 * self.braking)
+                    can_stop_comfortably = braking_dist + 10 <= dist_to_actual_stop
+                    self.yellow_decision = "stop" if can_stop_comfortably else "go"
+
+            if self.yellow_decision == "stop":
+                # The maximum speed that can stop exactly at the stop
+                # margin with the configured braking rate (v² = 2ad).
+                target_speed = math.sqrt(
+                    2 * self.braking * max(0.0, dist_to_actual_stop),
+                )
+            else:
+                target_speed = self.speed
 
         target_speed = min(target_speed, self._turn_target_speed(dist_to_stop))
 
         if vehicle_ahead is not None:
+            # Keep the configured, speed-dependent gap as the final spacing.
+            # Reserve a reaction buffer for the relative (closing) speed, so
+            # a faster small vehicle starts slowing before it reaches a
+            # slower large vehicle.  The remaining space determines the
+            # maximum safe closing speed (v² = 2ad).
             safe_dist = self.get_safe_following_distance()
-            
-            if dist_to_ahead <= 15:
-                target_speed = 0 if not ahead_is_turning else min(target_speed, ahead_speed)
-            elif dist_to_ahead < safe_dist:
-                ratio = max(0, (dist_to_ahead - 15) / (safe_dist - 15))
-                follow_speed = ahead_speed + (self.speed - ahead_speed) * ratio
+            if not ahead_is_turning:
+                closing_speed = max(0.0, self.current_speed - ahead_speed)
+                reaction_space = closing_speed * self.reaction_time
+                free_space = max(0.0, dist_to_ahead - safe_dist - reaction_space)
+                safe_closing_speed = math.sqrt(2 * self.braking * free_space)
+                follow_speed = ahead_speed + safe_closing_speed
                 target_speed = min(target_speed, follow_speed)
-
         if self.current_speed < target_speed:
             self.current_speed = min(target_speed, self.current_speed + self.acceleration * dt)
             self.stopped = False
@@ -425,10 +504,20 @@ class Vehicle:
 
         self.distance_from_stop -= self.current_speed * dt
 
-        if (light_state == "red" 
-            and 0 < self.distance_from_stop < self.stop_margin 
-            and not self.cleared_intersection):
+        if (
+            light_state == "yellow"
+            and self.yellow_decision == "stop"
+            and vehicle_ahead is None
+            and 0 < self.distance_from_stop < self.stop_margin
+        ):
             self.distance_from_stop = self.stop_margin
+            self.current_speed = 0
+            self.stopped = True
+
+        if (light_state == "red" 
+            and 0 < self.distance_from_stop < red_stop_distance
+            and not self.cleared_intersection):
+            # self.distance_from_stop = red_stop_distance
             self.current_speed = 0
             self.stopped = True
     

@@ -108,6 +108,9 @@ class Renderer:
 
         cx = w // 2
         cy = h // 2
+        ix_half_width, ix_half_height = self._get_intersection_half_dims()
+        margin = max(2, round(lane_width * self.config.get("road_side_margin_ratio", 0.25)))
+        margin_color = colors.get("road_margin", colors["road"])
 
         # -----------------------------
         # NORTH
@@ -119,17 +122,28 @@ class Renderer:
                 roads["north"]["incoming"] +
                 roads["north"]["outgoing"]
             )
+            road_left = cx - width // 2
+            road_right = road_left + width
 
+            # Paved shoulder / motorcycle margin.  It ends at the
+            # intersection so the intersection geometry remains unchanged.
+            pygame.draw.rect(
+                self.screen,
+                margin_color,
+                (road_left - margin, 0, width + margin * 2, cy - ix_half_height),
+            )
             pygame.draw.rect(
                 self.screen,
                 colors["road"],
                 (
-                    cx - width//2,
+                    road_left,
                     0,
                     width,
                     cy
                 )
             )
+            pygame.draw.line(self.screen, colors["white"], (road_left, 0), (road_left, cy - ix_half_height), 2)
+            pygame.draw.line(self.screen, colors["white"], (road_right, 0), (road_right, cy - ix_half_height), 2)
 
         # -----------------------------
         # SOUTH
@@ -141,17 +155,26 @@ class Renderer:
                 roads["south"]["incoming"] +
                 roads["south"]["outgoing"]
             )
+            road_left = cx - width // 2
+            road_right = road_left + width
 
+            pygame.draw.rect(
+                self.screen,
+                margin_color,
+                (road_left - margin, cy + ix_half_height, width + margin * 2, h - (cy + ix_half_height)),
+            )
             pygame.draw.rect(
                 self.screen,
                 colors["road"],
                 (
-                    cx-width//2,
+                    road_left,
                     cy,
                     width,
                     h-cy
                 )
             )
+            pygame.draw.line(self.screen, colors["white"], (road_left, cy + ix_half_height), (road_left, h), 2)
+            pygame.draw.line(self.screen, colors["white"], (road_right, cy + ix_half_height), (road_right, h), 2)
 
         # -----------------------------
         # WEST
@@ -163,17 +186,26 @@ class Renderer:
                 roads["west"]["incoming"] +
                 roads["west"]["outgoing"]
             )
+            road_top = cy - width // 2
+            road_bottom = road_top + width
 
+            pygame.draw.rect(
+                self.screen,
+                margin_color,
+                (0, road_top - margin, cx - ix_half_width, width + margin * 2),
+            )
             pygame.draw.rect(
                 self.screen,
                 colors["road"],
                 (
                     0,
-                    cy-width//2,
+                    road_top,
                     cx,
                     width
                 )
             )
+            pygame.draw.line(self.screen, colors["white"], (0, road_top), (cx - ix_half_width, road_top), 2)
+            pygame.draw.line(self.screen, colors["white"], (0, road_bottom), (cx - ix_half_width, road_bottom), 2)
 
         # -----------------------------
         # EAST
@@ -185,17 +217,26 @@ class Renderer:
                 roads["east"]["incoming"] +
                 roads["east"]["outgoing"]
             )
+            road_top = cy - width // 2
+            road_bottom = road_top + width
 
+            pygame.draw.rect(
+                self.screen,
+                margin_color,
+                (cx + ix_half_width, road_top - margin, w - (cx + ix_half_width), width + margin * 2),
+            )
             pygame.draw.rect(
                 self.screen,
                 colors["road"],
                 (
                     cx,
-                    cy-width//2,
+                    road_top,
                     w-cx,
                     width
                 )
             )
+            pygame.draw.line(self.screen, colors["white"], (cx + ix_half_width, road_top), (w, road_top), 2)
+            pygame.draw.line(self.screen, colors["white"], (cx + ix_half_width, road_bottom), (w, road_bottom), 2)
     
     def draw_lane_markings(self):
 
