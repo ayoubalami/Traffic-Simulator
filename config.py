@@ -17,7 +17,7 @@ CONFIG = {
         "signal_amber": (255, 220, 0)
     },
     "lane_width_m": 4.0,
-    "crosswalk_intersection_offset_m": 4.0,
+    "crosswalk_intersection_offset_m": 5.0,
     "crosswalk_width_m": 4.0,
     "crosswalk_stop_line_offset_m": 1.0,
     "vertical_road_direction_divider_width_m": 3.0,
@@ -34,6 +34,7 @@ CONFIG = {
         "right_turn_speed_kmh": 30.,
         "left_turn_speed_kmh": 35.,
         "right_turn_slowdown_distance_m": 25,
+        "left_turn_min_forward_progress_m": 12.0,
 
         "size_speed_reduction_per_length_ratio": 0.25,
         "min_size_speed_multiplier": 0.75,

@@ -323,6 +323,83 @@ class Vehicle:
         right_y = forward_x
         return cx, cy, forward_x, forward_y, right_x, right_y
 
+    def _find_vehicle_ahead(self, vehicles):
+        """Return the nearest vehicle occupying this vehicle's forward path.
+
+        Lane membership alone is not enough around the intersection: a
+        turning vehicle can enter a different lane or cross in front of a
+        vehicle before its road/lane fields are updated. Project each
+        vehicle's footprint onto this vehicle's forward and lateral axes so
+        that only traffic physically in the travel corridor is considered.
+        """
+        (
+            self_x,
+            self_y,
+            forward_x,
+            forward_y,
+            right_x,
+            right_y,
+        ) = self._get_pose_vectors()
+
+        closest_vehicle = None
+        closest_gap = float("inf")
+        closest_speed = 0.0
+        self_front_extent = self.length / 2
+        self_side_extent = self.width / 2
+
+        for other in vehicles:
+            if other is self or not other.active:
+                continue
+
+            (
+                other_x,
+                other_y,
+                other_forward_x,
+                other_forward_y,
+                other_right_x,
+                other_right_y,
+            ) = other._get_pose_vectors()
+            offset_x = other_x - self_x
+            offset_y = other_y - self_y
+            longitudinal_distance = (
+                offset_x * forward_x + offset_y * forward_y
+            )
+            if longitudinal_distance <= 0:
+                continue
+
+            # A rotated vehicle's extent along each axis. This keeps an
+            # in-progress turn in the corridor until it has cleared it.
+            other_front_extent = (
+                other.length / 2
+                * abs(other_forward_x * forward_x + other_forward_y * forward_y)
+                + other.width / 2
+                * abs(other_right_x * forward_x + other_right_y * forward_y)
+            )
+            other_side_extent = (
+                other.length / 2
+                * abs(other_forward_x * right_x + other_forward_y * right_y)
+                + other.width / 2
+                * abs(other_right_x * right_x + other_right_y * right_y)
+            )
+            lateral_distance = abs(offset_x * right_x + offset_y * right_y)
+            if lateral_distance > self_side_extent + other_side_extent:
+                continue
+
+            gap = longitudinal_distance - self_front_extent - other_front_extent
+            if gap >= closest_gap:
+                continue
+
+            closest_vehicle = other
+            closest_gap = gap
+            # Perpendicular or oncoming traffic is treated as stationary in
+            # this vehicle's path, so it is yielded to rather than followed.
+            closest_speed = other.current_speed * max(
+                0.0,
+                other_forward_x * forward_x + other_forward_y * forward_y,
+            )
+
+        return closest_vehicle, closest_gap, closest_speed
+
     def _turn_lane_index(self, direction):
         if self.turn_side == "left":
             return self._left_lane_index(direction)
@@ -338,10 +415,8 @@ class Vehicle:
         end_distance = -(half_dim + self.length * 2.5)
         end = self._center_for_distance(new_direction, new_lane, end_distance)
 
-        # Preserve the compact curve used by narrow roads.  On a wide road,
-        # only extend the exit point enough to put it at least one lane ahead
-        # of the entry point in the new travel direction; extending it across
-        # the whole intersection makes the turn unnecessarily wide.
+        # Keep right turns compact, but give left turns a larger radius so
+        # they do not cut through the middle of the intersection.
         forward = {
             "north": (0, 1),
             "south": (0, -1),
@@ -350,17 +425,26 @@ class Vehicle:
         }[new_direction]
         forward_progress = (end[0] - start[0]) * forward[0] + (end[1] - start[1]) * forward[1]
         min_forward_progress = self.config["lane_width"]
+        if self.turn_side == "left":
+            min_forward_progress = max(
+                min_forward_progress,
+                self._meters_to_pixels(
+                    self.config["vehicle_defaults"].get(
+                        "left_turn_min_forward_progress_m", 12.0,
+                    ),
+                ),
+            )
         if forward_progress < min_forward_progress:
             end_distance -= min_forward_progress - forward_progress
             end = self._center_for_distance(new_direction, new_lane, end_distance)
 
         if self.road_direction in ("north", "south"):
-            control = (start[0], end[1])
+            corner_control = (start[0], end[1])
         else:
-            control = (end[0], start[1])
+            corner_control = (end[0], start[1])
 
-        self.turn_curve = (start, control, end, new_direction, new_lane, end_distance)
-        self.turn_curve_length = self._curve_length(start, control, end)
+        self.turn_curve = (start, corner_control, end, new_direction, new_lane, end_distance)
+        self.turn_curve_length = self._curve_length(start, corner_control, end)
         self.turn_progress = 0.0
         self.turning = True
         self.stopped = False
@@ -391,21 +475,114 @@ class Vehicle:
         self.draw_angle = None
         self.cleared_intersection = True
 
-    def _update_turn(self, dt):
+    def _turn_has_pedestrian_conflict(self, pedestrians):
+        """Whether a pedestrian overlaps the upcoming left or right turn path."""
+        if not self.turn_target_direction or not self.turn_curve:
+            return False
+
+        exit_crossing = self.config["roads"][self.turn_target_direction]["inverse"]
+        p0, p1, p2, _, _, _ = self.turn_curve
+        path_points = [
+            self._quadratic_bezier(p0, p1, p2, t / 12)
+            for t in range(math.ceil(self.turn_progress * 12), 13)
+        ]
+        curve_end = path_points[-1]
+        forward = {
+            "north": (0, 1),
+            "south": (0, -1),
+            "west": (1, 0),
+            "east": (-1, 0),
+        }[self.turn_target_direction]
+        lookahead = max(
+            self.length * 2,
+            self.config["crosswalk_width"] + self._meters_to_pixels(2),
+        )
+        path_points.append((
+            curve_end[0] + forward[0] * lookahead,
+            curve_end[1] + forward[1] * lookahead,
+        ))
+
+        def distance_to_segment(point, start, end):
+            dx, dy = end[0] - start[0], end[1] - start[1]
+            length_squared = dx * dx + dy * dy
+            if length_squared == 0:
+                return math.dist(point, start)
+            t = max(0.0, min(1.0, ((point[0] - start[0]) * dx + (point[1] - start[1]) * dy) / length_squared))
+            closest = (start[0] + t * dx, start[1] + t * dy)
+            return math.dist(point, closest)
+
+        for pedestrian in pedestrians:
+            if pedestrian.crossing != exit_crossing:
+                continue
+            # Pedestrians waiting on the sidewalk are not in conflict; a
+            # pedestrian paused at the centre divider remains in the road.
+            if pedestrian.waiting and not pedestrian.has_reached_divider:
+                continue
+
+            clearance = self.width / 2 + pedestrian.radius + self._meters_to_pixels(0.5)
+            if any(
+                distance_to_segment(pedestrian.position, start, end) <= clearance
+                for start, end in zip(path_points, path_points[1:])
+            ):
+                return True
+        return False
+
+    def _update_turn(self, dt, pedestrians=(), vehicles=()):
         self.stopped = False
+        pedestrian_conflict = self._turn_has_pedestrian_conflict(pedestrians)
+        vehicle_ahead, dist_to_ahead, ahead_speed = self._find_vehicle_ahead(vehicles)
+        yield_stop_progress = 0.98
         turn_speed = self._selected_turn_speed()
+        if pedestrian_conflict:
+            # Brake for a stop at the end of the curve, immediately before
+            # the exit crosswalk, instead of stopping in the intersection.
+            remaining_distance = max(
+                0.0,
+                (yield_stop_progress - self.turn_progress) * self.turn_curve_length,
+            )
+            turn_speed = min(
+                turn_speed,
+                math.sqrt(2 * self.braking * remaining_distance),
+            )
+        if vehicle_ahead is not None:
+            safe_dist = self.get_safe_following_distance()
+            closing_speed = max(0.0, self.current_speed - ahead_speed)
+            reaction_space = closing_speed * self.reaction_time
+            free_space = max(0.0, dist_to_ahead - safe_dist - reaction_space)
+            safe_closing_speed = math.sqrt(2 * self.braking * free_space)
+            turn_speed = min(turn_speed, ahead_speed + safe_closing_speed)
+            if dist_to_ahead <= safe_dist:
+                turn_speed = min(turn_speed, ahead_speed)
+
         if self.current_speed < turn_speed:
             self.current_speed = min(turn_speed, self.current_speed + self.acceleration * dt)
         elif self.current_speed > turn_speed:
             self.current_speed = max(turn_speed, self.current_speed - self.braking * dt)
 
-        self.turn_progress += (self.current_speed * dt) / self.turn_curve_length
+        distance_travelled = self.current_speed * dt
+        if vehicle_ahead is not None:
+            safe_dist = self.get_safe_following_distance()
+            available_space = max(0.0, dist_to_ahead - safe_dist)
+            if distance_travelled > available_space:
+                distance_travelled = available_space
+                self.current_speed = distance_travelled / dt if dt > 0 else 0.0
+                self.stopped = self.current_speed == 0
+
+        next_progress = self.turn_progress + distance_travelled / self.turn_curve_length
+        if pedestrian_conflict and next_progress >= yield_stop_progress:
+            self.turn_progress = yield_stop_progress
+            self.current_speed = 0.0
+            self.stopped = True
+            self._update_turn_draw_state()
+            return
+
+        self.turn_progress = next_progress
         if self.turn_progress >= 1.0:
             self._finish_turn()
             return
         self._update_turn_draw_state()
  
-    def update(self, dt, light_state, vehicle_ahead=None):
+    def update(self, dt, light_state, vehicle_ahead=None, pedestrians=(), vehicles=()):
         if light_state != "yellow":
             self.yellow_decision = None
 
@@ -438,30 +615,42 @@ class Vehicle:
         self.last_light_state = light_state
 
         if self.turning:
-            self._update_turn(dt)
+            self._update_turn(dt, pedestrians, vehicles)
             return
 
         dist_to_stop = self.distance_from_stop
-
-        if self.is_turning_vehicle and not self.has_turned and dist_to_stop < -self.width:
+        turn_entry_distance = -self.width
+        approaching_turn = self.is_turning_vehicle and not self.has_turned
+        if approaching_turn and self.turn_side == "left":
+            ix_half_width, ix_half_height = self._intersection_half_dims()
+            # A left-turning vehicle first travels to the centre divider,
+            # then begins its wide turn from there.
+            turn_entry_distance = -(
+                ix_half_height
+                if self.road_direction in ("north", "south")
+                else ix_half_width
+            )
+        if (
+            approaching_turn
+            and dist_to_stop <= turn_entry_distance
+        ):
             self._start_turn()
-            self._update_turn(dt)
+            self._update_turn(dt, pedestrians, vehicles)
             return
 
-        if dist_to_stop < -self.length:
+        if (
+            dist_to_stop < -self.length
+            and (not approaching_turn or dist_to_stop <= turn_entry_distance)
+        ):
             self.cleared_intersection = True
 
-        if dist_to_stop < -self.width:
+        if (
+            dist_to_stop < -self.width
+            and (not approaching_turn or dist_to_stop <= turn_entry_distance)
+        ):
             self.cleared_intersection = True
 
-        dist_to_ahead = float('inf')
-        ahead_speed = self.speed
-        if vehicle_ahead is not None:
-            dist_to_ahead = self.distance_from_stop - vehicle_ahead.distance_from_stop - vehicle_ahead.length
-            ahead_speed = vehicle_ahead.current_speed
-            ahead_is_turning = getattr(vehicle_ahead, "turning", False)
-        else:
-            ahead_is_turning = False
+        traffic_ahead, dist_to_ahead, ahead_speed = self._find_vehicle_ahead(vehicles)
 
         target_speed = 0.0 if green_start_wait else self.speed
         red_stop_distance = self.stop_margin
@@ -481,7 +670,7 @@ class Vehicle:
                 # Only the first vehicle stops at the line.  Each following
                 # vehicle uses the rear of the vehicle ahead plus its current
                 # dynamic safe gap as its own stopping point.
-                if vehicle_ahead is not None and not ahead_is_turning:
+                if vehicle_ahead is not None:
                     red_stop_distance = max(
                         red_stop_distance,
                         vehicle_ahead.distance_from_stop
@@ -524,20 +713,27 @@ class Vehicle:
 
         target_speed = min(target_speed, self._turn_target_speed(dist_to_stop))
 
-        if vehicle_ahead is not None:
+        if traffic_ahead is not None:
             # Keep the configured, speed-dependent gap as the final spacing.
             # Reserve a reaction buffer for the relative (closing) speed, so
             # a faster small vehicle starts slowing before it reaches a
             # slower large vehicle.  The remaining space determines the
             # maximum safe closing speed (v² = 2ad).
             safe_dist = self.get_safe_following_distance()
-            if not ahead_is_turning:
-                closing_speed = max(0.0, self.current_speed - ahead_speed)
-                reaction_space = closing_speed * self.reaction_time
-                free_space = max(0.0, dist_to_ahead - safe_dist - reaction_space)
-                safe_closing_speed = math.sqrt(2 * self.braking * free_space)
-                follow_speed = ahead_speed + safe_closing_speed
-                target_speed = min(target_speed, follow_speed)
+            closing_speed = max(0.0, self.current_speed - ahead_speed)
+            reaction_space = closing_speed * self.reaction_time
+            free_space = max(0.0, dist_to_ahead - safe_dist - reaction_space)
+            safe_closing_speed = math.sqrt(2 * self.braking * free_space)
+            follow_speed = ahead_speed + safe_closing_speed
+            target_speed = min(target_speed, follow_speed)
+
+            # Once the gap is already at or below the safe distance, do not
+            # keep closing on the lead vehicle.  A stopped leader therefore
+            # makes this vehicle stop; a moving leader lets it match the
+            # leader's speed until the safe gap opens again.
+            if dist_to_ahead <= safe_dist:
+                target_speed = min(target_speed, ahead_speed)
+
         if self.current_speed < target_speed:
             self.current_speed = min(target_speed, self.current_speed + self.acceleration * dt)
             self.stopped = False
@@ -545,7 +741,20 @@ class Vehicle:
             self.current_speed = max(target_speed, self.current_speed - self.braking * dt)
             self.stopped = self.current_speed == 0
 
-        self.distance_from_stop -= self.current_speed * dt
+        distance_travelled = self.current_speed * dt
+        if traffic_ahead is not None:
+            # The speed target above starts braking early.  This final cap is
+            # a collision guard for large frame times or an unexpectedly slow
+            # lead vehicle: a vehicle may never use a frame to enter its safe
+            # following distance.
+            safe_dist = self.get_safe_following_distance()
+            available_space = max(0.0, dist_to_ahead - safe_dist)
+            if distance_travelled > available_space:
+                distance_travelled = available_space
+                self.current_speed = distance_travelled / dt if dt > 0 else 0.0
+                self.stopped = self.current_speed == 0
+
+        self.distance_from_stop -= distance_travelled
 
         if (
             light_state == "yellow"

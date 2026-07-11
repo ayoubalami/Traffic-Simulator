@@ -130,7 +130,13 @@ class Simulation:
             for i, v in enumerate(vehicles_in_lane):
                 ahead = vehicles_in_lane[i - 1] if i > 0 else None
                 light = self.light_controller.get_state(v.road_direction)
-                v.update(dt, light, ahead)
+                v.update(
+                    dt,
+                    light,
+                    ahead,
+                    self.pedestrians,
+                    self.vehicles,
+                )
     
     def _remove_off_screen(self):
         exited = [v for v in self.vehicles if v.is_off_screen()]
