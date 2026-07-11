@@ -1,10 +1,11 @@
-from config import CONFIG
+from config import CONFIG, build_runtime_config
 from simulation import Simulation
 from renderer import Renderer
 
 def main():
-    simulation = Simulation(CONFIG)
-    renderer = Renderer(CONFIG)
+    runtime_config = build_runtime_config(CONFIG)
+    simulation = Simulation(runtime_config)
+    renderer = Renderer(runtime_config)
     
     while renderer.is_running():
         dt = renderer.clock.tick(60) / 1000.0

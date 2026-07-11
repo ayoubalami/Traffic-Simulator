@@ -43,8 +43,8 @@ class Simulation:
         w = self.config["window"]["width"]
         h = self.config["window"]["height"]
         defaults = self.config["vehicle_defaults"]
-        min_length = defaults.get("vehicle_length_min", defaults.get("vehicle_length", 50))
-        max_length = defaults.get("vehicle_length_max", defaults.get("vehicle_length", 50))
+        min_length = defaults.get("vehicle_length_min_m", defaults.get("vehicle_length_m", 4.5))
+        max_length = defaults.get("vehicle_length_max_m", defaults.get("vehicle_length_m", 4.5))
         
         for _ in range(10):
             direction = random.choice(enabled)
@@ -107,7 +107,7 @@ class Simulation:
             choices = []
             weights = []
             for entry in weighted_lengths:
-                length = int(entry.get("length", min_length))
+                length = float(entry.get("length_m", min_length))
                 weight = float(entry.get("weight", 0))
                 if min_length <= length <= max_length and weight > 0:
                     choices.append(length)
@@ -116,7 +116,7 @@ class Simulation:
             if choices:
                 return random.choices(choices, weights=weights, k=1)[0]
 
-        return random.randint(min_length, max_length)
+        return random.uniform(min_length, max_length)
     
     def _update_vehicles(self, dt):
         lanes = defaultdict(list)

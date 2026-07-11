@@ -17,6 +17,14 @@ class Renderer:
             if event.type == pygame.QUIT:
                 self.running = False
         return self.running
+
+    def _divider_width(self, direction):
+        key = (
+            "vertical_road_direction_divider_width"
+            if direction in ("north", "south")
+            else "horizontal_road_direction_divider_width"
+        )
+        return self.config[key]
     
     def close(self):
         pygame.quit()
@@ -115,9 +123,9 @@ class Renderer:
         roads = self.config["roads"]
         ix_half_width, ix_half_height = self._get_intersection_half_dims()
         vehicle_stop_distance = (
-            max(10, lane_width // 1)
-            + max(40, lane_width // 1.5)
-            + max(5, lane_width // 6)
+            self.config["crosswalk_intersection_offset"]
+            + self.config["crosswalk_width"]
+            + self.config["crosswalk_stop_line_offset"]
         )
 
         def draw_signal(x, y, state, horizontal):
@@ -135,7 +143,7 @@ class Renderer:
             if not roads[crossing]["enabled"]:
                 continue
             state = light_controller.get_pedestrian_state(crossing)
-            road_width = lane_width * (roads[crossing]["incoming"] + roads[crossing]["outgoing"])
+            road_width = lane_width * (roads[crossing]["incoming"] + roads[crossing]["outgoing"]) + self._divider_width(crossing)
 
             if crossing in ("north", "south"):
                 stop_y = (cy - ix_half_height - vehicle_stop_distance if crossing == "north"
@@ -165,6 +173,8 @@ class Renderer:
         colors = self.config["colors"]
 
         lane_width = self.config["lane_width"]
+        vertical_divider_width = self.config["vertical_road_direction_divider_width"]
+        horizontal_divider_width = self.config["horizontal_road_direction_divider_width"]
 
         roads = self.config["roads"]
 
@@ -186,7 +196,7 @@ class Renderer:
             width = lane_width * (
                 roads["north"]["incoming"] +
                 roads["north"]["outgoing"]
-            )
+            ) + vertical_divider_width
             road_left = cx - width // 2
             road_right = road_left + width
 
@@ -219,7 +229,7 @@ class Renderer:
             width = lane_width * (
                 roads["south"]["incoming"] +
                 roads["south"]["outgoing"]
-            )
+            ) + vertical_divider_width
             road_left = cx - width // 2
             road_right = road_left + width
 
@@ -250,7 +260,7 @@ class Renderer:
             width = lane_width * (
                 roads["west"]["incoming"] +
                 roads["west"]["outgoing"]
-            )
+            ) + horizontal_divider_width
             road_top = cy - width // 2
             road_bottom = road_top + width
 
@@ -281,7 +291,7 @@ class Renderer:
             width = lane_width * (
                 roads["east"]["incoming"] +
                 roads["east"]["outgoing"]
-            )
+            ) + horizontal_divider_width
             road_top = cy - width // 2
             road_bottom = road_top + width
 
@@ -389,6 +399,8 @@ class Renderer:
         colors = self.config["colors"]
         crosswalk_color = colors.get("crosswalk", colors["white"])
         lane_width = self.config["lane_width"]
+        vertical_divider_width = self._divider_width("north")
+        horizontal_divider_width = self._divider_width("west")
         roads = self.config["roads"]
         w = self.config["window"]["width"]
         h = self.config["window"]["height"]
@@ -399,8 +411,8 @@ class Renderer:
         # lane_width=30
         stripe_width = max(4, lane_width // 10)
         stripe_gap = max(6, lane_width // 5)
-        setback = max(10, lane_width // 1.0)
-        crosswalk_depth = max(35, lane_width // 1.5)
+        setback = self.config["crosswalk_intersection_offset"]
+        crosswalk_depth = self.config["crosswalk_width"]
 
         def draw_horizontal_crosswalk(y, x_start, x_end):
             x = x_start
@@ -426,28 +438,28 @@ class Renderer:
 
         if roads["north"]["enabled"]:
             total_lanes = roads["north"]["incoming"] + roads["north"]["outgoing"]
-            road_width = total_lanes * lane_width
+            road_width = total_lanes * lane_width + vertical_divider_width
             road_left = cx - road_width / 2
             crosswalk_y = cy - ix_half_height - setback - crosswalk_depth
             draw_horizontal_crosswalk(crosswalk_y, road_left, road_left + road_width)
 
         if roads["south"]["enabled"]:
             total_lanes = roads["south"]["incoming"] + roads["south"]["outgoing"]
-            road_width = total_lanes * lane_width
+            road_width = total_lanes * lane_width + vertical_divider_width
             road_left = cx - road_width / 2
             crosswalk_y = cy + ix_half_height + setback
             draw_horizontal_crosswalk(crosswalk_y, road_left, road_left + road_width)
 
         if roads["west"]["enabled"]:
             total_lanes = roads["west"]["incoming"] + roads["west"]["outgoing"]
-            road_width = total_lanes * lane_width
+            road_width = total_lanes * lane_width + horizontal_divider_width
             road_top = cy - road_width / 2
             crosswalk_x = cx - ix_half_width - setback - crosswalk_depth
             draw_vertical_crosswalk(crosswalk_x, road_top, road_top + road_width)
 
         if roads["east"]["enabled"]:
             total_lanes = roads["east"]["incoming"] + roads["east"]["outgoing"]
-            road_width = total_lanes * lane_width
+            road_width = total_lanes * lane_width + horizontal_divider_width
             road_top = cy - road_width / 2
             crosswalk_x = cx + ix_half_width + setback
             draw_vertical_crosswalk(crosswalk_x, road_top, road_top + road_width)
@@ -460,13 +472,15 @@ class Renderer:
         cx = w // 2
         cy = h // 2
         lane_width = self.config["lane_width"]
+        vertical_divider_width = self._divider_width("north")
+        horizontal_divider_width = self._divider_width("west")
         roads = self.config["roads"]
 
         ix_half_width, ix_half_height = self._get_intersection_half_dims()
         stop_distance = (
-            max(10, lane_width // 1)
-            + max(40, lane_width // 1.5)
-            + max(5, lane_width // 6)
+            self.config["crosswalk_intersection_offset"]
+            + self.config["crosswalk_width"]
+            + self.config["crosswalk_stop_line_offset"]
         )
 
         line_thickness = 3
@@ -474,7 +488,7 @@ class Renderer:
         # NORTH: vehicles move SOUTH (down). Stop line is horizontal, at bottom of north road.
         if roads["north"]["enabled"]:
             total_lanes = roads["north"]["incoming"] + roads["north"]["outgoing"]
-            road_width = total_lanes * lane_width
+            road_width = total_lanes * lane_width + vertical_divider_width
             road_left = cx - road_width / 2
             stop_y = cy - ix_half_height - stop_distance
             # Only across incoming lanes (right side of yellow center line = left half)
@@ -490,11 +504,11 @@ class Renderer:
         # SOUTH: vehicles move NORTH (up). Stop line is horizontal, at top of south road.
         if roads["south"]["enabled"]:
             total_lanes = roads["south"]["incoming"] + roads["south"]["outgoing"]
-            road_width = total_lanes * lane_width
+            road_width = total_lanes * lane_width + vertical_divider_width
             road_left = cx - road_width / 2
             stop_y = cy + ix_half_height + stop_distance
             # Only across incoming lanes (left side of yellow center line = right half)
-            incoming_start = road_left + roads["south"]["outgoing"] * lane_width
+            incoming_start = road_left + roads["south"]["outgoing"] * lane_width + vertical_divider_width
             incoming_end = incoming_start + roads["south"]["incoming"] * lane_width
             pygame.draw.line(
                 self.screen,
@@ -507,11 +521,11 @@ class Renderer:
                # WEST: vehicles move EAST (right). Stop line is vertical, at right edge of west road.
         if roads["west"]["enabled"]:
             total_lanes = roads["west"]["incoming"] + roads["west"]["outgoing"]
-            road_width = total_lanes * lane_width
+            road_width = total_lanes * lane_width + horizontal_divider_width
             road_top = cy - road_width / 2
             stop_x = cx - ix_half_width - stop_distance
             # Incoming lanes are BELOW the yellow center line
-            center_y = road_top + roads["west"]["outgoing"] * lane_width
+            center_y = road_top + roads["west"]["outgoing"] * lane_width + horizontal_divider_width
             incoming_end = center_y + roads["west"]["incoming"] * lane_width
             pygame.draw.line(
                 self.screen,
@@ -524,11 +538,11 @@ class Renderer:
         # EAST: vehicles move WEST (left). Stop line is vertical, at left edge of east road.
         if roads["east"]["enabled"]:
             total_lanes = roads["east"]["incoming"] + roads["east"]["outgoing"]
-            road_width = total_lanes * lane_width
+            road_width = total_lanes * lane_width + horizontal_divider_width
             road_top = cy - road_width / 2
             stop_x = cx + ix_half_width + stop_distance
             # Incoming lanes are ABOVE the yellow center line
-            center_y = road_top + roads["east"]["outgoing"] * lane_width
+            center_y = road_top + roads["east"]["incoming"] * lane_width
             pygame.draw.line(
                 self.screen,
                 colors["white"],
@@ -583,11 +597,15 @@ class Renderer:
                 return
 
             total_lanes = road["incoming"] + road["outgoing"]
-            road_width = total_lanes * lane_width
+            divider_width = self._divider_width(direction)
+            road_width = total_lanes * lane_width + divider_width
 
             for i in range(road["incoming"]):
                 lane_idx = lane_start_idx + i
                 lane_center = lane_idx * lane_width + lane_width / 2
+                separator_after = road["incoming"] if direction in ("north", "east") else road["outgoing"]
+                if lane_idx >= separator_after:
+                    lane_center += divider_width
 
                 if direction in ("north", "south"):
                     # Vertical road: lane_center_x is offset from road_left
@@ -633,9 +651,9 @@ class Renderer:
         padding = 3
         side_offset = 15
         vehicle_stop_distance = (
-            max(10, lane_width // 1)
-            + max(40, lane_width // 1.5)
-            + max(5, lane_width // 6)
+            self.config["crosswalk_intersection_offset"]
+            + self.config["crosswalk_width"]
+            + self.config["crosswalk_stop_line_offset"]
         )
 
         timer_font = pygame.font.SysFont("monospace", 14)
@@ -698,7 +716,7 @@ class Renderer:
 
             light_state = light_controller.get_state(direction)
             total_lanes = road["incoming"] + road["outgoing"]
-            road_width = total_lanes * lane_width
+            road_width = total_lanes * lane_width + self._divider_width(direction)
 
             if direction == "north":
                 road_left = cx - road_width / 2
@@ -739,23 +757,25 @@ class Renderer:
         from_top):
 
         colors = self.config["colors"]
+        divider_width = self._divider_width("north")
 
         total = incoming + outgoing
 
-        road_width = total * lane_width
+        road_width = total * lane_width + divider_width
 
         left = x - road_width / 2
 
         # Yellow center line (solid)
 
-        center = left + outgoing * lane_width
+        separator_after = incoming if from_top else outgoing
+        center = left + separator_after * lane_width + divider_width / 2
 
         pygame.draw.line(
             self.screen,
-            colors["yellow"],
+            colors["direction_divider"],
             (center, start_y),
             (center, end_y),
-            3
+            divider_width
         )
 
         # White separators (dashed)
@@ -765,7 +785,7 @@ class Renderer:
             if i == outgoing:
                 continue
 
-            xx = left + i * lane_width
+            xx = left + i * lane_width + (divider_width if i > separator_after else 0)
 
             self._draw_dashed_line(
                 colors["white"],
@@ -782,15 +802,15 @@ class Renderer:
 
         v_width = 0
         if roads["north"]["enabled"]:
-            v_width = max(v_width, lane_width * (roads["north"]["incoming"] + roads["north"]["outgoing"]))
+            v_width = max(v_width, lane_width * (roads["north"]["incoming"] + roads["north"]["outgoing"]) + self._divider_width("north"))
         if roads["south"]["enabled"]:
-            v_width = max(v_width, lane_width * (roads["south"]["incoming"] + roads["south"]["outgoing"]))
+            v_width = max(v_width, lane_width * (roads["south"]["incoming"] + roads["south"]["outgoing"]) + self._divider_width("south"))
 
         h_width = 0
         if roads["east"]["enabled"]:
-            h_width = max(h_width, lane_width * (roads["east"]["incoming"] + roads["east"]["outgoing"]))
+            h_width = max(h_width, lane_width * (roads["east"]["incoming"] + roads["east"]["outgoing"]) + self._divider_width("east"))
         if roads["west"]["enabled"]:
-            h_width = max(h_width, lane_width * (roads["west"]["incoming"] + roads["west"]["outgoing"]))
+            h_width = max(h_width, lane_width * (roads["west"]["incoming"] + roads["west"]["outgoing"]) + self._divider_width("west"))
 
         return v_width / 2, h_width / 2
     
@@ -844,22 +864,24 @@ class Renderer:
         from_left):
 
         colors = self.config["colors"]
+        divider_width = self._divider_width("west")
 
         total = incoming + outgoing
 
-        road_width = total * lane_width
+        road_width = total * lane_width + divider_width
 
         top = y - road_width / 2
 
-        center = top + outgoing * lane_width
+        separator_after = outgoing if from_left else incoming
+        center = top + separator_after * lane_width + divider_width / 2
 
         # Yellow center line (solid)
         pygame.draw.line(
             self.screen,
-            colors["yellow"],
+            colors["direction_divider"],
             (start_x, center),
             (end_x, center),
-            3
+            divider_width
         )
 
         # White separators (dashed)
@@ -868,7 +890,7 @@ class Renderer:
             if i == outgoing:
                 continue
 
-            yy = top + i * lane_width
+            yy = top + i * lane_width + (divider_width if i > separator_after else 0)
 
             self._draw_dashed_line(
                 colors["white"],

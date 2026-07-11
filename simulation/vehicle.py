@@ -3,6 +3,20 @@ import random
 import pygame
 
 class Vehicle:
+    def _divider_width(self, direction):
+        key = (
+            "vertical_road_direction_divider_width"
+            if direction in ("north", "south")
+            else "horizontal_road_direction_divider_width"
+        )
+        return self.config[key]
+
+    def _meters_to_pixels(self, meters):
+        return meters * self.config["simulation"]["pixels_per_meter"]
+
+    def _kmh_to_pixels_per_second(self, kmh):
+        return self._meters_to_pixels(kmh / 3.6)
+
     # Turn targets are expressed in this codebase's road labels, where a
     # road direction names the approach and vehicles travel toward the
     # intersection from that side.
@@ -28,17 +42,21 @@ class Vehicle:
         self.color = (250, 200, 200)
         self.active = True
         
-        self.width = config["vehicle_defaults"].get("vehicle_width", 25)
-        default_length = config["vehicle_defaults"].get("vehicle_length", 50)
-        self.length = vehicle_length if vehicle_length is not None else default_length
+        defaults = config["vehicle_defaults"]
+        self.width = self._meters_to_pixels(defaults.get("vehicle_width_m", 1.8))
+        default_length_m = defaults.get("vehicle_length_m", 4.5)
+        self.length = self._meters_to_pixels(
+            vehicle_length if vehicle_length is not None else default_length_m,
+        )
         
-        base_length = config["vehicle_defaults"].get("vehicle_length", 50)
+        base_length = self._meters_to_pixels(default_length_m)
         length_scale = max(0.5, min(1.6, self.length / max(1, base_length)))
 
         # The configured speed is for a vehicle of the default length.
         # Larger vehicles receive a lower maximum speed; the lower bound
         # prevents unusually long vehicles from becoming unrealistically slow.
-        base_speed_kmh = config["vehicle_defaults"].get("speed_kmh", 50)
+        base_speed_kmh = defaults.get("max_speed_kmh", 50)
+        base_speed = self._kmh_to_pixels_per_second(base_speed_kmh)
         reduction = config["vehicle_defaults"].get(
             "size_speed_reduction_per_length_ratio", 0.30,
         )
@@ -54,13 +72,15 @@ class Vehicle:
             config["vehicle_defaults"].get("speed_variation_ratio", 0.05),
         )
         self.speed_variation = random.uniform(-speed_variation, speed_variation)
-        self.speed_kmh = base_speed_kmh * self.speed_multiplier * (1 + self.speed_variation)
-        self.speed = self._kmh_to_pixels_per_second(self.speed_kmh)
-        # turn_speed_kmh = config["vehicle_defaults"].get("right_turn_speed_kmh", 25)
-        self.right_turn_speed = self._kmh_to_pixels_per_second(self.speed_kmh / 1.75)
-        self.right_turn_slowdown_distance = config["vehicle_defaults"].get(
-            "right_turn_slowdown_distance",
-            self.length * 2,
+        self.speed = base_speed * self.speed_multiplier * (1 + self.speed_variation)
+        self.right_turn_speed = self._kmh_to_pixels_per_second(
+            defaults.get("right_turn_speed_kmh", base_speed_kmh / 1.75),
+        )
+        self.left_turn_speed = self._kmh_to_pixels_per_second(
+            defaults.get("left_turn_speed_kmh", base_speed_kmh / 1.5),
+        )
+        self.right_turn_slowdown_distance = self._meters_to_pixels(
+            defaults.get("right_turn_slowdown_distance_m", default_length_m * 2),
         )
         self.current_speed = self.speed
         self.stopped = False
@@ -72,18 +92,27 @@ class Vehicle:
 
         # Larger vehicles accelerate and brake a bit more slowly so the
         # queue feels less "same-speed" and more like mixed traffic.
-        self.acceleration = 80.0 / length_scale
-        self.min_speed = 0.0
-        self.reaction_time = 0.8
-        self.deceleration = 6.5 / length_scale
-       
-        ppm = self.config.get("simulation", {}).get("pixels_per_meter", 10)
-        self.braking = self.deceleration * ppm
+        self.acceleration = self._meters_to_pixels(
+            defaults.get("acceleration_mps2", 2.5),
+        ) / length_scale
+        self.min_speed = self._meters_to_pixels(defaults.get("min_speed_mps", 0.0))
+        self.reaction_time = defaults.get("reaction_time_s", 0.8)
+        self.deceleration = self._meters_to_pixels(
+            defaults.get("deceleration_mps2", 3.0),
+        ) / length_scale
+        self.braking = self._meters_to_pixels(
+            defaults.get("braking_deceleration_mps2", 6.5),
+        ) / length_scale
        
         self.cleared_intersection = False
-        self.desired_gap = config["vehicle_defaults"].get("safe_distance", 24)
+        self.desired_gap = self._meters_to_pixels(defaults.get("safe_distance_m", 3.0))
         self.moving_gap_multiplier = config["vehicle_defaults"].get("safe_distance_moving_multiplier", 1.0)
-        self.stop_margin = self._crosswalk_stop_distance()
+        stop_gap_min = max(0.0, self._meters_to_pixels(defaults.get("stop_line_gap_min_m", 0)))
+        stop_gap_max = max(
+            stop_gap_min,
+            self._meters_to_pixels(defaults.get("stop_line_gap_max_m", 0)),
+        )
+        self.stop_margin = self._crosswalk_stop_distance() + random.uniform(stop_gap_min, stop_gap_max)
 
         # --- right-turn setup ---
         # Decided once at spawn: only the outer (rightmost) lane of a road
@@ -159,15 +188,15 @@ class Vehicle:
 
         v_width = 0
         if roads["north"]["enabled"]:
-            v_width = max(v_width, lane_width * (roads["north"]["incoming"] + roads["north"]["outgoing"]))
+            v_width = max(v_width, lane_width * (roads["north"]["incoming"] + roads["north"]["outgoing"]) + self._divider_width("north"))
         if roads["south"]["enabled"]:
-            v_width = max(v_width, lane_width * (roads["south"]["incoming"] + roads["south"]["outgoing"]))
+            v_width = max(v_width, lane_width * (roads["south"]["incoming"] + roads["south"]["outgoing"]) + self._divider_width("south"))
 
         h_width = 0
         if roads["east"]["enabled"]:
-            h_width = max(h_width, lane_width * (roads["east"]["incoming"] + roads["east"]["outgoing"]))
+            h_width = max(h_width, lane_width * (roads["east"]["incoming"] + roads["east"]["outgoing"]) + self._divider_width("east"))
         if roads["west"]["enabled"]:
-            h_width = max(h_width, lane_width * (roads["west"]["incoming"] + roads["west"]["outgoing"]))
+            h_width = max(h_width, lane_width * (roads["west"]["incoming"] + roads["west"]["outgoing"]) + self._divider_width("west"))
 
         return v_width / 2, h_width / 2
 
@@ -177,9 +206,9 @@ class Vehicle:
         vehicle should halt so it remains before the crosswalk.
         """
         lane_width = self.config["lane_width"]
-        crosswalk_setback = max(10, lane_width // 1)
-        crosswalk_depth = max(40, lane_width // 1.5)
-        safety_buffer = max(5, lane_width // 6)
+        crosswalk_setback = self.config["crosswalk_intersection_offset"]
+        crosswalk_depth = self.config["crosswalk_width"]
+        safety_buffer = self.config["crosswalk_stop_line_offset"]
 
         # stripe_width = max(6, lane_width // 8)
         # stripe_gap = max(6, lane_width // 4)
@@ -199,11 +228,6 @@ class Vehicle:
 
         return moving_gap + (reaction_dist + braking_dist) * extra_scale
 
-    def _kmh_to_pixels_per_second(self, kmh):
-        pixels_per_meter = self.config.get("simulation", {}).get("pixels_per_meter", 10)
-        meters_per_second = kmh / 3.6
-        return meters_per_second * pixels_per_meter
-
     def _turn_target_speed(self, dist_to_stop):
         if not self.is_turning_vehicle or self.has_turned:
             return self.speed
@@ -211,7 +235,11 @@ class Vehicle:
             return self.speed
 
         ratio = max(0, min(1, dist_to_stop / self.right_turn_slowdown_distance))
-        return self.right_turn_speed + (self.speed - self.right_turn_speed) * ratio
+        turn_speed = self._selected_turn_speed()
+        return turn_speed + (self.speed - turn_speed) * ratio
+
+    def _selected_turn_speed(self):
+        return self.left_turn_speed if self.turn_side == "left" else self.right_turn_speed
 
     def _center_for_distance(self, direction, lane_index, distance_from_stop):
         w = self.config["window"]["width"]
@@ -222,7 +250,8 @@ class Vehicle:
         roads = self.config["roads"]
         road = roads[direction]
         total_lanes = road["incoming"] + road["outgoing"]
-        road_width = total_lanes * lane_width
+        divider_width = self._divider_width(direction)
+        road_width = total_lanes * lane_width + divider_width
         ix_half_width, ix_half_height = self._intersection_half_dims()
 
         if direction == "north":
@@ -231,12 +260,12 @@ class Vehicle:
             y = cy - ix_half_height - distance_from_stop - self.length / 2
         elif direction == "south":
             road_left = cx - road_width / 2
-            x = road_left + (road["outgoing"] + lane_index + 0.5) * lane_width
+            x = road_left + (road["outgoing"] + lane_index + 0.5) * lane_width + divider_width
             y = cy + ix_half_height + distance_from_stop + self.length / 2
         elif direction == "west":
             road_top = cy - road_width / 2
             x = cx - ix_half_width - distance_from_stop - self.length / 2
-            y = road_top + (road["outgoing"] + lane_index + 0.5) * lane_width
+            y = road_top + (road["outgoing"] + lane_index + 0.5) * lane_width + divider_width
         else:
             road_top = cy - road_width / 2
             x = cx + ix_half_width + distance_from_stop + self.length / 2
@@ -335,7 +364,7 @@ class Vehicle:
         self.turn_progress = 0.0
         self.turning = True
         self.stopped = False
-        self.current_speed = min(self.current_speed, self.right_turn_speed)
+        self.current_speed = min(self.current_speed, self._selected_turn_speed())
         self._update_turn_draw_state()
 
     def _update_turn_draw_state(self):
@@ -353,7 +382,7 @@ class Vehicle:
         self.lane_index = self._turn_lane_index(new_direction)
         if self.turn_curve:
             self.distance_from_stop = self.turn_curve[5]
-        self.current_speed = min(self.current_speed, self.right_turn_speed)
+        self.current_speed = min(self.current_speed, self._selected_turn_speed())
         self.has_turned = True
         self.turning = False
         self.turn_curve = None
@@ -364,10 +393,11 @@ class Vehicle:
 
     def _update_turn(self, dt):
         self.stopped = False
-        if self.current_speed < self.right_turn_speed:
-            self.current_speed = min(self.right_turn_speed, self.current_speed + self.acceleration * dt)
-        elif self.current_speed > self.right_turn_speed:
-            self.current_speed = max(self.right_turn_speed, self.current_speed - self.braking * dt)
+        turn_speed = self._selected_turn_speed()
+        if self.current_speed < turn_speed:
+            self.current_speed = min(turn_speed, self.current_speed + self.acceleration * dt)
+        elif self.current_speed > turn_speed:
+            self.current_speed = max(turn_speed, self.current_speed - self.braking * dt)
 
         self.turn_progress += (self.current_speed * dt) / self.turn_curve_length
         if self.turn_progress >= 1.0:
@@ -550,7 +580,8 @@ class Vehicle:
 
         road = roads[self.road_direction]
         total_lanes = road["incoming"] + road["outgoing"]
-        road_width = total_lanes * lane_width
+        divider_width = self._divider_width(self.road_direction)
+        road_width = total_lanes * lane_width + divider_width
 
         ix_half_width, ix_half_height = self._intersection_half_dims()
 
@@ -563,14 +594,14 @@ class Vehicle:
 
         elif self.road_direction == "south":
             road_left = cx - road_width / 2
-            lane_center_x = road_left + (road["outgoing"] + self.lane_index + 0.5) * lane_width
+            lane_center_x = road_left + (road["outgoing"] + self.lane_index + 0.5) * lane_width + divider_width
             stop_y = cy + ix_half_height
             vehicle_y = stop_y + self.distance_from_stop
             return pygame.Rect(lane_center_x - self.width / 2, vehicle_y, self.width, self.length)
 
         elif self.road_direction == "west":
             road_top = cy - road_width / 2
-            lane_center_y = road_top + (road["outgoing"] + self.lane_index + 0.5) * lane_width
+            lane_center_y = road_top + (road["outgoing"] + self.lane_index + 0.5) * lane_width + divider_width
             stop_x = cx - ix_half_width
             vehicle_x = stop_x - self.distance_from_stop - self.length
             return pygame.Rect(vehicle_x, lane_center_y - self.width / 2, self.length, self.width)
