@@ -96,7 +96,7 @@ class Simulation:
 
         for pedestrian in self.pedestrians:
             signal_state = self.light_controller.get_pedestrian_state(pedestrian.crossing)
-            pedestrian.update(dt, signal_state)
+            pedestrian.update(dt, signal_state, self.vehicles)
         self.pedestrians = [p for p in self.pedestrians if not p.has_finished()]
 
     def _choose_vehicle_length(self, min_length, max_length):
@@ -137,6 +137,7 @@ class Simulation:
                     self.pedestrians,
                     self.vehicles,
                 )
+                v.update_stopped_duration(dt, light)
     
     def _remove_off_screen(self):
         exited = [v for v in self.vehicles if v.is_off_screen()]

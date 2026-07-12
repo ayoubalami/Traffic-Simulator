@@ -43,6 +43,8 @@ class Vehicle:
         self.active = True
         
         defaults = config["vehicle_defaults"]
+        self.normal_color = self.color
+        self.stuck_color = tuple(defaults.get("stuck_vehicle_color", (255, 140, 0)))
         self.width = self._meters_to_pixels(defaults.get("vehicle_width_m", 1.8))
         default_length_m = defaults.get("vehicle_length_m", 4.5)
         self.length = self._meters_to_pixels(
@@ -84,6 +86,10 @@ class Vehicle:
         )
         self.current_speed = self.speed
         self.stopped = False
+        self.stopped_duration = 0.0
+        self.stuck_recovery_active = False
+        self.stuck_reduction_level = 0
+        self.stuck_reduction_elapsed = 0.0
         self.yellow_decision = None
         self.committed_to_cross = False
         self.last_light_state = None
@@ -218,15 +224,74 @@ class Vehicle:
         return crosswalk_setback + crosswalk_depth + safety_buffer
 
     def get_safe_following_distance(self):
+        defaults = self.config["vehicle_defaults"]
+        safe_gap = self.desired_gap
+        if self.stuck_recovery_active:
+            reduction_multiplier = max(
+                0.01,
+                min(1.0, defaults.get("stuck_safe_distance_multiplier", 0.5)),
+            )
+            min_multiplier = max(
+                0.01,
+                min(1.0, defaults.get("stuck_safe_distance_min_multiplier", 0.1)),
+            )
+            safe_gap *= max(
+                min_multiplier,
+                reduction_multiplier ** self.stuck_reduction_level,
+            )
+
         if self.current_speed <= 0 or self.moving_gap_multiplier <= 1:
-            return self.desired_gap
+            return safe_gap
 
         extra_scale = self.moving_gap_multiplier - 1
         reaction_dist = self.current_speed * self.reaction_time
         braking_dist = (self.current_speed ** 2) / (2 * self.braking)
-        moving_gap = self.desired_gap * self.moving_gap_multiplier
+        moving_gap = safe_gap * self.moving_gap_multiplier
 
         return moving_gap + (reaction_dist + braking_dist) * extra_scale
+
+    def update_stopped_duration(self, dt, light_state):
+        """Track stationary time, excluding normal red-light waiting."""
+        waiting_at_red = (
+            light_state == "red"
+            and not self.cleared_intersection
+            and not self.committed_to_cross
+        )
+        if waiting_at_red:
+            self.stopped_duration = 0.0
+            self.stuck_recovery_active = False
+            self.stuck_reduction_level = 0
+            self.stuck_reduction_elapsed = 0.0
+            self.color = self.normal_color
+            return
+
+        if self.current_speed <= 0.01:
+            self.stopped_duration += max(0.0, dt)
+            timeout = max(
+                0.0,
+                self.config["vehicle_defaults"].get("stuck_vehicle_timeout_s", 10.0),
+            )
+            activated_now = False
+            if not self.stuck_recovery_active and self.stopped_duration >= timeout:
+                # Keep the reduced following gap active after the first
+                # recovery movement; otherwise the normal gap immediately
+                # returns and the vehicle becomes stuck again.
+                self.stuck_recovery_active = True
+                self.stuck_reduction_level = 1
+                self.stuck_reduction_elapsed = self.stopped_duration - timeout
+                activated_now = True
+
+            if self.stuck_recovery_active:
+                if not activated_now:
+                    self.stuck_reduction_elapsed += max(0.0, dt)
+                if timeout > 0 and self.stuck_reduction_elapsed >= timeout:
+                    additional_levels = int(self.stuck_reduction_elapsed // timeout)
+                    self.stuck_reduction_level += additional_levels
+                    self.stuck_reduction_elapsed -= additional_levels * timeout
+                self.color = self.stuck_color
+        else:
+            self.stopped_duration = 0.0
+            self.color = self.normal_color
 
     def _turn_target_speed(self, dist_to_stop):
         if not self.is_turning_vehicle or self.has_turned:
@@ -527,6 +592,53 @@ class Vehicle:
                 return True
         return False
 
+    def _has_crosswalk_pedestrian_conflict(self, pedestrians):
+        """Whether a pedestrian occupies this vehicle's straight path."""
+        center_x, center_y, forward_x, forward_y, _, _ = self._get_pose_vectors()
+        front = (
+            center_x + forward_x * self.length / 2,
+            center_y + forward_y * self.length / 2,
+        )
+        # Look from the current front through this lane's crosswalk. The
+        # extra distance reaches the far side of the marked crossing, while
+        # the segment check keeps pedestrians in other lanes from blocking
+        # this vehicle.
+        lookahead = max(0.0, self.distance_from_stop - self.stop_margin)
+        lookahead += self.config["crosswalk_width"] + self._meters_to_pixels(1)
+        path_end = (
+            front[0] + forward_x * lookahead,
+            front[1] + forward_y * lookahead,
+        )
+
+        def distance_to_path(point):
+            dx, dy = path_end[0] - front[0], path_end[1] - front[1]
+            length_squared = dx * dx + dy * dy
+            if length_squared == 0:
+                return math.dist(point, front)
+            progress = max(
+                0.0,
+                min(
+                    1.0,
+                    ((point[0] - front[0]) * dx + (point[1] - front[1]) * dy)
+                    / length_squared,
+                ),
+            )
+            closest = (front[0] + progress * dx, front[1] + progress * dy)
+            return math.dist(point, closest)
+
+        for pedestrian in pedestrians:
+            if pedestrian.crossing != self.road_direction:
+                continue
+            # Someone waiting safely on the sidewalk is not yet in the
+            # crosswalk. A person paused at the centre divider is still in
+            # the roadway and must be yielded to.
+            if pedestrian.waiting and not pedestrian.has_reached_divider:
+                continue
+            clearance = self.width / 2 + pedestrian.radius + self._meters_to_pixels(0.5)
+            if distance_to_path(pedestrian.position) <= clearance:
+                return True
+        return False
+
     def _update_turn(self, dt, pedestrians=(), vehicles=()):
         self.stopped = False
         pedestrian_conflict = self._turn_has_pedestrian_conflict(pedestrians)
@@ -621,18 +733,16 @@ class Vehicle:
         dist_to_stop = self.distance_from_stop
         turn_entry_distance = -self.width
         approaching_turn = self.is_turning_vehicle and not self.has_turned
+        pedestrian_conflict = self._has_crosswalk_pedestrian_conflict(pedestrians)
         if approaching_turn and self.turn_side == "left":
-            ix_half_width, ix_half_height = self._intersection_half_dims()
-            # A left-turning vehicle first travels to the centre divider,
-            # then begins its wide turn from there.
-            turn_entry_distance = -(
-                ix_half_height
-                if self.road_direction in ("north", "south")
-                else ix_half_width
-            )
+            # The yellow centre divider ends at the intersection boundary.
+            # Keep going straight until the vehicle's front reaches that
+            # point, then begin the left-turn curve.
+            turn_entry_distance = -80.0
         if (
             approaching_turn
             and dist_to_stop <= turn_entry_distance
+            and not pedestrian_conflict
         ):
             self._start_turn()
             self._update_turn(dt, pedestrians, vehicles)
@@ -640,12 +750,14 @@ class Vehicle:
 
         if (
             dist_to_stop < -self.length
+            and not pedestrian_conflict
             and (not approaching_turn or dist_to_stop <= turn_entry_distance)
         ):
             self.cleared_intersection = True
 
         if (
             dist_to_stop < -self.width
+            and not pedestrian_conflict
             and (not approaching_turn or dist_to_stop <= turn_entry_distance)
         ):
             self.cleared_intersection = True
@@ -713,6 +825,15 @@ class Vehicle:
 
         target_speed = min(target_speed, self._turn_target_speed(dist_to_stop))
 
+        if pedestrian_conflict and not self.cleared_intersection:
+            # Stop before the crosswalk and remain there until every
+            # pedestrian using this crossing has cleared the roadway.
+            distance_to_crosswalk_stop = max(0.0, dist_to_stop - self.stop_margin)
+            target_speed = min(
+                target_speed,
+                math.sqrt(2 * self.braking * distance_to_crosswalk_stop),
+            )
+
         if traffic_ahead is not None:
             # Keep the configured, speed-dependent gap as the final spacing.
             # Reserve a reaction buffer for the relative (closing) speed, so
@@ -749,6 +870,13 @@ class Vehicle:
             # following distance.
             safe_dist = self.get_safe_following_distance()
             available_space = max(0.0, dist_to_ahead - safe_dist)
+            if distance_travelled > available_space:
+                distance_travelled = available_space
+                self.current_speed = distance_travelled / dt if dt > 0 else 0.0
+                self.stopped = self.current_speed == 0
+
+        if pedestrian_conflict and not self.cleared_intersection:
+            available_space = max(0.0, dist_to_stop - self.stop_margin)
             if distance_travelled > available_space:
                 distance_travelled = available_space
                 self.current_speed = distance_travelled / dt if dt > 0 else 0.0

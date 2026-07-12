@@ -114,14 +114,86 @@ class Pedestrian:
         divider_position = road_top + lanes_before_divider * lane_width + divider_width / 2
         return (divider_position - start[1]) / (end[1] - start[1])
 
-    def update(self, dt, signal_state):
-        # New pedestrians wait for green. A pedestrian already in the road
-        # may reach the central divider, but waits there on red before
-        # crossing into the opposite traffic direction.
+    def _next_lane_has_vehicle(self, vehicles):
+        """Whether the pedestrian's immediate next lane is occupied."""
+        start, end = self._endpoints()
+        road = self.config["roads"][self.crossing]
+        lane_width = self.config["lane_width"]
+        divider_width = self._divider_width(self.crossing)
+        total_lanes = road["incoming"] + road["outgoing"]
+
+        if self.crossing in ("north", "south"):
+            road_start = min(start[0], end[0]) + self.radius + 3
+            coordinate = self.position[0] + self.direction * self.radius
+            lanes_before_divider = (
+                road["incoming"] if self.crossing == "north" else road["outgoing"]
+            )
+        else:
+            road_start = min(start[1], end[1]) + self.radius + 3
+            coordinate = self.position[1] + self.direction * self.radius
+            lanes_before_divider = (
+                road["outgoing"] if self.crossing == "west" else road["incoming"]
+            )
+
+        lane_ranges = []
+        lane_start = road_start
+        for lane_index in range(total_lanes):
+            if lane_index == lanes_before_divider:
+                lane_start += divider_width
+            lane_ranges.append((lane_start, lane_start + lane_width))
+            lane_start += lane_width
+
+        # While the pedestrian is inside the yellow divider gap, let them
+        # cross that protected region freely. The next road lane is checked
+        # only when the pedestrian's front actually reaches its edge.
+        next_lane = next(
+            (lane for lane in lane_ranges if lane[0] <= coordinate <= lane[1]),
+            None,
+        )
+        if next_lane is None:
+            if self.direction == 1 and coordinate < lane_ranges[0][0]:
+                next_lane = lane_ranges[0]
+            elif self.direction == -1 and coordinate > lane_ranges[-1][1]:
+                next_lane = lane_ranges[-1]
+        if next_lane is None:
+            return False
+
+        if self.crossing in ("north", "south"):
+            left, right = next_lane
+            # Pedestrians use their own stripe within the crosswalk. Do not
+            # block them for a vehicle in the same lane but beside that
+            # stripe.
+            top = self.position[1] - self.radius
+            bottom = self.position[1] + self.radius
+        else:
+            left = self.position[0] - self.radius
+            right = self.position[0] + self.radius
+            top, bottom = next_lane
+
+        for vehicle in vehicles:
+            if not vehicle.active:
+                continue
+            rect = vehicle.get_rect()
+            if (
+                rect.right > left
+                and rect.left < right
+                and rect.bottom > top
+                and rect.top < bottom
+            ):
+                return True
+        return False
+
+    def update(self, dt, signal_state, vehicles=()):
+        # A new pedestrian (or one paused at the divider) needs green to
+        # enter a traffic lane. Once already crossing, they continue through
+        # red while their immediate next lane remains clear.
         if self.waiting:
-            if signal_state != "green":
+            if signal_state != "green" or self._next_lane_has_vehicle(vehicles):
                 return
             self.waiting = False
+            self.has_reached_divider = False
+        elif self._next_lane_has_vehicle(vehicles):
+            return
 
         start, end = self._endpoints()
         crossing_length = max(1.0, ((end[0] - start[0]) ** 2 + (end[1] - start[1]) ** 2) ** 0.5)

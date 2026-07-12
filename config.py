@@ -55,8 +55,12 @@ CONFIG = {
         "stop_line_gap_max_m": 2,
         "safe_distance_m": 3.0,
         "safe_distance_moving_multiplier": 1.25,
+        "stuck_vehicle_timeout_s": 2,
+        "stuck_safe_distance_multiplier": 0.5,
+        "stuck_safe_distance_min_multiplier": 0.1,
+        "stuck_vehicle_color": (255, 140, 0),
         "vehicle_length_weights": [
-            {"length_m": 7.4, "weight": 2},
+            {"length_m": 7, "weight": 2},
             {"length_m": 4.8, "weight": 15},
             {"length_m": 4.2, "weight": 45},
             {"length_m": 4.5, "weight": 3},
