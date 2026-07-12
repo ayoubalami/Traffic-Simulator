@@ -3,9 +3,9 @@ class TrafficLightController:
     
     def __init__(self, config):
         self.config = config
-        self.green_duration = 4.0
-        self.yellow_duration = 2.0
-        self.red_duration = 4.0
+        timing = config.get("traffic_lights", {})
+        self.green_duration = max(0.1, float(timing.get("green_duration_s", 4.0)))
+        self.yellow_duration = max(0.1, float(timing.get("yellow_duration_s", 2.0)))
         
         self.ns_state = "green"
         self.ew_state = "red"
@@ -54,7 +54,6 @@ class TrafficLightController:
         
         if current_state == "green":
             return max(0.0, self.green_duration - self.timer)
-        elif current_state == "yellow":
+        if current_state == "yellow":
             return max(0.0, self.yellow_duration - self.timer)
-        else:  # red
-            return max(0.0, self.red_duration - self.timer)
+        return 0.0

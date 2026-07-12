@@ -43,14 +43,17 @@ class Renderer:
         self.draw_traffic_lights(render_data["lights"])
         self.draw_pedestrian_lights(render_data["lights"])
         self.draw_metrics(render_data["metrics"])
+        self.draw_distance_scale()
         
         pygame.display.flip()
-        self.clock.tick(60)
     
     def draw_vehicles(self, vehicles):
         colors = self.config["colors"]
         signal_color = colors.get("signal_amber", (255, 220, 0))
         signal_outline = (80, 45, 0)
+        emergency_red = colors.get("emergency_red", (255, 35, 35))
+        emergency_blue = colors.get("emergency_blue", (35, 110, 255))
+        emergency_light_off = colors.get("emergency_light_off", (35, 35, 55))
 
         for v in vehicles:
             rect = v.get_rect()
@@ -80,17 +83,33 @@ class Renderer:
                     points = [(fx-4, fy), (fx+3, fy-4), (fx+3, fy+4)]
             pygame.draw.polygon(self.screen, (220, 220, 220), points)
 
-            signal_on = False
-            if hasattr(v, "is_turn_signal_on"):
-                signal_on = v.is_turn_signal_on()
-            elif hasattr(v, "is_right_signal_on"):
-                signal_on = v.is_right_signal_on()
+            if getattr(v, "is_emergency", False):
+                light_positions = v.get_emergency_light_positions()
+                phase = v.emergency_light_phase()
+                if light_positions and phase:
+                    radius = max(2, min(4, round(v.width * 0.18)))
+                    red_color = emergency_red if phase == "red" else emergency_light_off
+                    blue_color = emergency_blue if phase == "blue" else emergency_light_off
+                    pygame.draw.circle(
+                        self.screen,
+                        red_color,
+                        tuple(map(int, light_positions[0])),
+                        radius,
+                    )
+                    pygame.draw.circle(
+                        self.screen,
+                        blue_color,
+                        tuple(map(int, light_positions[1])),
+                        radius,
+                    )
+
+            signal_on = v.is_turn_signal_on()
 
             if signal_on:
                 signal_points = None
-                if getattr(v, "turn_side", None) == "left" and hasattr(v, "get_left_indicator"):
+                if getattr(v, "turn_side", None) == "left":
                     signal_points = v.get_left_indicator()
-                elif hasattr(v, "get_right_indicator"):
+                else:
                     signal_points = v.get_right_indicator()
 
                 if signal_points:
@@ -167,6 +186,41 @@ class Renderer:
             surf = self.font.render(text, True, (255, 255, 255))
             self.screen.blit(surf, (10, y))
             y += 20
+
+    def draw_distance_scale(self):
+        """Draw a metres-to-pixels reference key in the lower-right corner."""
+        scale_config = self.config.get("distance_scale", {})
+        if not scale_config.get("enabled", True):
+            return
+
+        meters = max(1.0, float(scale_config.get("length_m", 10.0)))
+        pixels_per_meter = self.config["simulation"]["pixels_per_meter"]
+        length_px = round(meters * pixels_per_meter)
+        width = self.config["window"]["width"]
+        height = self.config["window"]["height"]
+
+        x = width - length_px - 28
+        y = height - 30
+        label = f"{meters:g} m  ({length_px} px)"
+        label_surface = self.font.render(label, True, (255, 255, 255))
+        label_rect = label_surface.get_rect(midbottom=(x + length_px / 2, y - 10))
+
+        background_rect = label_rect.inflate(16, 30)
+        background_rect.bottom = y + 7
+        overlay = pygame.Surface(background_rect.size, pygame.SRCALPHA)
+        overlay.fill((20, 20, 20, 175))
+        self.screen.blit(overlay, background_rect.topleft)
+
+        pygame.draw.line(self.screen, (255, 255, 255), (x, y), (x + length_px, y), 2)
+        pygame.draw.line(self.screen, (255, 255, 255), (x, y - 6), (x, y + 6), 2)
+        pygame.draw.line(
+            self.screen,
+            (255, 255, 255),
+            (x + length_px, y - 6),
+            (x + length_px, y + 6),
+            2,
+        )
+        self.screen.blit(label_surface, label_rect)
     
     def draw_roads(self):
 

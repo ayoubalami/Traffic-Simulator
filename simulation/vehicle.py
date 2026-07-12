@@ -33,20 +33,32 @@ class Vehicle:
         "east": "north",
     }
 
-    def __init__(self, config, road_direction, lane_index, distance_from_stop, vehicle_length=None):
+    def __init__(
+        self,
+        config,
+        road_direction,
+        lane_index,
+        distance_from_stop,
+        vehicle_length=None,
+        is_emergency=False,
+    ):
         self.config = config
         self.road_direction = road_direction
         self.lane_index = lane_index
         self.distance_from_stop = distance_from_stop
+        self.is_emergency = bool(is_emergency)
         
-        self.color = (250, 200, 200)
-        self.active = True
+        self.color = (245, 245, 245) if self.is_emergency else (250, 200, 200)
         
         defaults = config["vehicle_defaults"]
         self.normal_color = self.color
         self.stuck_color = tuple(defaults.get("stuck_vehicle_color", (255, 140, 0)))
         self.width = self._meters_to_pixels(defaults.get("vehicle_width_m", 1.8))
-        default_length_m = defaults.get("vehicle_length_m", 4.5)
+        normal_length_m = defaults.get("vehicle_length_m", 4.5)
+        default_length_m = (
+            defaults.get("emergency_vehicle_length_m", normal_length_m)
+            if self.is_emergency else normal_length_m
+        )
         self.length = self._meters_to_pixels(
             vehicle_length if vehicle_length is not None else default_length_m,
         )
@@ -57,7 +69,9 @@ class Vehicle:
         # The configured speed is for a vehicle of the default length.
         # Larger vehicles receive a lower maximum speed; the lower bound
         # prevents unusually long vehicles from becoming unrealistically slow.
-        base_speed_kmh = defaults.get("max_speed_kmh", 50)
+        base_speed_kmh = defaults.get(
+            "emergency_vehicle_max_speed_kmh", defaults.get("max_speed_kmh", 50),
+        ) if self.is_emergency else defaults.get("max_speed_kmh", 50)
         base_speed = self._kmh_to_pixels_per_second(base_speed_kmh)
         reduction = config["vehicle_defaults"].get(
             "size_speed_reduction_per_length_ratio", 0.30,
@@ -65,7 +79,7 @@ class Vehicle:
         min_speed_multiplier = config["vehicle_defaults"].get(
             "min_size_speed_multiplier", 0.70,
         )
-        self.speed_multiplier = max(
+        speed_multiplier = max(
             min_speed_multiplier,
             min(1.0, 1.0 - (length_scale - 1.0) * reduction),
         )
@@ -73,8 +87,12 @@ class Vehicle:
             0.0,
             config["vehicle_defaults"].get("speed_variation_ratio", 0.05),
         )
-        self.speed_variation = random.uniform(-speed_variation, speed_variation)
-        self.speed = base_speed * self.speed_multiplier * (1 + self.speed_variation)
+        speed_variation = random.uniform(-speed_variation, speed_variation)
+        self.speed = base_speed * speed_multiplier * (1 + speed_variation)
+        self.emergency_light_cycle_ms = max(
+            50,
+            int(defaults.get("emergency_light_cycle_ms", 250)),
+        )
         self.right_turn_speed = self._kmh_to_pixels_per_second(
             defaults.get("right_turn_speed_kmh", base_speed_kmh / 1.75),
         )
@@ -95,13 +113,18 @@ class Vehicle:
         self.last_light_state = None
         self.green_start_delay_remaining = 0.0
         self.green_release_pending = False
+        self.lane_change_from_index = None
+        self.lane_change_progress = 0.0
+        self.lane_change_cooldown = 0.0
 
         # Larger vehicles accelerate and brake a bit more slowly so the
         # queue feels less "same-speed" and more like mixed traffic.
-        self.acceleration = self._meters_to_pixels(
-            defaults.get("acceleration_mps2", 2.5),
-        ) / length_scale
-        self.min_speed = self._meters_to_pixels(defaults.get("min_speed_mps", 0.0))
+        acceleration_mps2 = defaults.get("acceleration_mps2", 2.0)
+        self.acceleration = self._meters_to_pixels(acceleration_mps2) / length_scale
+        if self.is_emergency:
+            self.acceleration *= defaults.get(
+                "emergency_vehicle_acceleration_multiplier", 1.0,
+            )
         self.reaction_time = defaults.get("reaction_time_s", 0.8)
         self.deceleration = self._meters_to_pixels(
             defaults.get("deceleration_mps2", 3.0),
@@ -126,6 +149,7 @@ class Vehicle:
         # and only if the destination road is actually enabled.
         self.has_turned = False
         self.is_turning_vehicle = False
+        self.uses_turn_signal = False
         self.turn_side = None
         self.turn_target_direction = None
         self.turning = False
@@ -160,10 +184,22 @@ class Vehicle:
         if total_turn_weight > 0:
             roll = random.random()
             cumulative = 0.0
+            turn_signal_chance = max(
+                0.0,
+                min(
+                    1.0,
+                    float(
+                        config.get("simulation", {}).get(
+                            "turn_signal_use_chance", 1.0,
+                        )
+                    ),
+                ),
+            )
             for turn_side, target_direction, weight in turn_options:
                 cumulative += weight
                 if roll < cumulative:
                     self.is_turning_vehicle = True
+                    self.uses_turn_signal = random.random() < turn_signal_chance
                     self.turn_side = turn_side
                     self.turn_target_direction = target_direction
                     break
@@ -245,7 +281,7 @@ class Vehicle:
 
         extra_scale = self.moving_gap_multiplier - 1
         reaction_dist = self.current_speed * self.reaction_time
-        braking_dist = (self.current_speed ** 2) / (2 * self.braking)
+        braking_dist = (self.current_speed ** 2) / (2 * self.deceleration)
         moving_gap = safe_gap * self.moving_gap_multiplier
 
         return moving_gap + (reaction_dist + braking_dist) * extra_scale
@@ -254,6 +290,7 @@ class Vehicle:
         """Track stationary time, excluding normal red-light waiting."""
         waiting_at_red = (
             light_state == "red"
+            and not self.is_emergency
             and not self.cleared_intersection
             and not self.committed_to_cross
         )
@@ -292,6 +329,57 @@ class Vehicle:
         else:
             self.stopped_duration = 0.0
             self.color = self.normal_color
+
+    def can_start_lane_change(self):
+        defaults = self.config["vehicle_defaults"]
+        return (
+            defaults.get("lane_change_enabled", True)
+            and self.lane_change_from_index is None
+            and self.lane_change_cooldown <= 0
+            and self.current_speed >= self._lane_change_min_speed()
+            and not self.turning
+            and not self.is_turning_vehicle
+            and not self.cleared_intersection
+        )
+
+    def _lane_change_min_speed(self):
+        return self._meters_to_pixels(
+            self.config["vehicle_defaults"].get("lane_change_min_speed_mps", 2.0),
+        )
+
+    def start_lane_change(self, target_lane_index):
+        if target_lane_index == self.lane_index:
+            return
+        self.lane_change_from_index = self.lane_index
+        self.lane_index = target_lane_index
+        self.lane_change_progress = 0.0
+        self.lane_change_cooldown = self.config["vehicle_defaults"].get(
+            "lane_change_cooldown_s", 2.0,
+        )
+
+    def update_lane_change(self, dt):
+        self.lane_change_cooldown = max(0.0, self.lane_change_cooldown - dt)
+        if self.lane_change_from_index is None:
+            return
+        if self.current_speed < self._lane_change_min_speed():
+            return
+
+        duration = max(
+            0.05,
+            self.config["vehicle_defaults"].get("lane_change_duration_s", 0.6),
+        )
+        self.lane_change_progress = min(1.0, self.lane_change_progress + dt / duration)
+        if self.lane_change_progress >= 1.0:
+            self.lane_change_from_index = None
+
+    def finish_lane_change(self):
+        """Settle into the target lane before entering a turn."""
+        self.lane_change_from_index = None
+        self.lane_change_progress = 1.0
+
+    def _lane_change_eased_progress(self):
+        progress = self.lane_change_progress
+        return progress * progress * (3 - 2 * progress)
 
     def _turn_target_speed(self, dist_to_stop):
         if not self.is_turning_vehicle or self.has_turned:
@@ -384,6 +472,40 @@ class Vehicle:
         else:
             forward_x, forward_y = -1, 0
 
+        if self.lane_change_from_index is not None:
+            source_rect = self._get_rect_for_lane(self.lane_change_from_index)
+            target_rect = self._get_rect_for_lane(self.lane_index)
+            duration = max(
+                0.05,
+                self.config["vehicle_defaults"].get("lane_change_duration_s", 0.6),
+            )
+            # Derivative of smoothstep (3t² - 2t³). Combining its lateral
+            # velocity with forward motion gives a realistic diagonal yaw.
+            derivative = 6 * self.lane_change_progress * (1 - self.lane_change_progress)
+            lateral_x = (target_rect.centerx - source_rect.centerx) * derivative / duration
+            lateral_y = (target_rect.centery - source_rect.centery) * derivative / duration
+            forward_speed = self.current_speed
+            base_right_x = -forward_y
+            base_right_y = forward_x
+            lateral_speed = 0.0
+            if forward_speed >= self._lane_change_min_speed():
+                lateral_speed = lateral_x * base_right_x + lateral_y * base_right_y
+            max_angle = max(
+                0.0,
+                min(
+                    89.0,
+                    self.config["vehicle_defaults"].get("lane_change_max_angle_deg", 45.0),
+                ),
+            )
+            max_lateral_speed = forward_speed * math.tan(math.radians(max_angle))
+            lateral_speed = max(-max_lateral_speed, min(max_lateral_speed, lateral_speed))
+            velocity_x = forward_x * forward_speed + base_right_x * lateral_speed
+            velocity_y = forward_y * forward_speed + base_right_y * lateral_speed
+            velocity_length = math.hypot(velocity_x, velocity_y)
+            if velocity_length > 0:
+                forward_x = velocity_x / velocity_length
+                forward_y = velocity_y / velocity_length
+
         right_x = -forward_y
         right_y = forward_x
         return cx, cy, forward_x, forward_y, right_x, right_y
@@ -413,7 +535,7 @@ class Vehicle:
         self_side_extent = self.width / 2
 
         for other in vehicles:
-            if other is self or not other.active:
+            if other is self:
                 continue
 
             (
@@ -471,6 +593,10 @@ class Vehicle:
         return self._right_lane_index(direction)
 
     def _start_turn(self):
+        # A turn cannot safely share the same state as a lateral lane change.
+        # Finish the lane placement first so the new road never inherits an
+        # old lane index from the previous approach.
+        self.finish_lane_change()
         new_direction = self.turn_target_direction
         assert new_direction is not None
         new_lane = self._turn_lane_index(new_direction)
@@ -534,6 +660,7 @@ class Vehicle:
         self.current_speed = min(self.current_speed, self._selected_turn_speed())
         self.has_turned = True
         self.turning = False
+        self.finish_lane_change()
         self.turn_curve = None
         self.turn_progress = 0.0
         self.draw_center = None
@@ -654,14 +781,14 @@ class Vehicle:
             )
             turn_speed = min(
                 turn_speed,
-                math.sqrt(2 * self.braking * remaining_distance),
+                math.sqrt(2 * self.deceleration * remaining_distance),
             )
         if vehicle_ahead is not None:
             safe_dist = self.get_safe_following_distance()
             closing_speed = max(0.0, self.current_speed - ahead_speed)
             reaction_space = closing_speed * self.reaction_time
             free_space = max(0.0, dist_to_ahead - safe_dist - reaction_space)
-            safe_closing_speed = math.sqrt(2 * self.braking * free_space)
+            safe_closing_speed = math.sqrt(2 * self.deceleration * free_space)
             turn_speed = min(turn_speed, ahead_speed + safe_closing_speed)
             if dist_to_ahead <= safe_dist:
                 turn_speed = min(turn_speed, ahead_speed)
@@ -669,7 +796,10 @@ class Vehicle:
         if self.current_speed < turn_speed:
             self.current_speed = min(turn_speed, self.current_speed + self.acceleration * dt)
         elif self.current_speed > turn_speed:
-            self.current_speed = max(turn_speed, self.current_speed - self.braking * dt)
+            brake_rate = self.deceleration
+            if vehicle_ahead is not None and dist_to_ahead <= self._meters_to_pixels(0.5):
+                brake_rate = self.braking
+            self.current_speed = max(turn_speed, self.current_speed - brake_rate * dt)
 
         distance_travelled = self.current_speed * dt
         if vehicle_ahead is not None:
@@ -704,6 +834,7 @@ class Vehicle:
         green_start_wait = False
         if (
             light_state == "green"
+            and not self.is_emergency
             and self.last_light_state in ("red", "yellow")
             and not self.cleared_intersection
             and (self.stopped or self.current_speed <= 1.0)
@@ -769,7 +900,11 @@ class Vehicle:
 
         # A vehicle that has cleared the intersection no longer obeys this
         # approach's traffic light, but it must still follow its lane leader.
-        if not self.cleared_intersection and light_state == "red":
+        if (
+            not self.cleared_intersection
+            and light_state == "red"
+            and not self.is_emergency
+        ):
             # A vehicle that entered on yellow must finish clearing the
             # crosswalk after the light turns red.  A moving vehicle already
             # beyond the stop point is handled the same way.
@@ -794,7 +929,7 @@ class Vehicle:
                     target_speed = 0
                 else:
                     dist_to_actual_stop = dist_to_stop - red_stop_distance
-                    braking_dist = (self.current_speed ** 2) / (2 * self.braking)
+                    braking_dist = (self.current_speed ** 2) / (2 * self.deceleration)
                     if braking_dist >= dist_to_actual_stop:
                         target_speed = 0
 
@@ -807,7 +942,7 @@ class Vehicle:
                     # yellow rather than beginning a late stop.
                     self.yellow_decision = "go"
                 else:
-                    braking_dist = (self.current_speed ** 2) / (2 * self.braking)
+                    braking_dist = (self.current_speed ** 2) / (2 * self.deceleration)
                     can_stop_comfortably = braking_dist + 10 <= dist_to_actual_stop
                     self.yellow_decision = "stop" if can_stop_comfortably else "go"
 
@@ -818,20 +953,23 @@ class Vehicle:
                 # The maximum speed that can stop exactly at the stop
                 # margin with the configured braking rate (v² = 2ad).
                 target_speed = math.sqrt(
-                    2 * self.braking * max(0.0, dist_to_actual_stop),
+                    2 * self.deceleration * max(0.0, dist_to_actual_stop),
                 )
             else:
                 target_speed = self.speed
 
         target_speed = min(target_speed, self._turn_target_speed(dist_to_stop))
 
-        if pedestrian_conflict and not self.cleared_intersection:
-            # Stop before the crosswalk and remain there until every
-            # pedestrian using this crossing has cleared the roadway.
+        if pedestrian_conflict and (
+            not self.cleared_intersection or self.is_emergency
+        ):
+            # Emergency vehicles may cross a red light, but pedestrians always
+            # have priority. Stop before the crosswalk and remain there until
+            # every pedestrian using this crossing has cleared the roadway.
             distance_to_crosswalk_stop = max(0.0, dist_to_stop - self.stop_margin)
             target_speed = min(
                 target_speed,
-                math.sqrt(2 * self.braking * distance_to_crosswalk_stop),
+                math.sqrt(2 * self.deceleration * distance_to_crosswalk_stop),
             )
 
         if traffic_ahead is not None:
@@ -844,7 +982,7 @@ class Vehicle:
             closing_speed = max(0.0, self.current_speed - ahead_speed)
             reaction_space = closing_speed * self.reaction_time
             free_space = max(0.0, dist_to_ahead - safe_dist - reaction_space)
-            safe_closing_speed = math.sqrt(2 * self.braking * free_space)
+            safe_closing_speed = math.sqrt(2 * self.deceleration * free_space)
             follow_speed = ahead_speed + safe_closing_speed
             target_speed = min(target_speed, follow_speed)
 
@@ -859,7 +997,12 @@ class Vehicle:
             self.current_speed = min(target_speed, self.current_speed + self.acceleration * dt)
             self.stopped = False
         elif self.current_speed > target_speed:
-            self.current_speed = max(target_speed, self.current_speed - self.braking * dt)
+            brake_rate = self.deceleration
+            if traffic_ahead is not None and dist_to_ahead <= self._meters_to_pixels(0.5):
+                # The normal safe gap is handled with comfortable braking.
+                # Use the emergency limit only for a near-collision.
+                brake_rate = self.braking
+            self.current_speed = max(target_speed, self.current_speed - brake_rate * dt)
             self.stopped = self.current_speed == 0
 
         distance_travelled = self.current_speed * dt
@@ -875,7 +1018,9 @@ class Vehicle:
                 self.current_speed = distance_travelled / dt if dt > 0 else 0.0
                 self.stopped = self.current_speed == 0
 
-        if pedestrian_conflict and not self.cleared_intersection:
+        if pedestrian_conflict and (
+            not self.cleared_intersection or self.is_emergency
+        ):
             available_space = max(0.0, dist_to_stop - self.stop_margin)
             if distance_travelled > available_space:
                 distance_travelled = available_space
@@ -894,7 +1039,8 @@ class Vehicle:
             self.current_speed = 0
             self.stopped = True
 
-        if (light_state == "red" 
+        if (light_state == "red"
+            and not self.is_emergency
             and 0 < self.distance_from_stop < red_stop_distance
             and not self.cleared_intersection
             and not self.committed_to_cross):
@@ -907,6 +1053,21 @@ class Vehicle:
             x, y = self.draw_center
             size = max(self.length, self.width)
             return pygame.Rect(x - size / 2, y - size / 2, size, size)
+
+        rect = self._get_rect_for_lane(self.lane_index)
+        if self.lane_change_from_index is None:
+            return rect
+
+        source_rect = self._get_rect_for_lane(self.lane_change_from_index)
+        progress = self._lane_change_eased_progress()
+        return pygame.Rect(
+            source_rect.x + (rect.x - source_rect.x) * progress,
+            source_rect.y + (rect.y - source_rect.y) * progress,
+            rect.width,
+            rect.height,
+        )
+
+    def _get_rect_for_lane(self, lane_index):
 
         w = self.config["window"]["width"]
         h = self.config["window"]["height"]
@@ -924,28 +1085,28 @@ class Vehicle:
 
         if self.road_direction == "north":
             road_left = cx - road_width / 2
-            lane_center_x = road_left + (self.lane_index + 0.5) * lane_width
+            lane_center_x = road_left + (lane_index + 0.5) * lane_width
             stop_y = cy - ix_half_height
             vehicle_y = stop_y - self.distance_from_stop - self.length
             return pygame.Rect(lane_center_x - self.width / 2, vehicle_y, self.width, self.length)
 
         elif self.road_direction == "south":
             road_left = cx - road_width / 2
-            lane_center_x = road_left + (road["outgoing"] + self.lane_index + 0.5) * lane_width + divider_width
+            lane_center_x = road_left + (road["outgoing"] + lane_index + 0.5) * lane_width + divider_width
             stop_y = cy + ix_half_height
             vehicle_y = stop_y + self.distance_from_stop
             return pygame.Rect(lane_center_x - self.width / 2, vehicle_y, self.width, self.length)
 
         elif self.road_direction == "west":
             road_top = cy - road_width / 2
-            lane_center_y = road_top + (road["outgoing"] + self.lane_index + 0.5) * lane_width + divider_width
+            lane_center_y = road_top + (road["outgoing"] + lane_index + 0.5) * lane_width + divider_width
             stop_x = cx - ix_half_width
             vehicle_x = stop_x - self.distance_from_stop - self.length
             return pygame.Rect(vehicle_x, lane_center_y - self.width / 2, self.length, self.width)
 
         elif self.road_direction == "east":
             road_top = cy - road_width / 2
-            lane_center_y = road_top + (self.lane_index + 0.5) * lane_width
+            lane_center_y = road_top + (lane_index + 0.5) * lane_width
             stop_x = cx + ix_half_width
             vehicle_x = stop_x + self.distance_from_stop
             return pygame.Rect(vehicle_x, lane_center_y - self.width / 2, self.length, self.width)
@@ -953,15 +1114,12 @@ class Vehicle:
         return pygame.Rect(0, 0, 0, 0)
 
     def get_corners(self):
-        if not self.turning or self.draw_center is None or self.draw_angle is None:
+        if self.turning and (self.draw_center is None or self.draw_angle is None):
+            return None
+        if not self.turning and self.lane_change_from_index is None:
             return None
 
-        cx, cy = self.draw_center
-        radians = math.radians(self.draw_angle)
-        forward_x = math.cos(radians)
-        forward_y = math.sin(radians)
-        right_x = -forward_y
-        right_y = forward_x
+        cx, cy, forward_x, forward_y, right_x, right_y = self._get_pose_vectors()
         half_length = self.length / 2
         half_width = self.width / 2
 
@@ -985,7 +1143,9 @@ class Vehicle:
         ]
 
     def get_front_indicator(self):
-        if not self.turning or self.draw_center is None or self.draw_angle is None:
+        if self.turning and (self.draw_center is None or self.draw_angle is None):
+            return None
+        if not self.turning and self.lane_change_from_index is None:
             return None
 
         cx, cy, forward_x, forward_y, right_x, right_y = self._get_pose_vectors()
@@ -1029,18 +1189,37 @@ class Vehicle:
         ]
 
     def is_turn_signal_on(self):
-        return self.is_turning_vehicle and not self.has_turned and ((pygame.time.get_ticks() // 350) % 2 == 0)
+        return (
+            self.uses_turn_signal
+            and self.is_turning_vehicle
+            and not self.has_turned
+            and ((pygame.time.get_ticks() // 350) % 2 == 0)
+        )
 
-    def is_right_signal_on(self):
-        return self.is_turn_signal_on() and self.turn_side == "right"
+    def emergency_light_phase(self):
+        """Return the currently flashing emergency-light colour."""
+        if not self.is_emergency:
+            return None
+        cycle = self.emergency_light_cycle_ms
+        return "red" if (pygame.time.get_ticks() // cycle) % 2 == 0 else "blue"
+
+    def get_emergency_light_positions(self):
+        """Return the two roof-light positions in the current vehicle pose."""
+        if not self.is_emergency:
+            return None
+
+        center_x, center_y, _, _, right_x, right_y = self._get_pose_vectors()
+        offset = max(2.0, min(self.width * 0.30, 6.0))
+        return (
+            (center_x + right_x * offset, center_y + right_y * offset),
+            (center_x - right_x * offset, center_y - right_y * offset),
+        )
 
     def is_off_screen(self):
         w = self.config["window"]["width"]
         h = self.config["window"]["height"]
         cx = w // 2
         cy = h // 2
-        roads = self.config["roads"]
-
         ix_half_width, ix_half_height = self._intersection_half_dims()
 
         if self.road_direction == "north":
@@ -1061,3 +1240,17 @@ class Vehicle:
             return vehicle_left < 0
 
         return False
+
+
+class EmergencyVehicle(Vehicle):
+    """A vehicle allowed to cross red lights while yielding to pedestrians."""
+
+    def __init__(self, config, road_direction, lane_index, distance_from_stop, vehicle_length=None):
+        super().__init__(
+            config,
+            road_direction,
+            lane_index,
+            distance_from_stop,
+            vehicle_length=vehicle_length,
+            is_emergency=True,
+        )

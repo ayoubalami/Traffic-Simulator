@@ -171,8 +171,6 @@ class Pedestrian:
             top, bottom = next_lane
 
         for vehicle in vehicles:
-            if not vehicle.active:
-                continue
             rect = vehicle.get_rect()
             if (
                 rect.right > left
