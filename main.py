@@ -33,6 +33,9 @@ def load_neural_policy(path=POLICY_PATH):
 
 def main():
     runtime_config = build_runtime_config(CONFIG)
+    time_scale = float(runtime_config["simulation"].get("time_scale", 1.0))
+    if time_scale <= 0:
+        raise ValueError("simulation.time_scale must be positive")
     policy = load_neural_policy()
     if policy is not None:
         timing = runtime_config["traffic_lights"]
@@ -48,7 +51,7 @@ def main():
         # Cap and measure the frame once.  Measuring it again in Renderer.render
         # made the simulation advance only about half as fast as real time.
         dt = renderer.clock.tick(60) / 1000.0
-        dt *= runtime_config["simulation"].get("time_scale", 1.0)
+        dt *= time_scale
         simulation.update(dt)
         renderer.render(simulation.get_render_data())
     

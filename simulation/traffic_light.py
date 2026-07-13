@@ -27,6 +27,14 @@ class TrafficLightController:
             0.1,
             float(timing.get("green_extension_check_interval_s", 1.0)),
         )
+        pedestrian_timing = config.get("pedestrian_signals", {})
+        self.pedestrian_signals_enabled = bool(
+            pedestrian_timing.get("enabled", True)
+        )
+        self.pedestrian_walk_duration = max(
+            0.1,
+            float(pedestrian_timing.get("walk_duration_s", 5.0)),
+        )
 
         default_green_duration = max(
             0.1,
@@ -130,8 +138,26 @@ class TrafficLightController:
         return self.states.get(direction, "red")
 
     def get_pedestrian_state(self, crossing):
-        """Pedestrians cross only while traffic through that crossing is red."""
-        return "green" if self.get_state(crossing) == "red" else "red"
+        """Return the separately timed WALK/STOP state for a crosswalk.
+
+        A WALK window opens only during the beginning of the perpendicular
+        vehicle-green phase.  Yellow and all-red are always STOP, so a new
+        pedestrian cannot enter immediately before the next traffic phase.
+        """
+        if crossing not in self.DIRECTIONS:
+            return "red"
+        if not self.pedestrian_signals_enabled:
+            return "green" if self.get_state(crossing) == "red" else "red"
+
+        crossing_phase = (
+            "ns" if crossing in self.phase_directions("ns") else "ew"
+        )
+        can_walk = (
+            self.phase_state == "green"
+            and self.active_phase != crossing_phase
+            and self.timer < self.pedestrian_walk_duration
+        )
+        return "green" if can_walk else "red"
 
     def get_remaining_time(self):
         """Get remaining green/yellow time; all-red clearance has no countdown."""

@@ -17,6 +17,19 @@ class Vehicle:
     def _kmh_to_pixels_per_second(self, kmh):
         return self._meters_to_pixels(kmh / 3.6)
 
+    def _record_deceleration(self, previous_speed, dt, reason="command"):
+        """Record physical braking, excluding turn-geometry speed clamps."""
+        if dt <= 0:
+            return
+        pixels_per_meter = self.config["simulation"]["pixels_per_meter"]
+        deceleration_mps2 = max(
+            0.0,
+            (previous_speed - self.current_speed) / dt / pixels_per_meter,
+        )
+        if deceleration_mps2 >= self.last_deceleration_mps2:
+            self.last_deceleration_mps2 = deceleration_mps2
+            self.last_braking_reason = reason
+
     # Turn targets are expressed in this codebase's road labels, where a
     # road direction names the approach and vehicles travel toward the
     # intersection from that side.
@@ -105,6 +118,8 @@ class Vehicle:
             defaults.get("right_turn_slowdown_distance_m", default_length_m * 2),
         )
         self.current_speed = self.speed
+        self.last_deceleration_mps2 = 0.0
+        self.last_braking_reason = None
         self.stopped = False
         self.stopped_duration = 0.0
         self.stuck_recovery_active = False
@@ -118,7 +133,7 @@ class Vehicle:
         self.lane_change_from_index = None
         self.lane_change_progress = 0.0
         self.lane_change_cooldown = 0.0
-
+        # self.turn_curve=None
         # Larger vehicles accelerate and brake a bit more slowly so the
         # queue feels less "same-speed" and more like mixed traffic.
         acceleration_mps2 = defaults.get("acceleration_mps2", 2.0)
@@ -134,6 +149,11 @@ class Vehicle:
         self.braking = self._meters_to_pixels(
             defaults.get("braking_deceleration_mps2", 6.5),
         ) / length_scale
+        pixels_per_meter = self.config["simulation"]["pixels_per_meter"]
+        self.comfortable_deceleration_mps2 = (
+            self.deceleration / pixels_per_meter
+        )
+        self.last_braking_intensity = 0.0
        
         self.cleared_intersection = False
         self.desired_gap = self._meters_to_pixels(defaults.get("safe_distance_m", 3.0))
@@ -708,9 +728,9 @@ class Vehicle:
         for pedestrian in pedestrians:
             if pedestrian.crossing != exit_crossing:
                 continue
-            # Pedestrians waiting on the sidewalk are not in conflict; a
-            # pedestrian paused at the centre divider remains in the road.
-            if pedestrian.waiting and not pedestrian.has_reached_divider:
+            # Sidewalks and a sufficiently wide centre refuge are outside
+            # the live lanes, so vehicles do not wait for pedestrians there.
+            if pedestrian.is_safely_waiting():
                 continue
 
             clearance = self.width / 2 + pedestrian.radius + self._meters_to_pixels(0.5)
@@ -758,10 +778,9 @@ class Vehicle:
         for pedestrian in pedestrians:
             if pedestrian.crossing != self.road_direction:
                 continue
-            # Someone waiting safely on the sidewalk is not yet in the
-            # crosswalk. A person paused at the centre divider is still in
-            # the roadway and must be yielded to.
-            if pedestrian.waiting and not pedestrian.has_reached_divider:
+            # Sidewalks and a sufficiently wide centre refuge are outside
+            # the live lanes, so vehicles do not wait for pedestrians there.
+            if pedestrian.is_safely_waiting():
                 continue
             clearance = self.width / 2 + pedestrian.radius + self._meters_to_pixels(0.5)
             if distance_to_path(pedestrian.position) <= clearance:
@@ -801,7 +820,9 @@ class Vehicle:
             brake_rate = self.deceleration
             if vehicle_ahead is not None and dist_to_ahead <= self._meters_to_pixels(0.5):
                 brake_rate = self.braking
+            previous_speed = self.current_speed
             self.current_speed = max(turn_speed, self.current_speed - brake_rate * dt)
+            self._record_deceleration(previous_speed, dt)
 
         distance_travelled = self.current_speed * dt
         if vehicle_ahead is not None:
@@ -809,13 +830,17 @@ class Vehicle:
             available_space = max(0.0, dist_to_ahead - safe_dist)
             if distance_travelled > available_space:
                 distance_travelled = available_space
+                previous_speed = self.current_speed
                 self.current_speed = distance_travelled / dt if dt > 0 else 0.0
+                self._record_deceleration(previous_speed, dt, "leader")
                 self.stopped = self.current_speed == 0
 
         next_progress = self.turn_progress + distance_travelled / self.turn_curve_length
         if pedestrian_conflict and next_progress >= yield_stop_progress:
             self.turn_progress = yield_stop_progress
+            previous_speed = self.current_speed
             self.current_speed = 0.0
+            self._record_deceleration(previous_speed, dt, "pedestrian")
             self.stopped = True
             self._update_turn_draw_state()
             return
@@ -827,6 +852,8 @@ class Vehicle:
         self._update_turn_draw_state()
  
     def update(self, dt, light_state, vehicle_ahead=None, pedestrians=(), vehicles=()):
+        self.last_deceleration_mps2 = 0.0
+        self.last_braking_reason = None
         if light_state != "yellow":
             self.yellow_decision = None
 
@@ -1004,7 +1031,9 @@ class Vehicle:
                 # The normal safe gap is handled with comfortable braking.
                 # Use the emergency limit only for a near-collision.
                 brake_rate = self.braking
+            previous_speed = self.current_speed
             self.current_speed = max(target_speed, self.current_speed - brake_rate * dt)
+            self._record_deceleration(previous_speed, dt)
             self.stopped = self.current_speed == 0
 
         distance_travelled = self.current_speed * dt
@@ -1017,7 +1046,9 @@ class Vehicle:
             available_space = max(0.0, dist_to_ahead - safe_dist)
             if distance_travelled > available_space:
                 distance_travelled = available_space
+                previous_speed = self.current_speed
                 self.current_speed = distance_travelled / dt if dt > 0 else 0.0
+                self._record_deceleration(previous_speed, dt, "leader")
                 self.stopped = self.current_speed == 0
 
         if pedestrian_conflict and (
@@ -1026,7 +1057,9 @@ class Vehicle:
             available_space = max(0.0, dist_to_stop - self.stop_margin)
             if distance_travelled > available_space:
                 distance_travelled = available_space
+                previous_speed = self.current_speed
                 self.current_speed = distance_travelled / dt if dt > 0 else 0.0
+                self._record_deceleration(previous_speed, dt, "pedestrian")
                 self.stopped = self.current_speed == 0
 
         self.distance_from_stop -= distance_travelled
@@ -1038,7 +1071,9 @@ class Vehicle:
             and 0 < self.distance_from_stop < self.stop_margin
         ):
             self.distance_from_stop = self.stop_margin
+            previous_speed = self.current_speed
             self.current_speed = 0
+            self._record_deceleration(previous_speed, dt, "signal")
             self.stopped = True
 
         if (light_state == "red"
@@ -1047,7 +1082,9 @@ class Vehicle:
             and not self.cleared_intersection
             and not self.committed_to_cross):
             # self.distance_from_stop = red_stop_distance
+            previous_speed = self.current_speed
             self.current_speed = 0
+            self._record_deceleration(previous_speed, dt, "signal")
             self.stopped = True
     
     def get_rect(self):

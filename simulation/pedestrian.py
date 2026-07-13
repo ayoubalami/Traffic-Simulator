@@ -42,6 +42,15 @@ class Pedestrian:
         self.progress = 0.0 if self.direction == 1 else 1.0
         self.waiting = True
         self.has_reached_divider = False
+        pedestrian_signals = config.get("pedestrian_signals", {})
+        self.stop_at_divider = bool(
+            pedestrian_signals.get("stop_at_divider", True)
+        )
+        self.require_new_walk_signal_at_divider = bool(
+            pedestrian_signals.get("require_new_walk_signal_at_divider", True)
+        )
+        self._waiting_for_new_walk_signal = False
+        self._saw_stop_signal_at_divider = False
         self.position = (0.0, 0.0)
         self._update_position()
 
@@ -182,15 +191,33 @@ class Pedestrian:
                 return True
         return False
 
+    def is_safely_waiting(self):
+        """Whether this pedestrian is outside every live traffic lane."""
+        if not self.waiting:
+            return False
+        if not self.has_reached_divider:
+            return True
+        # Only regard the centre as a refuge when the whole pedestrian fits
+        # inside it.  Narrow painted dividers retain the conservative vehicle
+        # yielding behaviour.
+        return self._divider_width(self.crossing) >= self.radius * 2
+
     def update(self, dt, signal_state, vehicles=()):
         # A new pedestrian (or one paused at the divider) needs green to
         # enter a traffic lane. Once already crossing, they continue through
         # red while their immediate next lane remains clear.
         if self.waiting:
+            if self._waiting_for_new_walk_signal:
+                if signal_state != "green":
+                    self._saw_stop_signal_at_divider = True
+                    return
+                if not self._saw_stop_signal_at_divider:
+                    return
             if signal_state != "green" or self._next_lane_has_vehicle(vehicles):
                 return
             self.waiting = False
-            self.has_reached_divider = False
+            self._waiting_for_new_walk_signal = False
+            self._saw_stop_signal_at_divider = False
         elif self._next_lane_has_vehicle(vehicles):
             return
 
@@ -206,10 +233,17 @@ class Pedestrian:
             )
         )
 
-        if signal_state == "red" and crosses_divider:
+        should_stop_at_divider = crosses_divider and (
+            self.stop_at_divider or signal_state == "red"
+        )
+        if should_stop_at_divider:
             self.progress = divider_progress
             self.has_reached_divider = True
             self.waiting = True
+            self._waiting_for_new_walk_signal = (
+                self.require_new_walk_signal_at_divider
+            )
+            self._saw_stop_signal_at_divider = signal_state != "green"
         else:
             self.progress = next_progress
         self._update_position()

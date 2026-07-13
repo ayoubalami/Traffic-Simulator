@@ -3,6 +3,7 @@
 from copy import deepcopy
 import random
 from statistics import fmean
+import time
 
 from .evaluation import evaluate_across_seeds
 
@@ -30,6 +31,8 @@ class DurationEvolution:
         seeds=(1, 2, 3),
         evaluation_duration_s=120.0,
         timestep_s=1 / 30,
+        speed_factor=None,
+        progress_callback=None,
         random_seed=0,
     ):
         minimum, maximum = map(float, duration_bounds_s)
@@ -52,6 +55,8 @@ class DurationEvolution:
         self.seeds = tuple(seeds)
         self.evaluation_duration_s = evaluation_duration_s
         self.timestep_s = timestep_s
+        self.speed_factor = speed_factor
+        self.progress_callback = progress_callback
         self.random = random.Random(random_seed)
 
     def run(self):
@@ -59,25 +64,37 @@ class DurationEvolution:
         population = [self._random_genome() for _ in range(self.population_size)]
         best = None
         history = []
+        training_started = time.perf_counter()
 
         for generation in range(self.generations):
+            generation_started = time.perf_counter()
             scored = [self._score(genome) for genome in population]
             scored.sort(key=lambda candidate: candidate["fitness"], reverse=True)
             if best is None or scored[0]["fitness"] > best["fitness"]:
                 best = deepcopy(scored[0])
 
-            history.append(
-                {
-                    "generation": generation,
-                    "best_fitness": scored[0]["fitness"],
-                    "mean_fitness": fmean(candidate["fitness"] for candidate in scored),
-                    "best_durations_s": deepcopy(scored[0]["durations_s"]),
-                }
-            )
+            generation_finished = time.perf_counter()
+            progress = {
+                "generation": generation,
+                "generation_number": generation + 1,
+                "generation_time_s": generation_finished - generation_started,
+                "elapsed_time_s": generation_finished - training_started,
+                "best_fitness": scored[0]["fitness"],
+                "mean_fitness": fmean(candidate["fitness"] for candidate in scored),
+                "global_best_fitness": best["fitness"],
+                "best_durations_s": deepcopy(scored[0]["durations_s"]),
+            }
+            history.append(progress)
+            if self.progress_callback is not None:
+                self.progress_callback(progress)
             if generation < self.generations - 1:
                 population = self._next_generation(scored)
 
-        return {"best": best, "history": history}
+        return {
+            "best": best,
+            "history": history,
+            "training_time_s": time.perf_counter() - training_started,
+        }
 
     def _random_genome(self):
         return {
@@ -95,6 +112,7 @@ class DurationEvolution:
             seeds=self.seeds,
             duration_s=self.evaluation_duration_s,
             timestep_s=self.timestep_s,
+            speed_factor=self.speed_factor,
         )
         return {
             "durations_s": deepcopy(genome),

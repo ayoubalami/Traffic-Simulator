@@ -3,8 +3,8 @@ from copy import deepcopy
 
 CONFIG = {
     "window": {
-        "width": 1000,
-        "height": 700,
+        "width": 1300,
+        "height": 900,
         "title": "Traffic Simulator"
     },
     "colors": {
@@ -17,7 +17,8 @@ CONFIG = {
         "signal_amber": (255, 220, 0),
         "emergency_red": (255, 35, 35),
         "emergency_blue": (35, 110, 255),
-        "emergency_light_off": (35, 35, 55)
+        "emergency_light_off": (35, 35, 55),
+        "hard_braking_vehicle": (235, 35, 35)
     },
     "lane_width_m": 3.75,
     "crosswalk_intersection_offset_m": 5.0,
@@ -29,6 +30,11 @@ CONFIG = {
     "distance_scale": {
         "enabled": True,
         "length_m": 100.0,
+    },
+    "debug": {
+        # Draw the current physical deceleration beside every vehicle.
+        "show_vehicle_braking_rate": False,
+        "vehicle_braking_rate_decimals": 2,
     },
     "traffic_lights": {
         # Adaptive policies decide whether to extend green every second after
@@ -46,16 +52,49 @@ CONFIG = {
         },
         "yellow_duration_s": 2.0,
     },
+    "pedestrian_signals": {
+        # Pedestrian WALK is controlled independently from the vehicle red
+        # light.  It opens only at the beginning of a compatible, stable
+        # vehicle-green phase, preventing pedestrians from entering just
+        # before traffic is released.
+        "enabled": True,
+        "walk_duration_s": 5.0,
+        # Split a crossing into two stages.  A pedestrian waits on the
+        # protected centre divider for the next WALK signal before crossing
+        # the second carriageway.
+        "stop_at_divider": True,
+        "require_new_walk_signal_at_divider": True,
+    },
+    "fitness": {
+        # Reward and penalty coefficients used by calculate_fitness. Setting
+        # any penalty to zero removes that objective from training.
+        "throughput_reward": 100.0,
+        "vehicle_wait_time_penalty": 10.0,
+        "active_vehicle_wait_time_penalty": 5.0,
+        "max_vehicle_wait_time_penalty": 1.0,
+        "queued_vehicle_penalty": 10.0,
+        # Penalty applied per second of mean pedestrian signal/divider wait.
+        "pedestrian_wait_time_penalty": 5.0,
+        # Active pedestrians are included separately so an evaluation cannot
+        # improve its score by ending while people are still waiting.
+        "active_pedestrian_wait_time_penalty": 2.5,
+        # Penalty per vehicle-second of braking intensity above the vehicle's
+        # own comfortable deceleration. Normal braking therefore adds zero.
+        "excess_braking_intensity_penalty": 10.0,
+    },
     "simulation": {
         "pixels_per_meter": 7,
+        # Simulation acceleration factor.  The interactive renderer and
+        # headless neuroevolution evaluations both use this value.  Values
+        # above 1 run faster by using larger simulation-time increments.
         "time_scale": 1.0,
-        "vehicle_spawn_interval_s": 1.0,
+        "vehicle_spawn_interval_s": 0.50,
         # Relative arrival rates for each enabled approach.  Set a weight to
         # zero to prevent new vehicles from spawning on that approach.
         "direction_spawn_weights": {
-            "north": .50,
+            "north": .250,
             "south": 1.0,
-            "east": 1.0,
+            "east": 1.50,
             "west": 1.0,
         },
         "right_turn_chance" : .250,
@@ -64,7 +103,7 @@ CONFIG = {
         "turn_signal_use_chance": 0.50,
         # A small chance per spawn keeps emergency vehicles occasional while
         # making the feature visible during a normal simulation run.
-        "emergency_vehicle_spawn_chance": 0.08
+        "emergency_vehicle_spawn_chance": 0.01
     },
     "vehicle_defaults": {
         "max_speed_kmh": 50,
@@ -89,8 +128,14 @@ CONFIG = {
         # only a safety limit; normal slowing uses deceleration_mps2.
         "acceleration_mps2": 2.4,
         "reaction_time_s": 0.8,
-        "deceleration_mps2": 4.0,
-        "braking_deceleration_mps2": 4.5,
+        "deceleration_mps2": 3.0,
+        "braking_deceleration_mps2": 3.5,
+        # Hard braking is relative to each vehicle's comfortable deceleration:
+        # 1.0 is normal braking and 1.5 is the configured emergency rate.
+        "hard_braking_intensity_threshold": 150.0,
+        # Show a hard-braking vehicle in the warning color for this many
+        # real display seconds (independent of simulation.time_scale).
+        "hard_braking_highlight_duration_s": 1.0,
         "green_start_delay_min": 0.15,
         "green_start_delay_max": 0.60,
         "stop_line_gap_min_m": 0.1,
@@ -107,7 +152,7 @@ CONFIG = {
         "lane_change_max_angle_deg": 20.0,
         "lane_change_min_speed_mps": 4.0,
 
-        "stuck_vehicle_timeout_s": 2,
+        "stuck_vehicle_timeout_s": 1,
         "stuck_safe_distance_multiplier": 0.5,
         "stuck_safe_distance_min_multiplier": 0.1,
         "stuck_vehicle_color": (255, 140, 0),

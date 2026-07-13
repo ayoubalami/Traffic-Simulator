@@ -11,6 +11,7 @@ class Renderer:
         self.clock = pygame.time.Clock()
         self.running = True
         self.font = pygame.font.SysFont("monospace", 16)
+        self.vehicle_debug_font = pygame.font.SysFont("monospace", 11)
     
     def is_running(self):
         for event in pygame.event.get():
@@ -39,6 +40,7 @@ class Renderer:
         self.draw_stop_lines()
         self.draw_lane_arrows()
         self.draw_vehicles(render_data["vehicles"])
+        self.draw_vehicle_braking_debug(render_data["vehicles"])
         self.draw_pedestrians(render_data.get("pedestrians", []))
         self.draw_traffic_lights(render_data["lights"])
         self.draw_pedestrian_lights(render_data["lights"])
@@ -54,10 +56,15 @@ class Renderer:
         emergency_red = colors.get("emergency_red", (255, 35, 35))
         emergency_blue = colors.get("emergency_blue", (35, 110, 255))
         emergency_light_off = colors.get("emergency_light_off", (35, 35, 55))
+        hard_braking_color = colors.get("hard_braking_vehicle", (235, 35, 35))
 
         for v in vehicles:
             rect = v.get_rect()
-            body_color = v.color
+            body_color = (
+                hard_braking_color
+                if getattr(v, "hard_braking_highlight_remaining_s", 0.0) > 0
+                else v.color
+            )
 
             corners = v.get_corners() if hasattr(v, "get_corners") else None
             if corners:
@@ -115,6 +122,57 @@ class Renderer:
                 if signal_points:
                     pygame.draw.polygon(self.screen, signal_color, signal_points)
                     pygame.draw.polygon(self.screen, signal_outline, signal_points, 1)
+
+    def draw_vehicle_braking_debug(self, vehicles):
+        """Draw each vehicle's current physical deceleration in m/s²."""
+        debug = self.config.get("debug", {})
+        if not debug.get("show_vehicle_braking_rate", False):
+            return
+
+        decimals = max(
+            0,
+            min(4, int(debug.get("vehicle_braking_rate_decimals", 2))),
+        )
+        intensity_threshold = float(
+            self.config.get("vehicle_defaults", {}).get(
+                "hard_braking_intensity_threshold",
+                1.25,
+            )
+        )
+        for vehicle in vehicles:
+            braking_rate = max(
+                0.0,
+                float(getattr(vehicle, "last_deceleration_mps2", 0.0)),
+            )
+            braking_intensity = max(
+                0.0,
+                float(getattr(vehicle, "last_braking_intensity", 0.0)),
+            )
+            if braking_intensity >= intensity_threshold:
+                text_color = (255, 70, 70)
+            elif braking_rate > 0:
+                text_color = (255, 220, 70)
+            else:
+                text_color = (205, 205, 205)
+
+            label = (
+                f"B:{braking_rate:.{decimals}f} m/s2 "
+                f"I:{braking_intensity:.2f}"
+            )
+            braking_reason = getattr(vehicle, "last_braking_reason", None)
+            if braking_reason and braking_rate > 0:
+                label += f" {braking_reason}"
+            surface = self.vehicle_debug_font.render(label, True, text_color)
+            rect = vehicle.get_rect()
+            label_rect = surface.get_rect(
+                midbottom=(int(rect.centerx), int(rect.top) - 3),
+            )
+
+            # Keep labels readable and inside the window near edge vehicles.
+            label_rect.clamp_ip(self.screen.get_rect())
+            background = label_rect.inflate(4, 2)
+            pygame.draw.rect(self.screen, (20, 20, 20), background, border_radius=2)
+            self.screen.blit(surface, label_rect)
 
     def draw_pedestrians(self, pedestrians):
         """Draw each pedestrian as a colored circle with a direction arrow."""

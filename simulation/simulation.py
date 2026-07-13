@@ -31,7 +31,7 @@ class Simulation:
             pedestrian_defaults["spawn_interval_min"],
             pedestrian_defaults["spawn_interval_max"],
         )
-        self.metrics = Metrics()
+        self.metrics = Metrics(config)
         if duration_selector is not None:
             self.light_controller.set_duration_selector(
                 lambda direction: duration_selector(self.get_signal_observation(direction))
@@ -185,7 +185,7 @@ class Simulation:
         protected_crossings = set(self.light_controller.phase_directions(phase))
         return not any(
             pedestrian.crossing in protected_crossings
-            and (not pedestrian.waiting or pedestrian.has_reached_divider)
+            and not pedestrian.is_safely_waiting()
             for pedestrian in self.pedestrians
         )
 
@@ -216,6 +216,10 @@ class Simulation:
         for pedestrian in self.pedestrians:
             signal_state = self.light_controller.get_pedestrian_state(pedestrian.crossing)
             pedestrian.update(dt, signal_state, self.vehicles)
+        self.metrics.update_pedestrians(self.pedestrians, dt)
+        finished = [p for p in self.pedestrians if p.has_finished()]
+        for pedestrian in finished:
+            self.metrics.pedestrian_finished(id(pedestrian))
         self.pedestrians = [p for p in self.pedestrians if not p.has_finished()]
 
     def _choose_vehicle_length(self, min_length, max_length):
