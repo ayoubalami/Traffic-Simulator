@@ -23,21 +23,22 @@ class Pedestrian:
     def _meters_to_pixels(self, meters):
         return meters * self.config["simulation"]["pixels_per_meter"]
 
-    def __init__(self, config, crossing):
+    def __init__(self, config, crossing, rng=None):
         self.config = config
+        self.random = rng if rng is not None else random
         self.crossing = crossing
         defaults = config["pedestrian_defaults"]
-        self.speed = random.uniform(
+        self.speed = self.random.uniform(
             defaults["walking_speed_min_mps"],
             defaults["walking_speed_max_mps"],
         )
         self.speed = self._meters_to_pixels(self.speed)
         self.radius = defaults["radius"]
-        self.color = random.choice(self.COLORS)
-        self.direction = random.choice((-1, 1))
+        self.color = self.random.choice(self.COLORS)
+        self.direction = self.random.choice((-1, 1))
         # Keep each pedestrian on a distinct line inside the marked crossing
         # instead of sending everybody through its centre.
-        self.crosswalk_offset = random.uniform(-0.35, 0.35)
+        self.crosswalk_offset = self.random.uniform(-0.35, 0.35)
         self.progress = 0.0 if self.direction == 1 else 1.0
         self.waiting = True
         self.has_reached_divider = False

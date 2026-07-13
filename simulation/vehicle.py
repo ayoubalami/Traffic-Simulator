@@ -41,8 +41,10 @@ class Vehicle:
         distance_from_stop,
         vehicle_length=None,
         is_emergency=False,
+        rng=None,
     ):
         self.config = config
+        self.random = rng if rng is not None else random
         self.road_direction = road_direction
         self.lane_index = lane_index
         self.distance_from_stop = distance_from_stop
@@ -87,7 +89,7 @@ class Vehicle:
             0.0,
             config["vehicle_defaults"].get("speed_variation_ratio", 0.05),
         )
-        speed_variation = random.uniform(-speed_variation, speed_variation)
+        speed_variation = self.random.uniform(-speed_variation, speed_variation)
         self.speed = base_speed * speed_multiplier * (1 + speed_variation)
         self.emergency_light_cycle_ms = max(
             50,
@@ -141,7 +143,7 @@ class Vehicle:
             stop_gap_min,
             self._meters_to_pixels(defaults.get("stop_line_gap_max_m", 0)),
         )
-        self.stop_margin = self._crosswalk_stop_distance() + random.uniform(stop_gap_min, stop_gap_max)
+        self.stop_margin = self._crosswalk_stop_distance() + self.random.uniform(stop_gap_min, stop_gap_max)
 
         # --- right-turn setup ---
         # Decided once at spawn: only the outer (rightmost) lane of a road
@@ -182,7 +184,7 @@ class Vehicle:
 
         total_turn_weight = sum(weight for _, _, weight in turn_options)
         if total_turn_weight > 0:
-            roll = random.random()
+            roll = self.random.random()
             cumulative = 0.0
             turn_signal_chance = max(
                 0.0,
@@ -199,7 +201,7 @@ class Vehicle:
                 cumulative += weight
                 if roll < cumulative:
                     self.is_turning_vehicle = True
-                    self.uses_turn_signal = random.random() < turn_signal_chance
+                    self.uses_turn_signal = self.random.random() < turn_signal_chance
                     self.turn_side = turn_side
                     self.turn_target_direction = target_direction
                     break
@@ -842,7 +844,7 @@ class Vehicle:
             defaults = self.config["vehicle_defaults"]
             min_delay = max(0.0, defaults.get("green_start_delay_min", 0.15))
             max_delay = max(min_delay, defaults.get("green_start_delay_max", 0.60))
-            self.green_start_delay_remaining = random.uniform(min_delay, max_delay)
+            self.green_start_delay_remaining = self.random.uniform(min_delay, max_delay)
             self.green_release_pending = True
 
         if light_state == "green" and self.green_release_pending:
@@ -1245,7 +1247,15 @@ class Vehicle:
 class EmergencyVehicle(Vehicle):
     """A vehicle allowed to cross red lights while yielding to pedestrians."""
 
-    def __init__(self, config, road_direction, lane_index, distance_from_stop, vehicle_length=None):
+    def __init__(
+        self,
+        config,
+        road_direction,
+        lane_index,
+        distance_from_stop,
+        vehicle_length=None,
+        rng=None,
+    ):
         super().__init__(
             config,
             road_direction,
@@ -1253,4 +1263,5 @@ class EmergencyVehicle(Vehicle):
             distance_from_stop,
             vehicle_length=vehicle_length,
             is_emergency=True,
+            rng=rng,
         )

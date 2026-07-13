@@ -4,7 +4,7 @@ from copy import deepcopy
 CONFIG = {
     "window": {
         "width": 1000,
-        "height": 600,
+        "height": 700,
         "title": "Traffic Simulator"
     },
     "colors": {
@@ -31,14 +31,35 @@ CONFIG = {
         "length_m": 100.0,
     },
     "traffic_lights": {
-        "green_duration_s": 8.0,
+        # Adaptive policies decide whether to extend green every second after
+        # the minimum.  The maximum is a fairness/safety guardrail, not a
+        # duration selected ahead of time.
+        "min_green_duration_s": 10.0,
+        "max_green_duration_s": 30.0,
+        "green_extension_check_interval_s": 1.0,
+        "all_red_clearance_duration_s": 1.0,
+        "green_durations_s": {
+            "north": 8.0,
+            "south": 8.0,
+            "east": 8.0,
+            "west": 8.0,
+        },
         "yellow_duration_s": 2.0,
     },
     "simulation": {
         "pixels_per_meter": 7,
         "time_scale": 1.0,
-        "right_turn_chance": .250,
-        "left_turn_chance": .150,
+        "vehicle_spawn_interval_s": 1.0,
+        # Relative arrival rates for each enabled approach.  Set a weight to
+        # zero to prevent new vehicles from spawning on that approach.
+        "direction_spawn_weights": {
+            "north": .50,
+            "south": 1.0,
+            "east": 1.0,
+            "west": 1.0,
+        },
+        "right_turn_chance" : .250,
+        "left_turn_chance"  : .150,
         # Probability that a turning vehicle uses its indicator.
         "turn_signal_use_chance": 0.50,
         # A small chance per spawn keeps emergency vehicles occasional while
@@ -82,7 +103,7 @@ CONFIG = {
         "lane_change_cooldown_s": 15.0,
         "lane_change_min_distance_to_stop_m": 20.0,
         "lane_change_trigger_speed_ratio": 0.6,
-        "lane_change_random_rate_per_s": 20,
+        "lane_change_random_rate_per_s": 120,
         "lane_change_max_angle_deg": 20.0,
         "lane_change_min_speed_mps": 4.0,
 

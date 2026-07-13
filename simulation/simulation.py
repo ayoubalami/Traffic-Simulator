@@ -7,29 +7,50 @@ from .traffic_light import TrafficLightController
 from .metrics import Metrics
 
 class Simulation:
-    def __init__(self, config):
+    def __init__(
+        self,
+        config,
+        random_seed=None,
+        duration_selector=None,
+        extension_decider=None,
+    ):
         self.config = config
+        self.random = random.Random(random_seed) if random_seed is not None else random
         self.light_controller = TrafficLightController(config)
         self.vehicles = []
         self.pedestrians = []
         self.spawn_timer = 0
-        self.spawn_interval = 1
+        simulation_config = config.get("simulation", {})
+        self.spawn_interval = max(
+            0.01,
+            float(simulation_config.get("vehicle_spawn_interval_s", 1.0)),
+        )
         pedestrian_defaults = config["pedestrian_defaults"]
         self.pedestrian_spawn_timer = 0.0
-        self.pedestrian_spawn_interval = random.uniform(
+        self.pedestrian_spawn_interval = self.random.uniform(
             pedestrian_defaults["spawn_interval_min"],
             pedestrian_defaults["spawn_interval_max"],
         )
         self.metrics = Metrics()
+        if duration_selector is not None:
+            self.light_controller.set_duration_selector(
+                lambda direction: duration_selector(self.get_signal_observation(direction))
+            )
+        if extension_decider is not None:
+            self.light_controller.set_extension_decider(
+                lambda direction: self._should_extend_green(direction, extension_decider)
+            )
+        self.light_controller.set_phase_activation_guard(self._can_activate_phase)
     
     def update(self, dt):
+        self.metrics.advance_time(dt)
         self.light_controller.update(dt)
         self._spawn_vehicles(dt)
         self._update_lane_changes(dt)
         self._update_vehicles(dt)
         self._remove_off_screen()
         self._update_pedestrians(dt)
-        self.metrics.update(self.vehicles, self.light_controller)
+        self.metrics.update(self.vehicles, dt)
     
     def _spawn_vehicles(self, dt):
         self.spawn_timer += dt
@@ -37,9 +58,20 @@ class Simulation:
             return
         self.spawn_timer = 0
         
-        enabled = [d for d in ["north", "south", "east", "west"] 
-                   if self.config["roads"][d]["enabled"]]
+        enabled = [
+            direction
+            for direction in ("north", "south", "east", "west")
+            if self.config["roads"][direction]["enabled"]
+        ]
         if not enabled:
+            return
+
+        spawn_weights = self.config.get("simulation", {}).get(
+            "direction_spawn_weights",
+            {},
+        )
+        weights = [max(0.0, float(spawn_weights.get(direction, 1.0))) for direction in enabled]
+        if not any(weights):
             return
         
         w = self.config["window"]["width"]
@@ -60,10 +92,10 @@ class Simulation:
         max_length = defaults.get("vehicle_length_max_m", defaults.get("vehicle_length_m", 4.5))
         
         for _ in range(10):
-            direction = random.choice(enabled)
+            direction = self.random.choices(enabled, weights=weights, k=1)[0]
             road = self.config["roads"][direction]
-            lane = random.randint(0, road["incoming"] - 1)
-            is_emergency = random.random() < emergency_chance
+            lane = self.random.randint(0, road["incoming"] - 1)
+            is_emergency = self.random.random() < emergency_chance
             vehicle_length = (
                 defaults.get("emergency_vehicle_length_m", defaults.get("vehicle_length_m", 4.5))
                 if is_emergency
@@ -72,7 +104,14 @@ class Simulation:
             
             distance = h * 0.45 if direction in ("north", "south") else w * 0.45
             vehicle_class = EmergencyVehicle if is_emergency else Vehicle
-            candidate = vehicle_class(self.config, direction, lane, distance, vehicle_length)
+            candidate = vehicle_class(
+                self.config,
+                direction,
+                lane,
+                distance,
+                vehicle_length,
+                rng=self.random,
+            )
             
             blocked = False
             for v in self.vehicles:
@@ -93,7 +132,62 @@ class Simulation:
             
             if not blocked:
                 self.vehicles.append(candidate)
+                self.metrics.register_vehicle(id(candidate), direction)
                 return
+
+    def get_signal_observation(self, active_phase):
+        """Return the queue state available to an adaptive signal controller."""
+        queue_lengths = {direction: 0 for direction in ("north", "south", "east", "west")}
+        vehicle_counts = {direction: 0 for direction in ("north", "south", "east", "west")}
+        emergency_counts = {direction: 0 for direction in ("north", "south", "east", "west")}
+        pedestrian_counts = {direction: 0 for direction in ("north", "south", "east", "west")}
+        for vehicle in self.vehicles:
+            if not vehicle.cleared_intersection:
+                vehicle_counts[vehicle.road_direction] += 1
+                if vehicle.is_emergency:
+                    emergency_counts[vehicle.road_direction] += 1
+            if vehicle.stopped and not vehicle.cleared_intersection:
+                queue_lengths[vehicle.road_direction] += 1
+        for pedestrian in self.pedestrians:
+            if not pedestrian.waiting or pedestrian.has_reached_divider:
+                pedestrian_counts[pedestrian.crossing] += 1
+        return {
+            "queue_lengths": queue_lengths,
+            "vehicle_counts": vehicle_counts,
+            "emergency_counts": emergency_counts,
+            "pedestrian_counts": pedestrian_counts,
+            "active_phase": active_phase,
+            "green_elapsed_s": self.light_controller.timer,
+        }
+
+    def _should_extend_green(self, active_phase, extension_decider):
+        observation = self.get_signal_observation(active_phase)
+        active_directions = self.light_controller.phase_directions(active_phase)
+        opposing_directions = self.light_controller.phase_directions(
+            self.light_controller._next_phase(),
+        )
+        active_emergencies = sum(
+            observation["emergency_counts"][direction] for direction in active_directions
+        )
+        opposing_emergencies = sum(
+            observation["emergency_counts"][direction] for direction in opposing_directions
+        )
+        if opposing_emergencies:
+            return False
+        if active_emergencies:
+            return True
+        if not any(observation["vehicle_counts"][direction] for direction in active_directions):
+            return False
+        return bool(extension_decider(observation))
+
+    def _can_activate_phase(self, phase):
+        """Keep vehicle lights red until pedestrians in the next crossings clear."""
+        protected_crossings = set(self.light_controller.phase_directions(phase))
+        return not any(
+            pedestrian.crossing in protected_crossings
+            and (not pedestrian.waiting or pedestrian.has_reached_divider)
+            for pedestrian in self.pedestrians
+        )
 
     def _update_pedestrians(self, dt):
         self.pedestrian_spawn_timer += dt
@@ -107,9 +201,15 @@ class Simulation:
                 if self.config["roads"][direction]["enabled"]
             ]
             if enabled_crossings:
-                self.pedestrians.append(Pedestrian(self.config, random.choice(enabled_crossings)))
+                self.pedestrians.append(
+                    Pedestrian(
+                        self.config,
+                        self.random.choice(enabled_crossings),
+                        rng=self.random,
+                    )
+                )
             self.pedestrian_spawn_timer = 0.0
-            self.pedestrian_spawn_interval = random.uniform(
+            self.pedestrian_spawn_interval = self.random.uniform(
                 defaults["spawn_interval_min"], defaults["spawn_interval_max"],
             )
 
@@ -133,9 +233,9 @@ class Simulation:
                     weights.append(weight)
 
             if choices:
-                return random.choices(choices, weights=weights, k=1)[0]
+                return self.random.choices(choices, weights=weights, k=1)[0]
 
-        return random.uniform(min_length, max_length)
+        return self.random.uniform(min_length, max_length)
     
     def _update_vehicles(self, dt):
         lanes = defaultdict(list)
@@ -193,7 +293,7 @@ class Simulation:
                 leader.stopped
                 or leader.current_speed < vehicle.current_speed * trigger_ratio
             )
-            random_change = random.random() < random_change_probability
+            random_change = self.random.random() < random_change_probability
             if not blocked_by_leader and not random_change:
                 continue
 

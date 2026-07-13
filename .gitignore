@@ -1,0 +1,10 @@
+# Created by venv; see https://docs.python.org/3/library/venv.html
+
+Scripts/
+__pycache__/
+.agents/
+Include/
+Lib/
+__pycache__/
+pyvenv.cfg
+*.pyc
