@@ -10,8 +10,8 @@ class Renderer:
         pygame.display.set_caption(config["window"]["title"])
         self.clock = pygame.time.Clock()
         self.running = True
-        self.font = pygame.font.SysFont("monospace", 16)
-        self.vehicle_debug_font = pygame.font.SysFont("monospace", 11)
+        self.font = pygame.font.SysFont("monospace", 12)
+        self.vehicle_debug_font = pygame.font.SysFont("monospace", 16)
     
     def is_running(self):
         for event in pygame.event.get():
@@ -45,6 +45,11 @@ class Renderer:
         self.draw_traffic_lights(render_data["lights"])
         self.draw_pedestrian_lights(render_data["lights"])
         self.draw_metrics(render_data["metrics"])
+        self.draw_phase_probabilities(
+            render_data.get("phase_probabilities"),
+            render_data.get("policy_selected_phase"),
+            getattr(render_data["lights"], "active_phase", None),
+        )
         self.draw_distance_scale()
         
         pygame.display.flip()
@@ -242,8 +247,86 @@ class Renderer:
         for key, value in metrics.items():
             text = f"{key}: {value:.2f}" if isinstance(value, float) else f"{key}: {value}"
             surf = self.font.render(text, True, (255, 255, 255))
-            self.screen.blit(surf, (10, y))
-            y += 20
+            self.screen.blit(surf, (12, y))
+            y += 10
+
+    def draw_phase_probabilities(self, probabilities, selected_phase, active_phase):
+        """Draw the six-phase network's softmax outputs on the right."""
+        if not probabilities:
+            return
+
+        labels = (
+            ("ns", "North + South"),
+            ("ew", "East + West"),
+            ("north_only", "North only"),
+            ("south_only", "South only"),
+            ("east_only", "East only"),
+            ("west_only", "West only"),
+        )
+        panel_width = 300
+        panel_height = 244
+        panel_x = self.config["window"]["width"] - panel_width - 14
+        panel_y = 14
+        panel = pygame.Surface((panel_width, panel_height), pygame.SRCALPHA)
+        panel.fill((15, 18, 24, 220))
+        self.screen.blit(panel, (panel_x, panel_y))
+        pygame.draw.rect(
+            self.screen,
+            (105, 115, 130),
+            (panel_x, panel_y, panel_width, panel_height),
+            1,
+            border_radius=4,
+        )
+
+        title = self.font.render("Network outputs (softmax)", True, (255, 255, 255))
+        self.screen.blit(title, (panel_x + 12, panel_y + 10))
+
+        label_font = self.vehicle_debug_font
+        bar_x = panel_x + 112
+        bar_width = 120
+        row_y = panel_y + 42
+        for phase, label in labels:
+            probability = max(0.0, min(1.0, float(probabilities.get(phase, 0.0))))
+            is_selected = phase == selected_phase
+            is_active = phase == active_phase
+            text_color = (90, 225, 255) if is_selected else (225, 225, 225)
+            if is_active:
+                text_color = (100, 255, 135)
+            label_surface = label_font.render(label, True, text_color)
+            self.screen.blit(label_surface, (panel_x + 12, row_y + 2))
+
+            pygame.draw.rect(
+                self.screen,
+                (50, 55, 65),
+                (bar_x, row_y + 2, bar_width, 12),
+                border_radius=2,
+            )
+            fill_color = (60, 190, 230) if is_selected else (120, 140, 170)
+            if is_active:
+                fill_color = (65, 205, 105)
+            fill_width = round(bar_width * probability)
+            if fill_width:
+                pygame.draw.rect(
+                    self.screen,
+                    fill_color,
+                    (bar_x, row_y + 2, fill_width, 12),
+                    border_radius=2,
+                )
+            value_surface = label_font.render(
+                f"{probability * 100:5.1f}%",
+                True,
+                (240, 240, 240),
+            )
+            self.screen.blit(value_surface, (bar_x + bar_width + 7, row_y + 1))
+            row_y += 25
+
+        selected_label = selected_phase or "waiting"
+        footer = label_font.render(
+            f"Policy: {selected_label}  Active: {active_phase or '-'}",
+            True,
+            (190, 200, 215),
+        )
+        self.screen.blit(footer, (panel_x + 12, panel_y + panel_height - 25))
 
     def draw_distance_scale(self):
         """Draw a metres-to-pixels reference key in the lower-right corner."""

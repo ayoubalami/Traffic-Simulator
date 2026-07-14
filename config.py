@@ -42,6 +42,9 @@ CONFIG = {
         # duration selected ahead of time.
         "min_green_duration_s": 10.0,
         "max_green_duration_s": 30.0,
+        # Safety override for the six-phase model: no enabled approach may
+        # remain unserved beyond this duration.
+        "max_red_duration_s": 60.0,
         "green_extension_check_interval_s": 1.0,
         "all_red_clearance_duration_s": 1.0,
         "green_durations_s": {
@@ -82,23 +85,35 @@ CONFIG = {
         # own comfortable deceleration. Normal braking therefore adds zero.
         "excess_braking_intensity_penalty": 10.0,
     },
+    "six_phase_fitness": {
+        # Additional objectives used only by the separate six-phase model.
+        "turning_stuck_time_penalty": 20.0,
+        "turning_stuck_event_penalty": 25.0,
+        # Reject policies that form a persistent blockage in the physical
+        # intersection. Evaluation stops as soon as this condition is met.
+        "gridlock_penalty": 100000.0,
+        "gridlock_min_stuck_vehicles": 4,
+        "gridlock_speed_threshold_mps": 0.5,
+        "gridlock_persistence_s": 4.0,
+        "abort_remaining_seeds_on_gridlock": True,
+    },
     "simulation": {
         "pixels_per_meter": 7,
         # Simulation acceleration factor.  The interactive renderer and
         # headless neuroevolution evaluations both use this value.  Values
         # above 1 run faster by using larger simulation-time increments.
         "time_scale": 1.0,
-        "vehicle_spawn_interval_s": 0.50,
+        "vehicle_spawn_interval_s": 0.250,
         # Relative arrival rates for each enabled approach.  Set a weight to
         # zero to prevent new vehicles from spawning on that approach.
         "direction_spawn_weights": {
-            "north": .250,
-            "south": 1.0,
-            "east": 1.50,
-            "west": 1.0,
+            "north": .0150,
+            "south": 3.50,
+            "east": 0.50,
+            "west": 0.10,
         },
         "right_turn_chance" : .250,
-        "left_turn_chance"  : .150,
+        "left_turn_chance"  : .8350,
         # Probability that a turning vehicle uses its indicator.
         "turn_signal_use_chance": 0.50,
         # A small chance per spawn keeps emergency vehicles occasional while
@@ -126,7 +141,7 @@ CONFIG = {
         "speed_variation_ratio": 0.15,
         # Typical comfortable urban driving values.  The emergency value is
         # only a safety limit; normal slowing uses deceleration_mps2.
-        "acceleration_mps2": 2.4,
+        "acceleration_mps2": 2.0,
         "reaction_time_s": 0.8,
         "deceleration_mps2": 3.0,
         "braking_deceleration_mps2": 3.5,
@@ -136,6 +151,9 @@ CONFIG = {
         # Show a hard-braking vehicle in the warning color for this many
         # real display seconds (independent of simulation.time_scale).
         "hard_braking_highlight_duration_s": 1.0,
+        # A turning vehicle below this speed is considered stuck inside the
+        # intersection for the six-phase policy's fitness metrics.
+        "turning_stuck_speed_mps": 0.5,
         "green_start_delay_min": 0.15,
         "green_start_delay_max": 0.60,
         "stop_line_gap_min_m": 0.1,
@@ -148,7 +166,7 @@ CONFIG = {
         "lane_change_cooldown_s": 15.0,
         "lane_change_min_distance_to_stop_m": 20.0,
         "lane_change_trigger_speed_ratio": 0.6,
-        "lane_change_random_rate_per_s": 120,
+        "lane_change_random_rate_per_s": 1000,
         "lane_change_max_angle_deg": 20.0,
         "lane_change_min_speed_mps": 4.0,
 
@@ -173,10 +191,10 @@ CONFIG = {
         "radius": 7
     },
     "roads": {
-        "north": {"enabled": True, "incoming": 3, "outgoing": 3 ,"inverse": "south"},
-        "south": {"enabled": True, "incoming": 3, "outgoing": 3 ,"inverse": "north"},
-        "east": {"enabled": True, "incoming": 3, "outgoing": 3 ,"inverse": "west"},
-        "west": {"enabled": True, "incoming": 3 , "outgoing": 3 ,"inverse": "east"}
+        "north": {"enabled": True, "incoming": 2, "outgoing": 2 ,"inverse": "south"},
+        "south": {"enabled": True, "incoming": 2, "outgoing": 2 ,"inverse": "north"},
+        "east": {"enabled": True, "incoming": 2, "outgoing": 2 ,"inverse": "west"},
+        "west": {"enabled": True, "incoming": 2  , "outgoing": 2 ,"inverse": "east"}
     }
 }
 

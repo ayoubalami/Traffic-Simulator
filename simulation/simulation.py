@@ -3,7 +3,7 @@ import math
 from collections import defaultdict
 from .vehicle import EmergencyVehicle, Vehicle
 from .pedestrian import Pedestrian
-from .traffic_light import TrafficLightController
+from .traffic_light import SixPhaseTrafficLightController, TrafficLightController
 from .metrics import Metrics
 
 class Simulation:
@@ -13,10 +13,14 @@ class Simulation:
         random_seed=None,
         duration_selector=None,
         extension_decider=None,
+        phase_selector=None,
     ):
         self.config = config
         self.random = random.Random(random_seed) if random_seed is not None else random
-        self.light_controller = TrafficLightController(config)
+        controller_class = (
+            SixPhaseTrafficLightController if phase_selector is not None else TrafficLightController
+        )
+        self.light_controller = controller_class(config)
         self.vehicles = []
         self.pedestrians = []
         self.spawn_timer = 0
@@ -39,6 +43,13 @@ class Simulation:
         if extension_decider is not None:
             self.light_controller.set_extension_decider(
                 lambda direction: self._should_extend_green(direction, extension_decider)
+            )
+        if phase_selector is not None:
+            self.light_controller.set_phase_selector(
+                lambda active_phase, available_phases: phase_selector(
+                    self.get_signal_observation(active_phase),
+                    available_phases,
+                )
             )
         self.light_controller.set_phase_activation_guard(self._can_activate_phase)
     
@@ -141,6 +152,8 @@ class Simulation:
         vehicle_counts = {direction: 0 for direction in ("north", "south", "east", "west")}
         emergency_counts = {direction: 0 for direction in ("north", "south", "east", "west")}
         pedestrian_counts = {direction: 0 for direction in ("north", "south", "east", "west")}
+        turning_counts = {direction: 0 for direction in ("north", "south", "east", "west")}
+        stuck_turning_counts = {direction: 0 for direction in ("north", "south", "east", "west")}
         for vehicle in self.vehicles:
             if not vehicle.cleared_intersection:
                 vehicle_counts[vehicle.road_direction] += 1
@@ -148,6 +161,10 @@ class Simulation:
                     emergency_counts[vehicle.road_direction] += 1
             if vehicle.stopped and not vehicle.cleared_intersection:
                 queue_lengths[vehicle.road_direction] += 1
+            if vehicle.turning:
+                turning_counts[vehicle.road_direction] += 1
+                if vehicle.stopped or vehicle.current_speed <= 0.01:
+                    stuck_turning_counts[vehicle.road_direction] += 1
         for pedestrian in self.pedestrians:
             if not pedestrian.waiting or pedestrian.has_reached_divider:
                 pedestrian_counts[pedestrian.crossing] += 1
@@ -156,9 +173,56 @@ class Simulation:
             "vehicle_counts": vehicle_counts,
             "emergency_counts": emergency_counts,
             "pedestrian_counts": pedestrian_counts,
+            "turning_counts": turning_counts,
+            "stuck_turning_counts": stuck_turning_counts,
+            "red_elapsed_s": (
+                self.light_controller.get_red_elapsed()
+                if hasattr(self.light_controller, "get_red_elapsed")
+                else {direction: 0.0 for direction in queue_lengths}
+            ),
             "active_phase": active_phase,
             "green_elapsed_s": self.light_controller.timer,
         }
+
+    def count_stuck_vehicles_in_intersection(self, speed_threshold_mps=0.5):
+        """Count nearly stopped vehicles whose centres are in the junction."""
+        lane_width = self.config["lane_width"]
+        roads = self.config["roads"]
+        vertical_widths = [
+            lane_width * (roads[direction]["incoming"] + roads[direction]["outgoing"])
+            + self.config["vertical_road_direction_divider_width"]
+            for direction in ("north", "south")
+            if roads[direction]["enabled"]
+        ]
+        horizontal_widths = [
+            lane_width * (roads[direction]["incoming"] + roads[direction]["outgoing"])
+            + self.config["horizontal_road_direction_divider_width"]
+            for direction in ("east", "west")
+            if roads[direction]["enabled"]
+        ]
+        if not vertical_widths or not horizontal_widths:
+            return 0
+
+        center_x = self.config["window"]["width"] / 2
+        center_y = self.config["window"]["height"] / 2
+        half_width = max(vertical_widths) / 2
+        half_height = max(horizontal_widths) / 2
+        pixels_per_meter = max(
+            1e-9,
+            float(self.config["simulation"]["pixels_per_meter"]),
+        )
+        speed_limit = max(0.0, float(speed_threshold_mps)) * pixels_per_meter
+
+        count = 0
+        for vehicle in self.vehicles:
+            vehicle_center_x, vehicle_center_y = vehicle.get_rect().center
+            is_inside = (
+                center_x - half_width <= vehicle_center_x <= center_x + half_width
+                and center_y - half_height <= vehicle_center_y <= center_y + half_height
+            )
+            if is_inside and vehicle.current_speed <= speed_limit:
+                count += 1
+        return count
 
     def _should_extend_green(self, active_phase, extension_decider):
         observation = self.get_signal_observation(active_phase)

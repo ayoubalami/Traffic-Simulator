@@ -165,10 +165,10 @@ class Vehicle:
         )
         self.stop_margin = self._crosswalk_stop_distance() + self.random.uniform(stop_gap_min, stop_gap_max)
 
-        # --- right-turn setup ---
-        # Decided once at spawn: only the outer (rightmost) lane of a road
-        # has a small chance of turning right instead of going straight,
-        # and only if the destination road is actually enabled.
+        # --- route/turn setup ---
+        # Normally, only the outer turn lanes may probabilistically turn.
+        # If the road straight ahead is disabled, every vehicle is assigned
+        # a valid left or right exit instead of driving into the closed road.
         self.has_turned = False
         self.is_turning_vehicle = False
         self.uses_turn_signal = False
@@ -184,28 +184,39 @@ class Vehicle:
         right_turn_chance = config.get("simulation", {}).get("right_turn_chance", 0)
         left_turn_chance = config.get("simulation", {}).get("left_turn_chance", 0)
         roads = config["roads"]
-        turn_options = []
+        straight_exit_enabled = self._movement_exit_is_enabled(self.road_direction)
 
         right_target = self.RIGHT_TURN_TARGET.get(self.road_direction)
-        if (
-            right_target
-            and roads.get(roads.get(right_target, {}).get("inverse", False), {}).get("enabled", False)
-            and self.lane_index == self._right_lane_index(self.road_direction)
-        ):
-            turn_options.append(("right", right_target, max(0.0, right_turn_chance)))
-
         left_target = self.LEFT_TURN_TARGET.get(self.road_direction)
-        if (
-            left_target
-            and roads.get(roads.get(left_target, {}).get("inverse", False), {}).get("enabled", False)
-            and self.lane_index == self._left_lane_index(self.road_direction)
-        ):
-            turn_options.append(("left", left_target, max(0.0, left_turn_chance)))
+        available_turns = []
+        if right_target and self._movement_exit_is_enabled(right_target):
+            available_turns.append(
+                ("right", right_target, max(0.0, float(right_turn_chance)))
+            )
+        if left_target and self._movement_exit_is_enabled(left_target):
+            available_turns.append(
+                ("left", left_target, max(0.0, float(left_turn_chance)))
+            )
 
-        total_turn_weight = sum(weight for _, _, weight in turn_options)
-        if total_turn_weight > 0:
-            roll = self.random.random()
-            cumulative = 0.0
+        selected_turn = None
+        if not straight_exit_enabled:
+            selected_turn = self._select_forced_turn(available_turns)
+        else:
+            normal_turns = [
+                turn
+                for turn in available_turns
+                if (
+                    turn[0] == "right"
+                    and self.lane_index == self._right_lane_index(self.road_direction)
+                )
+                or (
+                    turn[0] == "left"
+                    and self.lane_index == self._left_lane_index(self.road_direction)
+                )
+            ]
+            selected_turn = self._select_optional_turn(normal_turns)
+
+        if selected_turn is not None:
             turn_signal_chance = max(
                 0.0,
                 min(
@@ -217,14 +228,60 @@ class Vehicle:
                     ),
                 ),
             )
-            for turn_side, target_direction, weight in turn_options:
-                cumulative += weight
-                if roll < cumulative:
-                    self.is_turning_vehicle = True
-                    self.uses_turn_signal = self.random.random() < turn_signal_chance
-                    self.turn_side = turn_side
-                    self.turn_target_direction = target_direction
-                    break
+            self.is_turning_vehicle = True
+            self.uses_turn_signal = self.random.random() < turn_signal_chance
+            self.turn_side, self.turn_target_direction, _ = selected_turn
+
+    def _movement_exit_is_enabled(self, movement_direction):
+        """Whether a movement direction leads to an enabled physical exit."""
+        roads = self.config["roads"]
+        movement_road = roads.get(movement_direction, {})
+        exit_direction = movement_road.get("inverse")
+        return bool(
+            exit_direction
+            and roads.get(exit_direction, {}).get("enabled", False)
+        )
+
+    def _select_optional_turn(self, turn_options):
+        """Apply the configured left/right probabilities on an open road."""
+        roll = self.random.random()
+        cumulative = 0.0
+        for turn in turn_options:
+            cumulative += turn[2]
+            if roll < cumulative:
+                return turn
+        return None
+
+    def _select_forced_turn(self, turn_options):
+        """Choose a valid turn when the straight physical exit is closed."""
+        if not turn_options:
+            return None
+
+        by_side = {turn[0]: turn for turn in turn_options}
+        right_lane = self._right_lane_index(self.road_direction)
+        left_lane = self._left_lane_index(self.road_direction)
+        if self.lane_index == right_lane and "right" in by_side:
+            return by_side["right"]
+        if self.lane_index == left_lane and "left" in by_side:
+            return by_side["left"]
+        if len(turn_options) == 1:
+            return turn_options[0]
+
+        # Centre lanes use the configured turn proportions. If both are zero,
+        # split traffic evenly so the closure can never produce a straight
+        # movement into the disabled road.
+        weights = [turn[2] for turn in turn_options]
+        total_weight = sum(weights)
+        if total_weight <= 0:
+            weights = [1.0] * len(turn_options)
+            total_weight = float(len(turn_options))
+        roll = self.random.random() * total_weight
+        cumulative = 0.0
+        for turn, weight in zip(turn_options, weights):
+            cumulative += weight
+            if roll < cumulative:
+                return turn
+        return turn_options[-1]
 
     def _right_lane_index(self, direction):
         """

@@ -25,6 +25,10 @@ class Metrics:
                 vehicle_defaults.get("hard_braking_highlight_duration_s", 1.0)
             ),
         )
+        self.turning_stuck_speed_mps = max(
+            0.0,
+            float(vehicle_defaults.get("turning_stuck_speed_mps", 0.5)),
+        )
         self.simulation_time = 0.0
         self.total_vehicles_spawned = 0
         self.total_vehicles_exited = 0
@@ -37,6 +41,10 @@ class Metrics:
         self.max_deceleration_mps2 = 0.0
         self.max_braking_intensity = 0.0
         self.total_excess_braking_intensity = 0.0
+        self.turning_stuck_events = 0
+        self.turning_stuck_vehicles = 0
+        self.total_turning_stuck_time = 0.0
+        self.max_turning_vehicles_stuck = 0
         self.total_pedestrians_spawned = 0
         self.total_pedestrians_finished = 0
         self.total_pedestrian_wait_time = 0.0
@@ -65,6 +73,8 @@ class Metrics:
             "previous_speed": None,
             "was_hard_braking": False,
             "has_hard_braked": False,
+            "was_turning_stuck": False,
+            "has_been_turning_stuck": False,
         }
 
         self.total_vehicles_spawned += 1
@@ -72,6 +82,7 @@ class Metrics:
     def update(self, vehicles, dt):
         self.queue_lengths = self._empty_direction_counts()
         dt = max(0.0, dt)
+        current_turning_vehicles_stuck = 0
         for v in vehicles:
             if id(v) not in self.vehicles_tracked:
                 self.register_vehicle(id(v), v.road_direction)
@@ -134,6 +145,21 @@ class Metrics:
             data["was_hard_braking"] = is_hard_braking
             data["previous_speed"] = v.current_speed
 
+            speed_mps = v.current_speed / self.pixels_per_meter
+            is_turning_stuck = bool(
+                getattr(v, "turning", False)
+                and speed_mps <= self.turning_stuck_speed_mps
+            )
+            if is_turning_stuck:
+                current_turning_vehicles_stuck += 1
+                self.total_turning_stuck_time += dt
+                if not data["was_turning_stuck"]:
+                    self.turning_stuck_events += 1
+                    if not data["has_been_turning_stuck"]:
+                        self.turning_stuck_vehicles += 1
+                        data["has_been_turning_stuck"] = True
+            data["was_turning_stuck"] = is_turning_stuck
+
             if v.stopped:
                 data["wait_time"] += dt
                 if not data["was_stopped"]:
@@ -153,6 +179,11 @@ class Metrics:
                 self.max_queue_lengths[direction],
                 count,
             )
+        self.max_turning_vehicles_stuck = max(
+            self.max_turning_vehicles_stuck,
+            current_turning_vehicles_stuck,
+        )
+        self.current_turning_vehicles_stuck = current_turning_vehicles_stuck
 
     def register_pedestrian(self, pedestrian_id):
         if pedestrian_id in self.pedestrians_tracked:
@@ -215,6 +246,10 @@ class Metrics:
             self.total_excess_braking_intensity
             / max(1, self.total_vehicles_spawned)
         )
+        turning_stuck_vehicle_rate = self.turning_stuck_vehicles / max(
+            1,
+            self.total_vehicles_spawned,
+        )
 
         return {
             "throughput": self.total_vehicles_exited,
@@ -242,6 +277,14 @@ class Metrics:
             "avg_excess_braking_intensity_per_vehicle": (
                 avg_excess_braking_intensity_per_vehicle
             ),
+            "turning_stuck_events": self.turning_stuck_events,
+            "turning_stuck_vehicles": self.turning_stuck_vehicles,
+            "turning_stuck_vehicle_rate": turning_stuck_vehicle_rate,
+            "total_turning_stuck_time": self.total_turning_stuck_time,
+            "current_turning_vehicles_stuck": getattr(
+                self, "current_turning_vehicles_stuck", 0
+            ),
+            "max_turning_vehicles_stuck": self.max_turning_vehicles_stuck,
             "queue_lengths": self.queue_lengths.copy(),
             "max_queue_lengths": self.max_queue_lengths.copy(),
             "simulation_time": self.simulation_time,
