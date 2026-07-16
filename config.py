@@ -3,8 +3,8 @@ from copy import deepcopy
 
 CONFIG = {
     "window": {
-        "width": 1300,
-        "height": 900,
+        "width": 1000,
+        "height": 800,
         "title": "Traffic Simulator"
     },
     "colors": {
@@ -28,13 +28,21 @@ CONFIG = {
     "horizontal_road_direction_divider_width_m": 3.0,
     "road_side_margin_ratio": 0.30,
     "distance_scale": {
-        "enabled": True,
+        "enabled": False,
         "length_m": 100.0,
     },
     "debug": {
         # Draw the current physical deceleration beside every vehicle.
         "show_vehicle_braking_rate": False,
         "vehicle_braking_rate_decimals": 2,
+    },
+    "interactive_density_control": {
+        # Change direction_spawn_weights while an interactive simulation is
+        # running. These are relative arrival weights: increasing one side
+        # sends a larger share of newly spawned vehicles to that approach.
+        "enabled": True,
+        "step": 0.25,
+        "max_weight": 10.0,
     },
     "traffic_lights": {
         # Adaptive policies decide whether to extend green every second after
@@ -47,6 +55,9 @@ CONFIG = {
         "max_red_duration_s": 60.0,
         "green_extension_check_interval_s": 1.0,
         "all_red_clearance_duration_s": 1.0,
+        # Right arrows are actuated independently from the neural main phase.
+        # Every demanded, compatible direction may be green simultaneously.
+        "automatic_right_turn_arrows": True,
         "green_durations_s": {
             "north": 8.0,
             "south": 8.0,
@@ -87,8 +98,21 @@ CONFIG = {
     },
     "six_phase_fitness": {
         # Additional objectives used only by the separate six-phase model.
-        "turning_stuck_time_penalty": 20.0,
-        "turning_stuck_event_penalty": 25.0,
+        # These two diagnostics overlap with left-turn delay and physical
+        # intersection blocking. Keep reporting them, but do not count the
+        # same congestion multiple times in fitness.
+        "turning_stuck_time_penalty": 0.0,
+        "turning_stuck_event_penalty": 0.0,
+        "phase_switch_penalty": 50.0,
+        # Empty phases are already prevented by the controller's demand mask.
+        "empty_phase_time_penalty": 0.0,
+        "intersection_blocking_time_penalty": 40.0,
+        "left_turn_delay_penalty": 15.0,
+        "right_turn_delay_penalty": 15.0,
+        # Penalize the approach with the highest average stopped time before
+        # entering the junction, so light traffic on other sides cannot hide
+        # one neglected direction in the global average.
+        "worst_approach_wait_time_penalty": 5.0,
         # Reject policies that form a persistent blockage in the physical
         # intersection. Evaluation stops as soon as this condition is met.
         "gridlock_penalty": 100000.0,
@@ -98,7 +122,7 @@ CONFIG = {
         "abort_remaining_seeds_on_gridlock": True,
     },
     "simulation": {
-        "pixels_per_meter": 7,
+        "pixels_per_meter": 6,
         # Simulation acceleration factor.  The interactive renderer and
         # headless neuroevolution evaluations both use this value.  Values
         # above 1 run faster by using larger simulation-time increments.
@@ -107,13 +131,13 @@ CONFIG = {
         # Relative arrival rates for each enabled approach.  Set a weight to
         # zero to prevent new vehicles from spawning on that approach.
         "direction_spawn_weights": {
-            "north": .0150,
-            "south": 3.50,
+            "north": 0.50,
+            "south": 1.50,
             "east": 0.50,
-            "west": 0.10,
+            "west": 0.310,
         },
-        "right_turn_chance" : .250,
-        "left_turn_chance"  : .8350,
+        "right_turn_chance" : .3250,
+        "left_turn_chance"  : .3350,
         # Probability that a turning vehicle uses its indicator.
         "turn_signal_use_chance": 0.50,
         # A small chance per spawn keeps emergency vehicles occasional while
@@ -130,6 +154,13 @@ CONFIG = {
         "left_turn_speed_kmh": 20.,
         "right_turn_slowdown_distance_m": 25,
         "left_turn_min_forward_progress_m": 12.0,
+        # Reserve the innermost incoming lane for left-turning vehicles.
+        # On a one-lane approach the lane must remain shared.
+        "exclusive_left_turn_lane": True,
+        # With at least three incoming lanes, reserve the outermost lane for
+        # right-turning vehicles. Two-lane approaches remain shared so one
+        # through lane is not removed by each turn movement.
+        "exclusive_right_turn_lane": True,
 
         "size_speed_reduction_per_length_ratio": 0.25,
         "min_size_speed_multiplier": 0.75,
@@ -191,10 +222,10 @@ CONFIG = {
         "radius": 7
     },
     "roads": {
-        "north": {"enabled": True, "incoming": 2, "outgoing": 2 ,"inverse": "south"},
-        "south": {"enabled": True, "incoming": 2, "outgoing": 2 ,"inverse": "north"},
-        "east": {"enabled": True, "incoming": 2, "outgoing": 2 ,"inverse": "west"},
-        "west": {"enabled": True, "incoming": 2  , "outgoing": 2 ,"inverse": "east"}
+        "north": {"enabled": True, "incoming": 4, "outgoing": 4 ,"inverse": "south"},
+        "south": {"enabled": True, "incoming": 4, "outgoing": 4 ,"inverse": "north"},
+        "east": {"enabled": True, "incoming": 4, "outgoing": 4 ,"inverse": "west"},
+        "west": {"enabled": True, "incoming": 4  , "outgoing": 4 ,"inverse": "east"}
     }
 }
 

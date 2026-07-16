@@ -168,7 +168,7 @@ class TrafficLightController:
 
 
 class SixPhaseTrafficLightController(TrafficLightController):
-    """Controller that can serve paired axes or one approach independently."""
+    """Controller with paired, individual, and protected-turn movements."""
 
     PHASES = (
         ("ns", ("north", "south")),
@@ -177,10 +177,56 @@ class SixPhaseTrafficLightController(TrafficLightController):
         ("south_only", ("south",)),
         ("east_only", ("east",)),
         ("west_only", ("west",)),
+        ("north_left", ("north",)),
+        ("south_left", ("south",)),
+        ("east_left", ("east",)),
+        ("west_left", ("west",)),
     )
     DIRECTIONS = ("north", "south", "east", "west")
+    SINGLE_APPROACH_PHASES = {
+        "north_only": "north",
+        "south_only": "south",
+        "east_only": "east",
+        "west_only": "west",
+    }
+    LEFT_TURN_PHASES = {
+        "north_left": "north",
+        "south_left": "south",
+        "east_left": "east",
+        "west_left": "west",
+    }
+    LEFT_TURN_EXIT_CROSSINGS = {
+        "north": "east",
+        "south": "west",
+        "east": "south",
+        "west": "north",
+    }
+    RIGHT_TURN_EXIT_CROSSINGS = {
+        "north": "west",
+        "south": "east",
+        "east": "north",
+        "west": "south",
+    }
+    RIGHT_TURN_TARGETS = {
+        "north": "east",
+        "south": "west",
+        "east": "south",
+        "west": "north",
+    }
+    LEFT_TURN_TARGETS = {
+        "north": "west",
+        "south": "east",
+        "east": "north",
+        "west": "south",
+    }
 
     def __init__(self, config):
+        self.left_turn_states = {
+            direction: "red" for direction in self.DIRECTIONS
+        }
+        self.right_turn_states = {
+            direction: "red" for direction in self.DIRECTIONS
+        }
         super().__init__(config)
         timing = config.get("traffic_lights", {})
         self.max_red_duration = max(
@@ -188,39 +234,349 @@ class SixPhaseTrafficLightController(TrafficLightController):
             float(timing.get("max_red_duration_s", 60.0)),
         )
         self.red_elapsed = {direction: 0.0 for direction in self.DIRECTIONS}
+        self.left_red_elapsed = {
+            direction: 0.0 for direction in self.DIRECTIONS
+        }
+        self.right_red_elapsed = {
+            direction: 0.0 for direction in self.DIRECTIONS
+        }
         self.phase_selector = None
+        self.phase_observation_provider = None
+        self.right_turn_activation_guard = None
+        self.automatic_right_turn_arrows = bool(
+            timing.get("automatic_right_turn_arrows", True)
+        )
         self.pending_phase = None
+        self.last_available_phases = ()
+        self.last_policy_requested_phase = None
+        self.last_controller_decision = self.active_phase
+
+    def _set_phase_lights(self, phase, state):
+        left_direction = self.LEFT_TURN_PHASES.get(phase)
+        if left_direction is not None:
+            self.left_turn_states[left_direction] = state
+            return
+        for direction in self.phase_directions(phase):
+            self.states[direction] = state
+        single_direction = self.SINGLE_APPROACH_PHASES.get(phase)
+        if single_direction is not None:
+            # An individual approach phase is also protected from opposing
+            # traffic, so its through and left movements may run together.
+            self.left_turn_states[single_direction] = state
+
+    def get_left_turn_state(self, direction):
+        """Return the dedicated protected-left arrow state."""
+        return self.left_turn_states.get(direction, "red")
+
+    def get_right_turn_state(self, direction):
+        """Return the dedicated protected/permissive-right arrow state."""
+        return self.right_turn_states.get(direction, "red")
+
+    def get_vehicle_state(self, vehicle):
+        """Return the signal governing this vehicle's intended movement."""
+        is_pending_left = bool(
+            getattr(vehicle, "is_turning_vehicle", False)
+            and getattr(vehicle, "turn_side", None) == "left"
+            and not getattr(vehicle, "has_turned", False)
+        )
+        if is_pending_left:
+            return self.get_left_turn_state(vehicle.road_direction)
+        is_pending_right = bool(
+            getattr(vehicle, "is_turning_vehicle", False)
+            and getattr(vehicle, "turn_side", None) == "right"
+            and not getattr(vehicle, "has_turned", False)
+        )
+        if is_pending_right:
+            right_state = self.get_right_turn_state(vehicle.road_direction)
+            if right_state != "red":
+                return right_state
+            # With the dedicated arrow red, a right turn remains permissive
+            # under its normal approach signal and yields on the turn path.
+            return self.get_state(vehicle.road_direction)
+        return self.get_state(vehicle.road_direction)
+
+    def phase_conflicting_crossings(self, phase):
+        """Return crosswalks that must be clear before this phase starts."""
+        crossings = set(self.phase_directions(phase))
+        left_direction = (
+            self.LEFT_TURN_PHASES.get(phase)
+            or self.SINGLE_APPROACH_PHASES.get(phase)
+        )
+        if left_direction is not None:
+            crossings.add(self.LEFT_TURN_EXIT_CROSSINGS[left_direction])
+        return crossings
+
+    def get_pedestrian_state(self, crossing):
+        right_arrow_conflict = any(
+            state == "green"
+            and crossing in {
+                direction,
+                self.RIGHT_TURN_EXIT_CROSSINGS[direction],
+            }
+            for direction, state in self.right_turn_states.items()
+        )
+        if (
+            self.phase_state == "green"
+            and (
+                crossing in self.phase_conflicting_crossings(self.active_phase)
+                or right_arrow_conflict
+            )
+        ):
+            return "red"
+        return super().get_pedestrian_state(crossing)
 
     def set_phase_selector(self, selector):
         """Set ``selector(active_phase, available_phases) -> phase_name``."""
         self.phase_selector = selector
 
-    def get_available_phases(self):
-        enabled = self.config.get("roads", {})
-        return tuple(
+    def set_phase_observation_provider(self, provider):
+        """Set a callback returning current demand and turn observations."""
+        self.phase_observation_provider = provider
+
+    def set_right_turn_activation_guard(self, guard):
+        """Set ``guard(direction)`` for pedestrian and scene-level safety."""
+        self.right_turn_activation_guard = guard
+
+    def right_turn_is_compatible_with_phase(self, direction, phase=None):
+        """Whether a right turn can run beside the selected main phase."""
+        phase = phase or self.active_phase
+        right_target = self.RIGHT_TURN_TARGETS[direction]
+        left_direction = self.LEFT_TURN_PHASES.get(phase)
+        if left_direction is not None:
+            return (
+                left_direction == direction
+                or self.LEFT_TURN_TARGETS[left_direction] != right_target
+            )
+
+        active_directions = set(self.phase_directions(phase))
+        if direction in active_directions:
+            return True
+        if right_target in active_directions:
+            return False
+        single_direction = self.SINGLE_APPROACH_PHASES.get(phase)
+        return not (
+            single_direction is not None
+            and self.LEFT_TURN_TARGETS[single_direction] == right_target
+        )
+
+    def _update_automatic_right_turns(self, observation):
+        approaching_right = observation.get("approaching_right_turn_counts", {})
+        for direction in self.DIRECTIONS:
+            demanded = approaching_right.get(direction, 0) > 0
+            compatible = (
+                self.phase_state == "green"
+                and self.right_turn_is_compatible_with_phase(direction)
+            )
+            guard_allows = (
+                self.right_turn_activation_guard is None
+                or self.right_turn_activation_guard(direction)
+            )
+            self.right_turn_states[direction] = (
+                "green"
+                if self.automatic_right_turn_arrows
+                and demanded
+                and compatible
+                and guard_allows
+                else "red"
+            )
+
+    def _phase_observation(self):
+        if self.phase_observation_provider is None:
+            return {}
+        return self.phase_observation_provider() or {}
+
+    def _direction_demand(self, observation):
+        vehicles = observation.get("vehicle_counts", {})
+        queues = observation.get("queue_lengths", {})
+        return {
+            direction: max(
+                int(vehicles.get(direction, 0)),
+                int(queues.get(direction, 0)),
+            )
+            for direction in self.DIRECTIONS
+        }
+
+    def get_available_phases(self, observation=None):
+        """Return physically valid phases that can serve current demand."""
+        roads = self.config.get("roads", {})
+        physically_available = tuple(
             phase
             for phase, directions in self.PHASES
-            if any(enabled.get(direction, {}).get("enabled", False) for direction in directions)
+            if (
+                all(roads.get(direction, {}).get("enabled", False) for direction in directions)
+                if len(directions) > 1
+                else bool(roads.get(directions[0], {}).get("enabled", False))
+            )
         )
+        if observation is None or not observation:
+            return physically_available
+
+        demand = self._direction_demand(observation)
+        demanded_directions = {
+            direction for direction, count in demand.items() if count > 0
+        }
+        if not demanded_directions:
+            if self.active_phase in physically_available:
+                return (self.active_phase,)
+            return physically_available[:1]
+
+        approaching_left = observation.get("approaching_left_turn_counts", {})
+        queued_left = observation.get("queued_left_turn_counts", {})
+        approaching_right = observation.get("approaching_right_turn_counts", {})
+        queued_right = observation.get("queued_right_turn_counts", {})
+        vehicles = observation.get("vehicle_counts", {})
+        queues = observation.get("queue_lengths", {})
+        regular_demand = {
+            direction: max(
+                0,
+                int(vehicles.get(direction, 0))
+                - int(approaching_left.get(direction, 0)),
+                int(queues.get(direction, 0))
+                - int(queued_left.get(direction, 0)),
+            )
+            for direction in self.DIRECTIONS
+        }
+        regular_demand = {
+            direction: max(
+                0,
+                regular_demand[direction]
+                - int(approaching_right.get(direction, 0)),
+                int(queues.get(direction, 0))
+                - int(queued_left.get(direction, 0))
+                - int(queued_right.get(direction, 0)),
+            )
+            for direction in self.DIRECTIONS
+        }
+        available = []
+        for phase, directions in self.PHASES:
+            if phase not in physically_available:
+                continue
+            serves_active_automatic_right = bool(
+                phase == self.active_phase
+                and any(
+                    approaching_right.get(direction, 0) > 0
+                    and self.right_turn_is_compatible_with_phase(
+                        direction,
+                        phase,
+                    )
+                    for direction in self.DIRECTIONS
+                )
+            )
+            if serves_active_automatic_right:
+                available.append(phase)
+                continue
+            left_direction = self.LEFT_TURN_PHASES.get(phase)
+            if left_direction is not None:
+                if approaching_left.get(left_direction, 0) > 0:
+                    available.append(phase)
+                continue
+            if len(directions) > 1:
+                if any(
+                    regular_demand[direction] > 0
+                    or approaching_right.get(direction, 0) > 0
+                    for direction in directions
+                ):
+                    available.append(phase)
+                continue
+
+            direction = directions[0]
+            if demand[direction] <= 0:
+                continue
+            opposite = roads.get(direction, {}).get("inverse")
+            paired_phase_is_possible = bool(
+                opposite and roads.get(opposite, {}).get("enabled", False)
+            )
+            needs_protected_turn = bool(
+                approaching_left.get(direction, 0) > 0
+                and opposite
+                and demand.get(opposite, 0) > 0
+            )
+            if not paired_phase_is_possible or needs_protected_turn:
+                available.append(phase)
+
+        return tuple(available) or physically_available
 
     def get_red_elapsed(self):
         return self.red_elapsed.copy()
 
+    def get_left_red_elapsed(self):
+        return self.left_red_elapsed.copy()
+
+    def get_right_red_elapsed(self):
+        return self.right_red_elapsed.copy()
+
+    def phase_serves_left_turn(self, phase, direction):
+        return (
+            self.LEFT_TURN_PHASES.get(phase) == direction
+            or self.SINGLE_APPROACH_PHASES.get(phase) == direction
+        )
+
+    def phase_serves_right_turn(self, phase, direction):
+        return (
+            self.right_turn_is_compatible_with_phase(direction, phase)
+            or direction in self.phase_directions(phase)
+        )
+
     def update(self, dt):
         dt = max(0.0, dt)
         self.timer += dt
+        observation = self._phase_observation()
+        demand = self._direction_demand(observation)
+        approaching_left = observation.get("approaching_left_turn_counts", {})
+        approaching_right = observation.get("approaching_right_turn_counts", {})
         for direction in self.DIRECTIONS:
-            if self.states[direction] == "green":
+            if self.states[direction] == "green" or demand[direction] <= 0:
                 self.red_elapsed[direction] = 0.0
             else:
                 self.red_elapsed[direction] += dt
+            if (
+                self.left_turn_states[direction] == "green"
+                or approaching_left.get(direction, 0) <= 0
+            ):
+                self.left_red_elapsed[direction] = 0.0
+            else:
+                self.left_red_elapsed[direction] += dt
+            if (
+                self.right_turn_states[direction] == "green"
+                or self.states[direction] == "green"
+                or approaching_right.get(direction, 0) <= 0
+            ):
+                self.right_red_elapsed[direction] = 0.0
+            else:
+                self.right_red_elapsed[direction] += dt
 
         if self.phase_state == "green":
             if self.timer >= self.max_green_duration:
-                self.pending_phase = self._choose_phase(force_change=True)
-                self._start_yellow()
+                requested_phase = self._choose_phase(
+                    force_change=False,
+                    observation=observation,
+                )
+                if requested_phase != self.active_phase:
+                    self.pending_phase = requested_phase
+                    self._start_yellow()
+                elif self._has_competing_demand(observation):
+                    requested_phase = self._choose_phase(
+                        force_change=True,
+                        observation=observation,
+                    )
+                    if requested_phase != self.active_phase:
+                        self.pending_phase = requested_phase
+                        self._start_yellow()
+                    else:
+                        self.next_extension_check = (
+                            self.timer + self.extension_check_interval
+                        )
+                else:
+                    # An actuated signal may rest in green when nobody else
+                    # is waiting; maximum green matters only under competition.
+                    self.next_extension_check = (
+                        self.timer + self.extension_check_interval
+                    )
             elif self.timer >= self.next_extension_check:
-                requested_phase = self._choose_phase(force_change=False)
+                requested_phase = self._choose_phase(
+                    force_change=False,
+                    observation=observation,
+                )
                 if requested_phase == self.active_phase:
                     self.next_extension_check += self.extension_check_interval
                 else:
@@ -231,7 +587,10 @@ class SixPhaseTrafficLightController(TrafficLightController):
             self.phase_state = "all_red"
             self.timer = 0.0
         elif self.phase_state == "all_red":
-            next_phase = self.pending_phase or self._choose_phase(force_change=True)
+            next_phase = self.pending_phase or self._choose_phase(
+                force_change=True,
+                observation=observation,
+            )
             can_activate = (
                 self.phase_activation_guard is None
                 or self.phase_activation_guard(next_phase)
@@ -252,45 +611,149 @@ class SixPhaseTrafficLightController(TrafficLightController):
                 self.pending_phase = None
                 self.timer = 0.0
 
-    def _choose_phase(self, force_change):
-        available = self.get_available_phases()
+        self._update_automatic_right_turns(observation)
+
+    def _has_competing_demand(self, observation):
+        return any(
+            phase != self.active_phase
+            for phase in self.get_available_phases(observation)
+        )
+
+    def _choose_phase(self, force_change, observation=None):
+        observation = observation or self._phase_observation()
+        available = self.get_available_phases(observation)
+        self.last_available_phases = tuple(available)
         if not available:
+            self.last_policy_requested_phase = None
+            self.last_controller_decision = self.active_phase
             return self.active_phase
 
+        demand = self._direction_demand(observation)
         overdue = {
             direction
             for direction, elapsed in self.red_elapsed.items()
             if elapsed >= self.max_red_duration
             and self.config["roads"][direction]["enabled"]
+            and demand[direction] > 0
+        }
+        approaching_left = observation.get("approaching_left_turn_counts", {})
+        overdue_left = {
+            direction
+            for direction, elapsed in self.left_red_elapsed.items()
+            if elapsed >= self.max_red_duration
+            and self.config["roads"][direction]["enabled"]
+            and approaching_left.get(direction, 0) > 0
+        }
+        approaching_right = observation.get("approaching_right_turn_counts", {})
+        overdue_right = {
+            direction
+            for direction, elapsed in self.right_red_elapsed.items()
+            if elapsed >= self.max_red_duration
+            and self.config["roads"][direction]["enabled"]
+            and approaching_right.get(direction, 0) > 0
         }
         requested = None
         if self.phase_selector is not None:
             requested = self.phase_selector(self.active_phase, available)
+        self.last_policy_requested_phase = requested
         if requested not in available:
             requested = self.active_phase if self.active_phase in available else available[0]
 
-        if overdue and not overdue.intersection(self.phase_directions(requested)):
-            requested = self._fairest_phase(available, exclude=())
+        left_is_served = any(
+            self.phase_serves_left_turn(requested, direction)
+            for direction in overdue_left
+        )
+        if overdue_left and not left_is_served:
+            left_candidates = [
+                phase
+                for phase in available
+                if any(
+                    self.phase_serves_left_turn(phase, direction)
+                    for direction in overdue_left
+                )
+            ]
+            if left_candidates:
+                requested = self._fairest_phase(
+                    left_candidates,
+                    exclude=(),
+                    observation=observation,
+                )
+        right_is_served = any(
+            self.phase_serves_right_turn(requested, direction)
+            for direction in overdue_right
+        )
+        if overdue_right and not right_is_served:
+            right_candidates = [
+                phase
+                for phase in available
+                if any(
+                    self.phase_serves_right_turn(phase, direction)
+                    for direction in overdue_right
+                )
+            ]
+            if right_candidates:
+                requested = self._fairest_phase(
+                    right_candidates,
+                    exclude=(),
+                    observation=observation,
+                )
+        elif overdue and not overdue.intersection(self.phase_directions(requested)):
+            requested = self._fairest_phase(
+                available,
+                exclude=(),
+                observation=observation,
+            )
         if force_change and requested == self.active_phase:
-            requested = self._fairest_phase(available, exclude=(self.active_phase,))
+            requested = self._fairest_phase(
+                available,
+                exclude=(self.active_phase,),
+                observation=observation,
+            )
+        self.last_controller_decision = requested
         return requested
 
-    def _fairest_phase(self, available, exclude):
+    def _fairest_phase(self, available, exclude, observation=None):
         candidates = [phase for phase in available if phase not in exclude]
         if not candidates:
             return self.active_phase
+        observation = observation or {}
+        demand = self._direction_demand(observation)
+        approaching_left = observation.get("approaching_left_turn_counts", {})
+        approaching_right = observation.get("approaching_right_turn_counts", {})
         return max(
             candidates,
             key=lambda phase: (
-                sum(self.red_elapsed[d] for d in self.phase_directions(phase)),
+                sum(
+                    max(
+                        self.red_elapsed[d],
+                        (
+                            self.left_red_elapsed[d]
+                            if self.phase_serves_left_turn(phase, d)
+                            else 0.0
+                        ),
+                        (
+                            self.right_red_elapsed[d]
+                            if self.phase_serves_right_turn(phase, d)
+                            else 0.0
+                        ),
+                    )
+                    for d in self.phase_directions(phase)
+                    if demand[d] > 0
+                ),
+                (
+                    approaching_left.get(self.LEFT_TURN_PHASES[phase], 0)
+                    if phase in self.LEFT_TURN_PHASES
+                    else sum(demand[d] for d in self.phase_directions(phase))
+                ),
                 len(self.phase_directions(phase)),
             ),
         )
 
     def _next_phase(self):
         return self.pending_phase or self._fairest_phase(
-            self.get_available_phases(),
+            self.get_available_phases(self._phase_observation()),
             exclude=(self.active_phase,),
+            observation=self._phase_observation(),
         )
 
     def get_remaining_time(self):

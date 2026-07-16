@@ -1,8 +1,13 @@
+import math
+
 import pygame
 
 class Renderer:
+    DENSITY_DIRECTIONS = ("north", "south", "east", "west")
+
     def __init__(self, config):
         self.config = config
+        self._initialize_density_control()
         pygame.init()
         w = config["window"]["width"]
         h = config["window"]["height"]
@@ -17,7 +22,81 @@ class Renderer:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 self.running = False
+            elif event.type == pygame.KEYDOWN:
+                self._handle_density_key(event.key)
         return self.running
+
+    def _initialize_density_control(self):
+        settings = self.config.get("interactive_density_control", {})
+        self.density_control_enabled = bool(settings.get("enabled", True))
+        weights = self.config.setdefault("simulation", {}).setdefault(
+            "direction_spawn_weights",
+            {},
+        )
+        for direction in self.DENSITY_DIRECTIONS:
+            weights.setdefault(direction, 0.0)
+        self.initial_direction_spawn_weights = {
+            direction: float(weights[direction])
+            for direction in self.DENSITY_DIRECTIONS
+        }
+        self.selected_density_direction = next(
+            (
+                direction
+                for direction in self.DENSITY_DIRECTIONS
+                if self.config.get("roads", {}).get(direction, {}).get("enabled", False)
+            ),
+            "north",
+        )
+
+    def _handle_density_key(self, key):
+        """Handle one key press and update live direction arrival weights."""
+        if not self.density_control_enabled:
+            return False
+
+        selection_keys = {
+            pygame.K_1: "north",
+            pygame.K_KP1: "north",
+            pygame.K_2: "south",
+            pygame.K_KP2: "south",
+            pygame.K_3: "east",
+            pygame.K_KP3: "east",
+            pygame.K_4: "west",
+            pygame.K_KP4: "west",
+        }
+        if key in selection_keys:
+            self.selected_density_direction = selection_keys[key]
+            return True
+
+        weights = self.config["simulation"]["direction_spawn_weights"]
+        settings = self.config.get("interactive_density_control", {})
+        step = max(0.0, float(settings.get("step", 0.05)))
+        max_weight = max(0.0, float(settings.get("max_weight", 10.0)))
+        direction = self.selected_density_direction
+
+        increase_keys = {pygame.K_UP, pygame.K_EQUALS, pygame.K_KP_PLUS}
+        plus_key = getattr(pygame, "K_PLUS", None)
+        if plus_key is not None:
+            increase_keys.add(plus_key)
+
+        if key in increase_keys:
+            weights[direction] = round(
+                min(max_weight, float(weights[direction]) + step),
+                6,
+            )
+            return True
+        if key in {pygame.K_DOWN, pygame.K_MINUS, pygame.K_KP_MINUS}:
+            weights[direction] = round(
+                max(0.0, float(weights[direction]) - step),
+                6,
+            )
+            return True
+        if key in {pygame.K_0, pygame.K_KP0}:
+            weights[direction] = 0.0
+            return True
+        if key == pygame.K_r:
+            weights.update(self.initial_direction_spawn_weights)
+            return True
+        return False
 
     def _divider_width(self, direction):
         key = (
@@ -49,7 +128,9 @@ class Renderer:
             render_data.get("phase_probabilities"),
             render_data.get("policy_selected_phase"),
             getattr(render_data["lights"], "active_phase", None),
+            render_data.get("phase_decision_debug"),
         )
+        self.draw_density_controls()
         self.draw_distance_scale()
         
         pygame.display.flip()
@@ -250,8 +331,14 @@ class Renderer:
             self.screen.blit(surf, (12, y))
             y += 10
 
-    def draw_phase_probabilities(self, probabilities, selected_phase, active_phase):
-        """Draw the six-phase network's softmax outputs on the right."""
+    def draw_phase_probabilities(
+        self,
+        probabilities,
+        selected_phase,
+        active_phase,
+        decision_debug=None,
+    ):
+        """Draw raw outputs and each stage of the controller decision."""
         if not probabilities:
             return
 
@@ -262,9 +349,13 @@ class Renderer:
             ("south_only", "South only"),
             ("east_only", "East only"),
             ("west_only", "West only"),
+            ("north_left", "North left"),
+            ("south_left", "South left"),
+            ("east_left", "East left"),
+            ("west_left", "West left"),
         )
         panel_width = 300
-        panel_height = 244
+        panel_height = 370
         panel_x = self.config["window"]["width"] - panel_width - 14
         panel_y = 14
         panel = pygame.Surface((panel_width, panel_height), pygame.SRCALPHA)
@@ -278,8 +369,23 @@ class Renderer:
             border_radius=4,
         )
 
-        title = self.font.render("Network outputs (softmax)", True, (255, 255, 255))
+        title = self.font.render(
+            "Raw softmax outputs (dim = masked)",
+            True,
+            (255, 255, 255),
+        )
         self.screen.blit(title, (panel_x + 12, panel_y + 10))
+
+        decision_debug = decision_debug or {}
+        available = set(
+            decision_debug.get("available_phases")
+            or (phase for phase, _ in labels)
+        )
+        raw_best = decision_debug.get("raw_best_phase")
+        network_request = decision_debug.get("network_request") or selected_phase
+        controller_decision = decision_debug.get("controller_decision")
+        pending_phase = decision_debug.get("pending_phase")
+        phase_state = decision_debug.get("phase_state") or "-"
 
         label_font = self.vehicle_debug_font
         bar_x = panel_x + 112
@@ -287,9 +393,16 @@ class Renderer:
         row_y = panel_y + 42
         for phase, label in labels:
             probability = max(0.0, min(1.0, float(probabilities.get(phase, 0.0))))
-            is_selected = phase == selected_phase
+            is_available = phase in available
+            is_selected = phase == network_request
+            is_controller_decision = phase == controller_decision
+            is_pending = phase == pending_phase
             is_active = phase == active_phase
             text_color = (90, 225, 255) if is_selected else (225, 225, 225)
+            if not is_available:
+                text_color = (105, 110, 120)
+            if is_controller_decision or is_pending:
+                text_color = (255, 190, 75)
             if is_active:
                 text_color = (100, 255, 135)
             label_surface = label_font.render(label, True, text_color)
@@ -302,6 +415,10 @@ class Renderer:
                 border_radius=2,
             )
             fill_color = (60, 190, 230) if is_selected else (120, 140, 170)
+            if not is_available:
+                fill_color = (65, 68, 75)
+            if is_controller_decision or is_pending:
+                fill_color = (225, 145, 45)
             if is_active:
                 fill_color = (65, 205, 105)
             fill_width = round(bar_width * probability)
@@ -320,13 +437,93 @@ class Renderer:
             self.screen.blit(value_surface, (bar_x + bar_width + 7, row_y + 1))
             row_y += 25
 
-        selected_label = selected_phase or "waiting"
-        footer = label_font.render(
-            f"Policy: {selected_label}  Active: {active_phase or '-'}",
+        raw_footer = self.font.render(
+            f"Raw best: {raw_best or '-'}  Request: {network_request or '-'}",
             True,
             (190, 200, 215),
         )
-        self.screen.blit(footer, (panel_x + 12, panel_y + panel_height - 25))
+        controller_footer = self.font.render(
+            f"Controller: {controller_decision or '-'}  Pending: {pending_phase or '-'}",
+            True,
+            (190, 200, 215),
+        )
+        active_footer = self.font.render(
+            f"Active: {active_phase or '-'}  State: {phase_state}",
+            True,
+            (190, 200, 215),
+        )
+        self.screen.blit(raw_footer, (panel_x + 12, panel_y + panel_height - 61))
+        self.screen.blit(
+            controller_footer,
+            (panel_x + 12, panel_y + panel_height - 43),
+        )
+        self.screen.blit(active_footer, (panel_x + 12, panel_y + panel_height - 25))
+
+    def draw_density_controls(self):
+        """Show and explain the live per-approach arrival-weight controls."""
+        if not self.density_control_enabled:
+            return
+
+        width = self.config["window"]["width"]
+        height = self.config["window"]["height"]
+        panel_width = 350
+        panel_height = 112
+        panel_x = max(10, width - panel_width - 14)
+        panel_y = max(10, height - panel_height - 52)
+        panel = pygame.Surface((panel_width, panel_height), pygame.SRCALPHA)
+        panel.fill((15, 18, 24, 220))
+        self.screen.blit(panel, (panel_x, panel_y))
+        pygame.draw.rect(
+            self.screen,
+            (105, 115, 130),
+            (panel_x, panel_y, panel_width, panel_height),
+            1,
+            border_radius=4,
+        )
+
+        title = self.font.render(
+            "Live arrival weights (relative)",
+            True,
+            (255, 255, 255),
+        )
+        self.screen.blit(title, (panel_x + 10, panel_y + 8))
+
+        weights = self.config["simulation"]["direction_spawn_weights"]
+        roads = self.config.get("roads", {})
+        labels = (
+            ("north", "1 North"),
+            ("south", "2 South"),
+            ("east", "3 East"),
+            ("west", "4 West"),
+        )
+        for index, (direction, label) in enumerate(labels):
+            column = index % 2
+            row = index // 2
+            x = panel_x + 10 + column * 168
+            y = panel_y + 31 + row * 18
+            is_selected = direction == self.selected_density_direction
+            is_enabled = roads.get(direction, {}).get("enabled", False)
+            color = (90, 225, 255) if is_selected else (225, 225, 225)
+            suffix = "" if is_enabled else " (road off)"
+            surface = self.font.render(
+                f"[{label}]: {float(weights[direction]):.2f}{suffix}",
+                True,
+                color,
+            )
+            self.screen.blit(surface, (x, y))
+
+        help_1 = self.font.render(
+            "Up/+ increase   Down/- decrease   0 stop",
+            True,
+            (195, 205, 220),
+        )
+        help_2 = self.font.render(
+            "R reset startup values",
+            True,
+            (195, 205, 220),
+        )
+        self.screen.blit(help_1, (panel_x + 10, panel_y + 72))
+        self.screen.blit(help_2, (panel_x + 10, panel_y + 90))
 
     def draw_distance_scale(self):
         """Draw a metres-to-pixels reference key in the lower-right corner."""
@@ -748,8 +945,7 @@ class Renderer:
 
 
     def draw_lane_arrows(self):
-        """Draw straight white arrows on each incoming lane, near the stop line."""
-        import math
+        """Draw movement arrows on each incoming lane near the stop line."""
 
         colors = self.config["colors"]
         w = self.config["window"]["width"]
@@ -786,6 +982,36 @@ class Renderer:
             pygame.draw.line(surface, color, (x2, y2),
                             (x2 + head_len * math.cos(right), y2 + head_len * math.sin(right)), 2)
 
+        def draw_turn_arrow(surface, color, center, angle, turn_side):
+            """Draw an approach-relative left- or right-turn lane arrow."""
+            forward = math.radians(angle)
+            turn_angle = angle - 90 if turn_side == "left" else angle + 90
+            turn = math.radians(turn_angle)
+            forward_x, forward_y = math.cos(forward), math.sin(forward)
+            turn_x, turn_y = math.cos(turn), math.sin(turn)
+            start = (
+                center[0] - forward_x * shaft_len,
+                center[1] - forward_y * shaft_len,
+            )
+            bend = (
+                center[0] + forward_x * 2,
+                center[1] + forward_y * 2,
+            )
+            end = (bend[0] + turn_x * shaft_len, bend[1] + turn_y * shaft_len)
+            pygame.draw.lines(surface, color, False, (start, bend, end), 2)
+            for head_angle in (turn_angle + 150, turn_angle - 150):
+                head = math.radians(head_angle)
+                pygame.draw.line(
+                    surface,
+                    color,
+                    end,
+                    (
+                        end[0] + head_len * math.cos(head),
+                        end[1] + head_len * math.sin(head),
+                    ),
+                    2,
+                )
+
         def draw_road_arrows(direction, road, stop_pos, arrow_offset, lane_start_idx, angle):
             """Draw straight arrows for all incoming lanes of one road."""
             if not road["enabled"] or road["incoming"] == 0:
@@ -813,7 +1039,53 @@ class Renderer:
                     ax = stop_pos + arrow_offset
                     ay = road_top + lane_center
 
-                draw_straight_arrow(self.screen, arrow_color, (ax, ay), angle)
+                exclusive_left_lane = bool(
+                    self.config.get("vehicle_defaults", {}).get(
+                        "exclusive_left_turn_lane",
+                        False,
+                    )
+                    and road["incoming"] > 1
+                )
+                exclusive_right_lane = bool(
+                    self.config.get("vehicle_defaults", {}).get(
+                        "exclusive_right_turn_lane",
+                        False,
+                    )
+                    and road["incoming"] > 2
+                )
+                left_lane_index = (
+                    road["incoming"] - 1
+                    if direction in ("north", "east")
+                    else 0
+                )
+                right_lane_index = (
+                    road["incoming"] - 1
+                    if direction in ("south", "west")
+                    else 0
+                )
+                if exclusive_left_lane and i == left_lane_index:
+                    draw_turn_arrow(
+                        self.screen,
+                        arrow_color,
+                        (ax, ay),
+                        angle,
+                        "left",
+                    )
+                elif exclusive_right_lane and i == right_lane_index:
+                    draw_turn_arrow(
+                        self.screen,
+                        arrow_color,
+                        (ax, ay),
+                        angle,
+                        "right",
+                    )
+                else:
+                    draw_straight_arrow(
+                        self.screen,
+                        arrow_color,
+                        (ax, ay),
+                        angle,
+                    )
 
         # North: move down, arrow points down (90°), above stop line
         draw_road_arrows("north", roads["north"], cy - ix_half_height, -120, 0, 90)
@@ -903,6 +1175,63 @@ class Renderer:
             pygame.draw.rect(self.screen, timer_bg_color, (bg_x, bg_y, bg_w, bg_h))
             pygame.draw.rect(self.screen, (60, 60, 60), (bg_x, bg_y, bg_w, bg_h), 1)
             self.screen.blit(surf, (bg_x + pad, bg_y + pad))
+
+        def draw_turn_arrow_signal(x, y, direction, state, turn_side):
+            """Draw a separate protected-turn arrow beside the main signal."""
+            size = 18
+            if direction == "north":
+                offset = box_short + 3 + (size + 3 if turn_side == "right" else 0)
+                arrow_x, arrow_y = x + offset, y + (box_long - size) / 2
+            elif direction == "south":
+                offset = size + 3 + (size + 3 if turn_side == "right" else 0)
+                arrow_x, arrow_y = x - offset, y + (box_long - size) / 2
+            elif direction == "west":
+                offset = size + 3 + (size + 3 if turn_side == "right" else 0)
+                arrow_x, arrow_y = x + (box_long - size) / 2, y - offset
+            else:
+                offset = box_short + 3 + (size + 3 if turn_side == "right" else 0)
+                arrow_x, arrow_y = x + (box_long - size) / 2, y + offset
+
+            pygame.draw.rect(
+                self.screen,
+                (20, 20, 20),
+                (arrow_x, arrow_y, size, size),
+                border_radius=2,
+            )
+            pygame.draw.rect(
+                self.screen,
+                (70, 70, 70),
+                (arrow_x, arrow_y, size, size),
+                1,
+                border_radius=2,
+            )
+            arrow_color = bright.get(state, faded["red"])
+            local_points = [
+                (4, 9), (9, 4), (9, 7), (14, 7), (14, 14),
+                (11, 14), (11, 10), (9, 10), (9, 13),
+            ]
+            rotation_degrees = {
+                "north": 180,
+                "south": 0,
+                "west": 90,
+                "east": -90,
+            }[direction]
+            radians = math.radians(rotation_degrees)
+            cosine, sine = math.cos(radians), math.sin(radians)
+            points = []
+            for local_x, local_y in local_points:
+                # The base polygon points toward the icon that is visually
+                # the right-turn signal after the approach rotation. Mirror
+                # it for the left-turn signal.
+                if turn_side == "left":
+                    local_x = 18 - local_x
+                centered_x, centered_y = local_x - 9, local_y - 9
+                rotated_x = centered_x * cosine - centered_y * sine
+                rotated_y = centered_x * sine + centered_y * cosine
+                points.append(
+                    (arrow_x + 9 + rotated_x, arrow_y + 9 + rotated_y)
+                )
+            pygame.draw.polygon(self.screen, arrow_color, points)
         
         for direction in ["north", "south", "east", "west"]:
             road = roads[direction]
@@ -940,6 +1269,36 @@ class Renderer:
                 box_y = road_top - box_short - side_offset
                 draw_light_box(box_x, box_y, direction, ["red", "yellow", "green"], light_state)
                 draw_timer(box_x, box_y, direction, remaining)
+
+            # The visual turn icons are intentionally placed in the swapped
+            # slots above. Feed each glyph the state matching the movement it
+            # now depicts, so vehicles and the displayed green arrow agree.
+            if (
+                hasattr(light_controller, "get_left_turn_state")
+                and hasattr(light_controller, "get_right_turn_state")
+            ):
+                draw_turn_arrow_signal(
+                    box_x,
+                    box_y,
+                    direction,
+                    light_controller.get_right_turn_state(direction),
+                    "left",
+                )
+                draw_turn_arrow_signal(
+                    box_x,
+                    box_y,
+                    direction,
+                    light_controller.get_left_turn_state(direction),
+                    "right",
+                )
+            elif hasattr(light_controller, "get_left_turn_state"):
+                draw_turn_arrow_signal(
+                    box_x,
+                    box_y,
+                    direction,
+                    light_controller.get_left_turn_state(direction),
+                    "right",
+                )
     
     def draw_vertical_markings(
         self,

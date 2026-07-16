@@ -36,6 +36,11 @@ class Metrics:
         self.total_stops = 0
         self.total_travel_time = 0.0
         self.max_wait_time = 0.0
+        self.total_pre_intersection_wait_time = 0.0
+        self.total_pre_intersection_wait_time_by_direction = (
+            self._empty_direction_counts()
+        )
+        self.vehicles_spawned_by_direction = self._empty_direction_counts()
         self.hard_braking_events = 0
         self.hard_braking_vehicles = 0
         self.max_deceleration_mps2 = 0.0
@@ -45,6 +50,15 @@ class Metrics:
         self.turning_stuck_vehicles = 0
         self.total_turning_stuck_time = 0.0
         self.max_turning_vehicles_stuck = 0
+        self.phase_switches = 0
+        self.empty_phase_time = 0.0
+        self.intersection_blocking_time = 0.0
+        self.left_turn_delay = 0.0
+        self.right_turn_delay = 0.0
+        self.paired_phase_time = 0.0
+        self.single_phase_time = 0.0
+        self.phase_activation_counts = {}
+        self.previous_active_phase = None
         self.total_pedestrians_spawned = 0
         self.total_pedestrians_finished = 0
         self.total_pedestrian_wait_time = 0.0
@@ -66,6 +80,7 @@ class Metrics:
             return
         self.vehicles_tracked[vehicle_id] = {
             "wait_time": 0.0,
+            "pre_intersection_wait_time": 0.0,
             "stops": 0,
             "spawn_time": self.simulation_time,
             "direction": direction,
@@ -78,6 +93,8 @@ class Metrics:
         }
 
         self.total_vehicles_spawned += 1
+        if direction in self.vehicles_spawned_by_direction:
+            self.vehicles_spawned_by_direction[direction] += 1
 
     def update(self, vehicles, dt):
         self.queue_lengths = self._empty_direction_counts()
@@ -162,6 +179,14 @@ class Metrics:
 
             if v.stopped:
                 data["wait_time"] += dt
+                if not v.cleared_intersection:
+                    direction = data["direction"]
+                    data["pre_intersection_wait_time"] += dt
+                    self.total_pre_intersection_wait_time += dt
+                    if direction in self.total_pre_intersection_wait_time_by_direction:
+                        self.total_pre_intersection_wait_time_by_direction[
+                            direction
+                        ] += dt
                 if not data["was_stopped"]:
                     data["stops"] += 1
                 data["was_stopped"] = True
@@ -184,6 +209,74 @@ class Metrics:
             current_turning_vehicles_stuck,
         )
         self.current_turning_vehicles_stuck = current_turning_vehicles_stuck
+
+    def update_control(
+        self,
+        light_controller,
+        vehicles,
+        dt,
+        intersection_stuck_vehicles=0,
+    ):
+        """Accumulate dense signal-control and intersection-flow metrics."""
+        dt = max(0.0, dt)
+        active_phase = light_controller.active_phase
+        if light_controller.phase_state == "green":
+            if self.previous_active_phase is None:
+                self.phase_activation_counts[active_phase] = 1
+            elif active_phase != self.previous_active_phase:
+                self.phase_switches += 1
+                self.phase_activation_counts[active_phase] = (
+                    self.phase_activation_counts.get(active_phase, 0) + 1
+                )
+            self.previous_active_phase = active_phase
+
+            active_directions = set(
+                light_controller.phase_directions(active_phase)
+            )
+            demand_by_direction = self._empty_direction_counts()
+            for vehicle in vehicles:
+                if not getattr(vehicle, "cleared_intersection", False):
+                    direction = getattr(vehicle, "road_direction", None)
+                    if direction in demand_by_direction:
+                        demand_by_direction[direction] += 1
+            active_demand = sum(
+                demand_by_direction[direction]
+                for direction in active_directions
+            )
+            competing_demand = sum(
+                count
+                for direction, count in demand_by_direction.items()
+                if direction not in active_directions
+            )
+            if active_demand == 0 and competing_demand > 0:
+                self.empty_phase_time += dt
+
+            if len(active_directions) > 1:
+                self.paired_phase_time += dt
+            else:
+                self.single_phase_time += dt
+
+        self.intersection_blocking_time += (
+            max(0, int(intersection_stuck_vehicles)) * dt
+        )
+        for vehicle in vehicles:
+            is_pending_turn = bool(
+                getattr(vehicle, "is_turning_vehicle", False)
+                and getattr(vehicle, "turn_side", None) in ("left", "right")
+                and not getattr(vehicle, "has_turned", False)
+            )
+            if not is_pending_turn:
+                continue
+            free_flow_speed = max(1e-9, float(getattr(vehicle, "speed", 0.0)))
+            speed_ratio = min(
+                1.0,
+                max(0.0, float(vehicle.current_speed) / free_flow_speed),
+            )
+            delay = (1.0 - speed_ratio) * dt
+            if getattr(vehicle, "turn_side", None) == "left":
+                self.left_turn_delay += delay
+            else:
+                self.right_turn_delay += delay
 
     def register_pedestrian(self, pedestrian_id):
         if pedestrian_id in self.pedestrians_tracked:
@@ -250,6 +343,24 @@ class Metrics:
             1,
             self.total_vehicles_spawned,
         )
+        avg_pre_intersection_wait_by_direction = {
+            direction: (
+                self.total_pre_intersection_wait_time_by_direction[direction]
+                / max(1, self.vehicles_spawned_by_direction[direction])
+            )
+            for direction in self.total_pre_intersection_wait_time_by_direction
+        }
+        observed_approach_waits = [
+            avg_pre_intersection_wait_by_direction[direction]
+            for direction, count in self.vehicles_spawned_by_direction.items()
+            if count > 0
+        ]
+        max_avg_pre_intersection_wait = max(observed_approach_waits, default=0.0)
+        pre_intersection_wait_imbalance = (
+            max_avg_pre_intersection_wait - min(observed_approach_waits)
+            if observed_approach_waits
+            else 0.0
+        )
 
         return {
             "throughput": self.total_vehicles_exited,
@@ -259,6 +370,17 @@ class Metrics:
             "active_vehicles": len(self.vehicles_tracked),
             "avg_active_wait_time": avg_active_wait,
             "max_wait_time": self.max_wait_time,
+            "avg_pre_intersection_wait_time": (
+                self.total_pre_intersection_wait_time
+                / max(1, sum(self.vehicles_spawned_by_direction.values()))
+            ),
+            "avg_pre_intersection_wait_time_by_direction": (
+                avg_pre_intersection_wait_by_direction
+            ),
+            "max_avg_pre_intersection_wait_time": max_avg_pre_intersection_wait,
+            "pre_intersection_wait_time_imbalance": (
+                pre_intersection_wait_imbalance
+            ),
             "avg_pedestrian_wait_time": avg_pedestrian_wait,
             "avg_active_pedestrian_wait_time": avg_active_pedestrian_wait,
             "max_pedestrian_wait_time": self.max_pedestrian_wait_time,
@@ -285,6 +407,14 @@ class Metrics:
                 self, "current_turning_vehicles_stuck", 0
             ),
             "max_turning_vehicles_stuck": self.max_turning_vehicles_stuck,
+            "phase_switches": self.phase_switches,
+            "empty_phase_time": self.empty_phase_time,
+            "intersection_blocking_time": self.intersection_blocking_time,
+            "left_turn_delay": self.left_turn_delay,
+            "right_turn_delay": self.right_turn_delay,
+            "paired_phase_time": self.paired_phase_time,
+            "single_phase_time": self.single_phase_time,
+            "phase_activation_counts": self.phase_activation_counts.copy(),
             "queue_lengths": self.queue_lengths.copy(),
             "max_queue_lengths": self.max_queue_lengths.copy(),
             "simulation_time": self.simulation_time,

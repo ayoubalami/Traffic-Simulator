@@ -51,7 +51,16 @@ class Simulation:
                     available_phases,
                 )
             )
+            self.light_controller.set_phase_observation_provider(
+                lambda: self.get_signal_observation(
+                    self.light_controller.active_phase
+                )
+            )
         self.light_controller.set_phase_activation_guard(self._can_activate_phase)
+        if hasattr(self.light_controller, "set_right_turn_activation_guard"):
+            self.light_controller.set_right_turn_activation_guard(
+                self._can_activate_right_turn
+            )
     
     def update(self, dt):
         self.metrics.advance_time(dt)
@@ -62,6 +71,16 @@ class Simulation:
         self._remove_off_screen()
         self._update_pedestrians(dt)
         self.metrics.update(self.vehicles, dt)
+        gridlock_config = self.config.get("six_phase_fitness", {})
+        intersection_stuck_vehicles = self.count_stuck_vehicles_in_intersection(
+            gridlock_config.get("gridlock_speed_threshold_mps", 0.5)
+        )
+        self.metrics.update_control(
+            self.light_controller,
+            self.vehicles,
+            dt,
+            intersection_stuck_vehicles,
+        )
     
     def _spawn_vehicles(self, dt):
         self.spawn_timer += dt
@@ -152,11 +171,22 @@ class Simulation:
         vehicle_counts = {direction: 0 for direction in ("north", "south", "east", "west")}
         emergency_counts = {direction: 0 for direction in ("north", "south", "east", "west")}
         pedestrian_counts = {direction: 0 for direction in ("north", "south", "east", "west")}
+        waiting_pedestrian_counts = {direction: 0 for direction in ("north", "south", "east", "west")}
         turning_counts = {direction: 0 for direction in ("north", "south", "east", "west")}
         stuck_turning_counts = {direction: 0 for direction in ("north", "south", "east", "west")}
+        approaching_left_turn_counts = {direction: 0 for direction in ("north", "south", "east", "west")}
+        queued_left_turn_counts = {direction: 0 for direction in ("north", "south", "east", "west")}
+        approaching_right_turn_counts = {direction: 0 for direction in ("north", "south", "east", "west")}
+        queued_right_turn_counts = {direction: 0 for direction in ("north", "south", "east", "west")}
+        speed_ratio_sums = {direction: 0.0 for direction in ("north", "south", "east", "west")}
         for vehicle in self.vehicles:
             if not vehicle.cleared_intersection:
                 vehicle_counts[vehicle.road_direction] += 1
+                free_flow_speed = max(1e-9, float(vehicle.speed))
+                speed_ratio_sums[vehicle.road_direction] += min(
+                    1.0,
+                    max(0.0, float(vehicle.current_speed) / free_flow_speed),
+                )
                 if vehicle.is_emergency:
                     emergency_counts[vehicle.road_direction] += 1
             if vehicle.stopped and not vehicle.cleared_intersection:
@@ -165,27 +195,72 @@ class Simulation:
                 turning_counts[vehicle.road_direction] += 1
                 if vehicle.stopped or vehicle.current_speed <= 0.01:
                     stuck_turning_counts[vehicle.road_direction] += 1
+            is_approaching_turn = bool(
+                getattr(vehicle, "is_turning_vehicle", False)
+                and not getattr(vehicle, "has_turned", False)
+                and not vehicle.cleared_intersection
+            )
+            if is_approaching_turn and vehicle.turn_side == "left":
+                approaching_left_turn_counts[vehicle.road_direction] += 1
+                if vehicle.stopped:
+                    queued_left_turn_counts[vehicle.road_direction] += 1
+            elif is_approaching_turn and vehicle.turn_side == "right":
+                approaching_right_turn_counts[vehicle.road_direction] += 1
+                if vehicle.stopped:
+                    queued_right_turn_counts[vehicle.road_direction] += 1
         for pedestrian in self.pedestrians:
+            if pedestrian.waiting:
+                waiting_pedestrian_counts[pedestrian.crossing] += 1
             if not pedestrian.waiting or pedestrian.has_reached_divider:
                 pedestrian_counts[pedestrian.crossing] += 1
+        average_speed_ratios = {
+            direction: speed_ratio_sums[direction] / max(1, vehicle_counts[direction])
+            for direction in speed_ratio_sums
+        }
+        blocking_speed_threshold = self.config.get("six_phase_fitness", {}).get(
+            "gridlock_speed_threshold_mps",
+            0.5,
+        )
+        (
+            intersection_vehicle_count,
+            blocked_intersection_vehicle_count,
+        ) = self.get_intersection_vehicle_counts(blocking_speed_threshold)
         return {
             "queue_lengths": queue_lengths,
             "vehicle_counts": vehicle_counts,
+            "average_speed_ratios": average_speed_ratios,
             "emergency_counts": emergency_counts,
             "pedestrian_counts": pedestrian_counts,
+            "waiting_pedestrian_counts": waiting_pedestrian_counts,
             "turning_counts": turning_counts,
             "stuck_turning_counts": stuck_turning_counts,
+            "approaching_left_turn_counts": approaching_left_turn_counts,
+            "queued_left_turn_counts": queued_left_turn_counts,
+            "approaching_right_turn_counts": approaching_right_turn_counts,
+            "queued_right_turn_counts": queued_right_turn_counts,
+            "intersection_vehicle_count": intersection_vehicle_count,
+            "blocked_intersection_vehicle_count": blocked_intersection_vehicle_count,
             "red_elapsed_s": (
                 self.light_controller.get_red_elapsed()
                 if hasattr(self.light_controller, "get_red_elapsed")
+                else {direction: 0.0 for direction in queue_lengths}
+            ),
+            "left_red_elapsed_s": (
+                self.light_controller.get_left_red_elapsed()
+                if hasattr(self.light_controller, "get_left_red_elapsed")
+                else {direction: 0.0 for direction in queue_lengths}
+            ),
+            "right_red_elapsed_s": (
+                self.light_controller.get_right_red_elapsed()
+                if hasattr(self.light_controller, "get_right_red_elapsed")
                 else {direction: 0.0 for direction in queue_lengths}
             ),
             "active_phase": active_phase,
             "green_elapsed_s": self.light_controller.timer,
         }
 
-    def count_stuck_vehicles_in_intersection(self, speed_threshold_mps=0.5):
-        """Count nearly stopped vehicles whose centres are in the junction."""
+    def get_intersection_vehicle_counts(self, speed_threshold_mps=0.5):
+        """Return total and nearly stopped vehicle counts in the junction."""
         lane_width = self.config["lane_width"]
         roads = self.config["roads"]
         vertical_widths = [
@@ -201,7 +276,7 @@ class Simulation:
             if roads[direction]["enabled"]
         ]
         if not vertical_widths or not horizontal_widths:
-            return 0
+            return 0, 0
 
         center_x = self.config["window"]["width"] / 2
         center_y = self.config["window"]["height"] / 2
@@ -213,16 +288,27 @@ class Simulation:
         )
         speed_limit = max(0.0, float(speed_threshold_mps)) * pixels_per_meter
 
-        count = 0
+        vehicle_count = 0
+        blocked_vehicle_count = 0
         for vehicle in self.vehicles:
-            vehicle_center_x, vehicle_center_y = vehicle.get_rect().center
+            get_rect = getattr(vehicle, "get_rect", None)
+            if not callable(get_rect):
+                continue
+            vehicle_center_x, vehicle_center_y = get_rect().center
             is_inside = (
                 center_x - half_width <= vehicle_center_x <= center_x + half_width
                 and center_y - half_height <= vehicle_center_y <= center_y + half_height
             )
-            if is_inside and vehicle.current_speed <= speed_limit:
-                count += 1
-        return count
+            if not is_inside:
+                continue
+            vehicle_count += 1
+            if vehicle.current_speed <= speed_limit:
+                blocked_vehicle_count += 1
+        return vehicle_count, blocked_vehicle_count
+
+    def count_stuck_vehicles_in_intersection(self, speed_threshold_mps=0.5):
+        """Count nearly stopped vehicles whose centres are in the junction."""
+        return self.get_intersection_vehicle_counts(speed_threshold_mps)[1]
 
     def _should_extend_green(self, active_phase, extension_decider):
         observation = self.get_signal_observation(active_phase)
@@ -246,7 +332,33 @@ class Simulation:
 
     def _can_activate_phase(self, phase):
         """Keep vehicle lights red until pedestrians in the next crossings clear."""
-        protected_crossings = set(self.light_controller.phase_directions(phase))
+        # A vehicle already committed to a protected turn must finish clearing
+        # the conflict zone before any new movement receives green.
+        if any(
+            getattr(vehicle, "turning", False)
+            for vehicle in self.vehicles
+        ):
+            return False
+        if hasattr(self.light_controller, "phase_conflicting_crossings"):
+            protected_crossings = set(
+                self.light_controller.phase_conflicting_crossings(phase)
+            )
+        else:
+            protected_crossings = set(
+                self.light_controller.phase_directions(phase)
+            )
+        return not any(
+            pedestrian.crossing in protected_crossings
+            and not pedestrian.is_safely_waiting()
+            for pedestrian in self.pedestrians
+        )
+
+    def _can_activate_right_turn(self, direction):
+        """Keep an automatic right arrow red while either crosswalk is used."""
+        exit_crossing = (
+            self.light_controller.RIGHT_TURN_EXIT_CROSSINGS[direction]
+        )
+        protected_crossings = {direction, exit_crossing}
         return not any(
             pedestrian.crossing in protected_crossings
             and not pedestrian.is_safely_waiting()
@@ -316,7 +428,10 @@ class Simulation:
         for vehicles_in_lane in lanes.values():
             for i, v in enumerate(vehicles_in_lane):
                 ahead = vehicles_in_lane[i - 1] if i > 0 else None
-                light = self.light_controller.get_state(v.road_direction)
+                if hasattr(self.light_controller, "get_vehicle_state"):
+                    light = self.light_controller.get_vehicle_state(v)
+                else:
+                    light = self.light_controller.get_state(v.road_direction)
                 v.update(
                     dt,
                     light,
@@ -370,6 +485,11 @@ class Simulation:
             best_front_gap = -1.0
             for candidate_lane in (vehicle.lane_index - 1, vehicle.lane_index + 1):
                 if not 0 <= candidate_lane < road["incoming"]:
+                    continue
+                if (
+                    hasattr(vehicle, "lane_is_allowed_for_movement")
+                    and not vehicle.lane_is_allowed_for_movement(candidate_lane)
+                ):
                     continue
                 front_gap = self._lane_change_front_gap(vehicle, candidate_lane)
                 if front_gap is None or not self._lane_change_is_safe(vehicle, candidate_lane):

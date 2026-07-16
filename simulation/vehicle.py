@@ -216,6 +216,8 @@ class Vehicle:
             ]
             selected_turn = self._select_optional_turn(normal_turns)
 
+        self._apply_exclusive_turn_lanes(selected_turn)
+
         if selected_turn is not None:
             turn_signal_chance = max(
                 0.0,
@@ -231,6 +233,79 @@ class Vehicle:
             self.is_turning_vehicle = True
             self.uses_turn_signal = self.random.random() < turn_signal_chance
             self.turn_side, self.turn_target_direction, _ = selected_turn
+
+    def _apply_exclusive_turn_lanes(self, selected_turn):
+        """Place turning traffic in configured dedicated outer lanes."""
+        road = self.config["roads"][self.road_direction]
+        defaults = self.config["vehicle_defaults"]
+        reserve_left = bool(
+            defaults.get("exclusive_left_turn_lane", False)
+            and road["incoming"] > 1
+        )
+        reserve_right = bool(
+            defaults.get("exclusive_right_turn_lane", False)
+            and road["incoming"] > 2
+        )
+        left_lane = self._left_lane_index(self.road_direction)
+        right_lane = self._right_lane_index(self.road_direction)
+        is_left_turn = bool(selected_turn and selected_turn[0] == "left")
+        is_right_turn = bool(selected_turn and selected_turn[0] == "right")
+        if is_left_turn and reserve_left:
+            self.lane_index = left_lane
+            return
+        if is_right_turn and reserve_right:
+            self.lane_index = right_lane
+            return
+
+        reserved_lanes = set()
+        if reserve_left:
+            reserved_lanes.add(left_lane)
+        if reserve_right:
+            reserved_lanes.add(right_lane)
+        if self.lane_index not in reserved_lanes:
+            return
+        regular_lanes = [
+            lane for lane in range(road["incoming"])
+            if lane not in reserved_lanes
+        ]
+        self.lane_index = min(
+            regular_lanes,
+            key=lambda lane: abs(lane - self.lane_index),
+        )
+
+    def lane_is_allowed_for_movement(self, lane_index):
+        """Whether this vehicle may occupy an incoming lane before crossing."""
+        road = self.config["roads"][self.road_direction]
+        defaults = self.config["vehicle_defaults"]
+        reserve_left = bool(
+            defaults.get("exclusive_left_turn_lane", False)
+            and road["incoming"] > 1
+        )
+        reserve_right = bool(
+            defaults.get("exclusive_right_turn_lane", False)
+            and road["incoming"] > 2
+        )
+        left_lane = self._left_lane_index(self.road_direction)
+        right_lane = self._right_lane_index(self.road_direction)
+        is_pending_left = bool(
+            self.is_turning_vehicle
+            and self.turn_side == "left"
+            and not self.has_turned
+        )
+        is_pending_right = bool(
+            self.is_turning_vehicle
+            and self.turn_side == "right"
+            and not self.has_turned
+        )
+        if is_pending_left and reserve_left:
+            return lane_index == left_lane
+        if is_pending_right and reserve_right:
+            return lane_index == right_lane
+        if reserve_left and lane_index == left_lane:
+            return False
+        if reserve_right and lane_index == right_lane:
+            return False
+        return True
 
     def _movement_exit_is_enabled(self, movement_direction):
         """Whether a movement direction leads to an enabled physical exit."""

@@ -2,11 +2,20 @@
 
 import argparse
 import json
+import multiprocessing
+import os
 from pathlib import Path
+
+os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 
 from config import CONFIG, build_runtime_config
 from simulation import SixPhasePolicyEvolution
-from simulation.six_phase_neuroevolution import PHASE_NAMES, SixPhasePolicy
+from simulation.six_phase_neuroevolution import (
+    INPUT_FEATURE_NAMES,
+    PHASE_NAMES,
+    SIX_PHASE_POLICY_FORMAT_VERSION,
+    SixPhasePolicy,
+)
 
 
 def parse_seeds(value):
@@ -16,9 +25,18 @@ def parse_seeds(value):
     return seeds
 
 
+def parse_profile_names(value):
+    names = tuple(name.strip() for name in value.split(",") if name.strip())
+    if not names:
+        raise argparse.ArgumentTypeError("provide at least one profile name")
+    return names
+
+
 def parse_arguments():
     parser = argparse.ArgumentParser(
-        description="Train a six-phase policy with paired and individual greens.",
+        description=(
+            "Train main phases with independently actuated safe right arrows."
+        ),
     )
     parser.add_argument("--population", type=int, default=50)
     parser.add_argument("--generations", type=int, default=10)
@@ -29,9 +47,21 @@ def parse_arguments():
     parser.add_argument("--maximum-green", type=float, default=30.0)
     parser.add_argument("--random-seed", type=int, default=42)
     parser.add_argument(
+        "--workers",
+        type=int,
+        default=max(1, min(8, (os.cpu_count() or 1) - 1)),
+        help="candidate evaluation processes; use 1 to disable parallelism",
+    )
+    parser.add_argument(
+        "--profiles",
+        type=parse_profile_names,
+        default=None,
+        help="comma-separated configured profile names; default: all",
+    )
+    parser.add_argument(
         "--output",
         type=Path,
-        default=Path("models/six_phase_policy.json"),
+        default=Path("models/six_phase_policy_v8.json"),
     )
     return parser.parse_args()
 
@@ -40,6 +70,8 @@ def main():
     args = parse_arguments()
     if args.speed_factor <= 0:
         raise SystemExit("--speed-factor must be positive")
+    if args.workers < 1:
+        raise SystemExit("--workers must be a positive integer")
     duration_bounds_s = (args.minimum_green, args.maximum_green)
 
     def log_generation(progress):
@@ -57,6 +89,20 @@ def main():
     timing = runtime_config["traffic_lights"]
     timing["min_green_duration_s"] = args.minimum_green
     timing["max_green_duration_s"] = args.maximum_green
+    configured_profiles = runtime_config.get("six_phase_training", {}).get(
+        "traffic_profiles",
+        [],
+    )
+    if args.profiles is None:
+        traffic_profiles = configured_profiles
+    else:
+        profiles_by_name = {
+            profile["name"]: profile for profile in configured_profiles
+        }
+        unknown = [name for name in args.profiles if name not in profiles_by_name]
+        if unknown:
+            raise SystemExit(f"unknown traffic profiles: {', '.join(unknown)}")
+        traffic_profiles = [profiles_by_name[name] for name in args.profiles]
     trainer = SixPhasePolicyEvolution(
         runtime_config,
         duration_bounds_s=duration_bounds_s,
@@ -65,22 +111,26 @@ def main():
         seeds=args.seeds,
         evaluation_duration_s=args.evaluation_duration,
         speed_factor=args.speed_factor,
+        traffic_profiles=traffic_profiles,
+        workers=args.workers,
         progress_callback=log_generation,
         random_seed=args.random_seed,
     )
     print(
         "Training six-phase neural policy "
         f"({args.population} candidates, {args.generations} generations, "
-        f"seeds={args.seeds}, speed={args.speed_factor:g}x)..."
+        f"{len(traffic_profiles)} profiles, seeds={args.seeds}, "
+        f"speed={args.speed_factor:g}x, workers={trainer.workers})..."
     )
     result = trainer.run()
     best = result["best"]
     output = {
-        "format_version": 1,
+        "format_version": SIX_PHASE_POLICY_FORMAT_VERSION,
         "policy_type": "six_phase",
         "phases": list(PHASE_NAMES),
         "network": {
             "input_size": SixPhasePolicy.input_size,
+            "input_features": list(INPUT_FEATURE_NAMES),
             "hidden_size": SixPhasePolicy.hidden_size,
             "output_size": SixPhasePolicy.output_size,
         },
@@ -91,6 +141,7 @@ def main():
         "weights": best["policy"].weights,
         "fitness": best["fitness"],
         "mean_metrics": best["mean_metrics"],
+        "scenario_evaluations": best["scenario_evaluations"],
         "history": result["history"],
         "training": {
             "population_size": args.population,
@@ -98,11 +149,13 @@ def main():
             "seeds": args.seeds,
             "evaluation_duration_s": args.evaluation_duration,
             "speed_factor": args.speed_factor,
+            "workers": trainer.workers,
             "training_time_s": result["training_time_s"],
             "fitness_weights": dict(CONFIG.get("fitness", {})),
             "six_phase_fitness_weights": dict(
                 CONFIG.get("six_phase_fitness", {})
             ),
+            "traffic_profiles": traffic_profiles,
             "random_seed": args.random_seed,
         },
     }
@@ -114,4 +167,5 @@ def main():
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     main()
