@@ -32,6 +32,8 @@ class Metrics:
         self.simulation_time = 0.0
         self.total_vehicles_spawned = 0
         self.total_vehicles_exited = 0
+        self.left_turn_vehicles_spawned = 0
+        self.right_turn_vehicles_spawned = 0
         self.total_wait_time = 0.0
         self.total_stops = 0
         self.total_travel_time = 0.0
@@ -51,6 +53,12 @@ class Metrics:
         self.total_turning_stuck_time = 0.0
         self.max_turning_vehicles_stuck = 0
         self.phase_switches = 0
+        self.movement_set_changes = 0
+        self.changed_movement_count = 0
+        self.transition_clearance_time = 0.0
+        self.total_green_movement_time = 0.0
+        self.useful_green_movement_time = 0.0
+        self.wasted_green_movement_time = 0.0
         self.empty_phase_time = 0.0
         self.intersection_blocking_time = 0.0
         self.left_turn_delay = 0.0
@@ -59,6 +67,7 @@ class Metrics:
         self.single_phase_time = 0.0
         self.phase_activation_counts = {}
         self.previous_active_phase = None
+        self.previous_active_movements = None
         self.total_pedestrians_spawned = 0
         self.total_pedestrians_finished = 0
         self.total_pedestrian_wait_time = 0.0
@@ -75,15 +84,17 @@ class Metrics:
     def advance_time(self, dt):
         self.simulation_time += max(0.0, dt)
 
-    def register_vehicle(self, vehicle_id, direction=None):
+    def register_vehicle(self, vehicle_id, direction=None, turn_side=None):
         if vehicle_id in self.vehicles_tracked:
             return
+        turn_side = turn_side if turn_side in ("left", "right") else None
         self.vehicles_tracked[vehicle_id] = {
             "wait_time": 0.0,
             "pre_intersection_wait_time": 0.0,
             "stops": 0,
             "spawn_time": self.simulation_time,
             "direction": direction,
+            "turn_side": turn_side,
             "was_stopped": False,
             "previous_speed": None,
             "was_hard_braking": False,
@@ -93,6 +104,10 @@ class Metrics:
         }
 
         self.total_vehicles_spawned += 1
+        if turn_side == "left":
+            self.left_turn_vehicles_spawned += 1
+        elif turn_side == "right":
+            self.right_turn_vehicles_spawned += 1
         if direction in self.vehicles_spawned_by_direction:
             self.vehicles_spawned_by_direction[direction] += 1
 
@@ -102,9 +117,22 @@ class Metrics:
         current_turning_vehicles_stuck = 0
         for v in vehicles:
             if id(v) not in self.vehicles_tracked:
-                self.register_vehicle(id(v), v.road_direction)
+                self.register_vehicle(
+                    id(v),
+                    v.road_direction,
+                    getattr(v, "turn_side", None),
+                )
 
             data = self.vehicles_tracked[id(v)]
+            # Some tests and integrations register a vehicle before its route
+            # is assigned. Capture that route once without double-counting it.
+            turn_side = getattr(v, "turn_side", None)
+            if data["turn_side"] is None and turn_side in ("left", "right"):
+                data["turn_side"] = turn_side
+                if turn_side == "left":
+                    self.left_turn_vehicles_spawned += 1
+                else:
+                    self.right_turn_vehicles_spawned += 1
             v.hard_braking_highlight_remaining_s = max(
                 0.0,
                 getattr(v, "hard_braking_highlight_remaining_s", 0.0) - dt,
@@ -220,6 +248,8 @@ class Metrics:
         """Accumulate dense signal-control and intersection-flow metrics."""
         dt = max(0.0, dt)
         active_phase = light_controller.active_phase
+        if light_controller.phase_state in ("yellow", "all_red"):
+            self.transition_clearance_time += dt
         if light_controller.phase_state == "green":
             if self.previous_active_phase is None:
                 self.phase_activation_counts[active_phase] = 1
@@ -230,27 +260,96 @@ class Metrics:
                 )
             self.previous_active_phase = active_phase
 
-            active_directions = set(
-                light_controller.phase_directions(active_phase)
+            active_movements = set(
+                getattr(light_controller, "active_movements", ())
             )
-            demand_by_direction = self._empty_direction_counts()
+            if not active_movements:
+                left_direction = getattr(
+                    light_controller,
+                    "LEFT_TURN_PHASES",
+                    {},
+                ).get(active_phase)
+                single_direction = getattr(
+                    light_controller,
+                    "SINGLE_APPROACH_PHASES",
+                    {},
+                ).get(active_phase)
+                if left_direction is not None:
+                    active_movements.add(f"{left_direction}_left")
+                else:
+                    active_movements.update(
+                        f"{direction}_through"
+                        for direction in light_controller.phase_directions(
+                            active_phase
+                        )
+                    )
+                    if single_direction is not None:
+                        active_movements.add(f"{single_direction}_left")
+            if hasattr(light_controller, "get_right_turn_state"):
+                active_movements.update(
+                    f"{direction}_right"
+                    for direction in self.queue_lengths
+                    if light_controller.get_right_turn_state(direction)
+                    == "green"
+                )
+
+            if self.previous_active_movements is None:
+                self.previous_active_movements = frozenset(active_movements)
+            elif active_movements != self.previous_active_movements:
+                self.movement_set_changes += 1
+                self.changed_movement_count += len(
+                    active_movements.symmetric_difference(
+                        self.previous_active_movements
+                    )
+                )
+                self.previous_active_movements = frozenset(active_movements)
+
+            demand_by_movement = {}
             for vehicle in vehicles:
-                if not getattr(vehicle, "cleared_intersection", False):
-                    direction = getattr(vehicle, "road_direction", None)
-                    if direction in demand_by_direction:
-                        demand_by_direction[direction] += 1
-            active_demand = sum(
-                demand_by_direction[direction]
-                for direction in active_directions
+                if getattr(vehicle, "cleared_intersection", False):
+                    continue
+                direction = getattr(vehicle, "road_direction", None)
+                if direction not in self.queue_lengths:
+                    continue
+                turn_side = getattr(vehicle, "turn_side", None)
+                is_pending_turn = bool(
+                    getattr(vehicle, "is_turning_vehicle", False)
+                    and turn_side in ("left", "right")
+                    and not getattr(vehicle, "has_turned", False)
+                )
+                movement_kind = turn_side if is_pending_turn else "through"
+                movement = f"{direction}_{movement_kind}"
+                demand_by_movement[movement] = (
+                    demand_by_movement.get(movement, 0) + 1
+                )
+
+            demanded_movements = {
+                movement
+                for movement, count in demand_by_movement.items()
+                if count > 0
+            }
+            useful_movements = active_movements.intersection(
+                demanded_movements
             )
-            competing_demand = sum(
-                count
-                for direction, count in demand_by_direction.items()
-                if direction not in active_directions
-            )
-            if active_demand == 0 and competing_demand > 0:
+            self.total_green_movement_time += len(active_movements) * dt
+            self.useful_green_movement_time += len(useful_movements) * dt
+            if demanded_movements:
+                wasted_movements = active_movements.difference(
+                    demanded_movements
+                )
+                self.wasted_green_movement_time += (
+                    len(wasted_movements) * dt
+                )
+            if (
+                not useful_movements
+                and demanded_movements.difference(active_movements)
+            ):
                 self.empty_phase_time += dt
 
+            active_directions = {
+                movement.split("_", 1)[0]
+                for movement in active_movements
+            }
             if len(active_directions) > 1:
                 self.paired_phase_time += dt
             else:
@@ -267,13 +366,19 @@ class Metrics:
             )
             if not is_pending_turn:
                 continue
-            free_flow_speed = max(1e-9, float(getattr(vehicle, "speed", 0.0)))
+            turn_side = getattr(vehicle, "turn_side", None)
+            expected_speed = getattr(
+                vehicle,
+                "left_turn_speed" if turn_side == "left" else "right_turn_speed",
+                getattr(vehicle, "speed", 0.0),
+            )
+            expected_speed = max(1e-9, float(expected_speed))
             speed_ratio = min(
                 1.0,
-                max(0.0, float(vehicle.current_speed) / free_flow_speed),
+                max(0.0, float(vehicle.current_speed) / expected_speed),
             )
             delay = (1.0 - speed_ratio) * dt
-            if getattr(vehicle, "turn_side", None) == "left":
+            if turn_side == "left":
                 self.left_turn_delay += delay
             else:
                 self.right_turn_delay += delay
@@ -319,6 +424,17 @@ class Metrics:
         avg_stops = self.total_stops / max(1, self.total_vehicles_exited)
         avg_travel_time = self.total_travel_time / max(1, self.total_vehicles_exited)
         active_wait_times = [data["wait_time"] for data in self.vehicles_tracked.values()]
+        active_stop_counts = [data["stops"] for data in self.vehicles_tracked.values()]
+        total_vehicle_wait_time = self.total_wait_time + sum(active_wait_times)
+        avg_vehicle_wait_time_all = total_vehicle_wait_time / max(
+            1,
+            self.total_vehicles_spawned,
+        )
+        total_vehicle_stops = self.total_stops + sum(active_stop_counts)
+        stops_per_vehicle = total_vehicle_stops / max(
+            1,
+            self.total_vehicles_spawned,
+        )
         avg_active_wait = sum(active_wait_times) / max(1, len(active_wait_times))
         active_pedestrian_wait_times = [
             data["wait_time"] for data in self.pedestrians_tracked.values()
@@ -330,6 +446,17 @@ class Metrics:
         avg_active_pedestrian_wait = sum(active_pedestrian_wait_times) / max(
             1,
             len(active_pedestrian_wait_times),
+        )
+        total_pedestrian_wait_time = (
+            self.total_pedestrian_wait_time + sum(active_pedestrian_wait_times)
+        )
+        avg_pedestrian_wait_time_all = total_pedestrian_wait_time / max(
+            1,
+            self.total_pedestrians_spawned,
+        )
+        throughput_rate = self.total_vehicles_exited / max(
+            1,
+            self.total_vehicles_spawned,
         )
         hard_braking_vehicle_rate = self.hard_braking_vehicles / max(
             1,
@@ -361,11 +488,39 @@ class Metrics:
             if observed_approach_waits
             else 0.0
         )
+        green_movement_utilization = (
+            self.useful_green_movement_time
+            / max(1e-9, self.total_green_movement_time)
+        )
+        wasted_green_movement_fraction = (
+            self.wasted_green_movement_time
+            / max(1e-9, self.total_green_movement_time)
+        )
+        transition_clearance_fraction = (
+            self.transition_clearance_time
+            / max(1e-9, self.simulation_time)
+        )
+        intersection_blocking_rate = (
+            self.intersection_blocking_time
+            / max(1e-9, self.simulation_time)
+        )
+        avg_left_turn_delay = self.left_turn_delay / max(
+            1,
+            self.left_turn_vehicles_spawned,
+        )
+        avg_right_turn_delay = self.right_turn_delay / max(
+            1,
+            self.right_turn_vehicles_spawned,
+        )
 
         return {
             "throughput": self.total_vehicles_exited,
+            "throughput_rate": throughput_rate,
             "avg_wait_time": avg_wait,
+            "avg_vehicle_wait_time_all": avg_vehicle_wait_time_all,
+            "total_vehicle_wait_time": total_vehicle_wait_time,
             "avg_stops": avg_stops,
+            "stops_per_vehicle": stops_per_vehicle,
             "avg_travel_time": avg_travel_time,
             "active_vehicles": len(self.vehicles_tracked),
             "avg_active_wait_time": avg_active_wait,
@@ -383,10 +538,9 @@ class Metrics:
             ),
             "avg_pedestrian_wait_time": avg_pedestrian_wait,
             "avg_active_pedestrian_wait_time": avg_active_pedestrian_wait,
+            "avg_pedestrian_wait_time_all": avg_pedestrian_wait_time_all,
             "max_pedestrian_wait_time": self.max_pedestrian_wait_time,
-            "total_pedestrian_wait_time": (
-                self.total_pedestrian_wait_time + sum(active_pedestrian_wait_times)
-            ),
+            "total_pedestrian_wait_time": total_pedestrian_wait_time,
             "active_pedestrians": len(self.pedestrians_tracked),
             "total_pedestrians_spawned": self.total_pedestrians_spawned,
             "total_pedestrians_finished": self.total_pedestrians_finished,
@@ -408,10 +562,24 @@ class Metrics:
             ),
             "max_turning_vehicles_stuck": self.max_turning_vehicles_stuck,
             "phase_switches": self.phase_switches,
+            "movement_set_changes": self.movement_set_changes,
+            "changed_movement_count": self.changed_movement_count,
+            "transition_clearance_time": self.transition_clearance_time,
+            "transition_clearance_fraction": transition_clearance_fraction,
+            "total_green_movement_time": self.total_green_movement_time,
+            "useful_green_movement_time": self.useful_green_movement_time,
+            "wasted_green_movement_time": self.wasted_green_movement_time,
+            "green_movement_utilization": green_movement_utilization,
+            "wasted_green_movement_fraction": (
+                wasted_green_movement_fraction
+            ),
             "empty_phase_time": self.empty_phase_time,
             "intersection_blocking_time": self.intersection_blocking_time,
+            "intersection_blocking_rate": intersection_blocking_rate,
             "left_turn_delay": self.left_turn_delay,
             "right_turn_delay": self.right_turn_delay,
+            "avg_left_turn_delay": avg_left_turn_delay,
+            "avg_right_turn_delay": avg_right_turn_delay,
             "paired_phase_time": self.paired_phase_time,
             "single_phase_time": self.single_phase_time,
             "phase_activation_counts": self.phase_activation_counts.copy(),
@@ -419,4 +587,6 @@ class Metrics:
             "max_queue_lengths": self.max_queue_lengths.copy(),
             "simulation_time": self.simulation_time,
             "total_vehicles_spawned": self.total_vehicles_spawned,
+            "left_turn_vehicles_spawned": self.left_turn_vehicles_spawned,
+            "right_turn_vehicles_spawned": self.right_turn_vehicles_spawned,
         }

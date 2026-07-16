@@ -1,5 +1,6 @@
 """Run the simulator with the separate six-phase neural policy."""
 
+import argparse
 import json
 from pathlib import Path
 
@@ -14,6 +15,12 @@ from simulation.six_phase_neuroevolution import (
 
 
 POLICY_PATH = Path(__file__).resolve().parent / "models" / "six_phase_policy_v8.json"
+
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(description="Run a categorical signal policy.")
+    parser.add_argument("--model", type=Path, default=POLICY_PATH)
+    return parser.parse_args()
 
 
 def load_six_phase_policy(path=POLICY_PATH):
@@ -46,11 +53,12 @@ def load_six_phase_policy(path=POLICY_PATH):
 
 
 def main():
+    args = parse_arguments()
     runtime_config = build_runtime_config(CONFIG)
     time_scale = float(runtime_config["simulation"].get("time_scale", 1.0))
     if time_scale <= 0:
         raise ValueError("simulation.time_scale must be positive")
-    policy = load_six_phase_policy()
+    policy = load_six_phase_policy(args.model)
     timing = runtime_config["traffic_lights"]
     timing["min_green_duration_s"] = policy.minimum_duration_s
     timing["max_green_duration_s"] = policy.maximum_duration_s

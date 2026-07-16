@@ -225,7 +225,7 @@ class SixPhaseTrafficLightController(TrafficLightController):
             direction: "red" for direction in self.DIRECTIONS
         }
         self.right_turn_states = {
-            direction: "red" for direction in self.DIRECTIONS
+            direction: "off" for direction in self.DIRECTIONS
         }
         super().__init__(config)
         timing = config.get("traffic_lights", {})
@@ -246,6 +246,20 @@ class SixPhaseTrafficLightController(TrafficLightController):
         self.automatic_right_turn_arrows = bool(
             timing.get("automatic_right_turn_arrows", True)
         )
+        self.right_turn_demand_hold_s = max(
+            0.0,
+            float(timing.get("right_turn_demand_hold_s", 1.0)),
+        )
+        self.right_turn_min_green_s = max(
+            0.0,
+            float(timing.get("right_turn_min_green_s", 2.0)),
+        )
+        self.right_turn_demand_hold_remaining = {
+            direction: 0.0 for direction in self.DIRECTIONS
+        }
+        self.right_turn_green_elapsed = {
+            direction: 0.0 for direction in self.DIRECTIONS
+        }
         self.pending_phase = None
         self.last_available_phases = ()
         self.last_policy_requested_phase = None
@@ -269,8 +283,15 @@ class SixPhaseTrafficLightController(TrafficLightController):
         return self.left_turn_states.get(direction, "red")
 
     def get_right_turn_state(self, direction):
-        """Return the dedicated protected/permissive-right arrow state."""
-        return self.right_turn_states.get(direction, "red")
+        """Return ``green``, prohibitive ``red``, or inactive ``off``."""
+        return self.right_turn_states.get(direction, "off")
+
+    def get_right_turn_permission_state(self, direction):
+        """Return the effective signal obeyed by a pending right turn."""
+        arrow_state = self.get_right_turn_state(direction)
+        if arrow_state == "off":
+            return self.get_state(direction)
+        return arrow_state
 
     def get_vehicle_state(self, vehicle):
         """Return the signal governing this vehicle's intended movement."""
@@ -287,12 +308,9 @@ class SixPhaseTrafficLightController(TrafficLightController):
             and not getattr(vehicle, "has_turned", False)
         )
         if is_pending_right:
-            right_state = self.get_right_turn_state(vehicle.road_direction)
-            if right_state != "red":
-                return right_state
-            # With the dedicated arrow red, a right turn remains permissive
-            # under its normal approach signal and yields on the turn path.
-            return self.get_state(vehicle.road_direction)
+            return self.get_right_turn_permission_state(
+                vehicle.road_direction
+            )
         return self.get_state(vehicle.road_direction)
 
     def phase_conflicting_crossings(self, phase):
@@ -359,10 +377,27 @@ class SixPhaseTrafficLightController(TrafficLightController):
             and self.LEFT_TURN_TARGETS[single_direction] == right_target
         )
 
-    def _update_automatic_right_turns(self, observation):
+    def _update_automatic_right_turns(self, observation, dt=0.0):
+        """Actuate right arrows with demand debounce and immediate safety red."""
+        dt = max(0.0, float(dt))
         approaching_right = observation.get("approaching_right_turn_counts", {})
         for direction in self.DIRECTIONS:
             demanded = approaching_right.get(direction, 0) > 0
+            if demanded:
+                self.right_turn_demand_hold_remaining[direction] = (
+                    self.right_turn_demand_hold_s
+                )
+            else:
+                self.right_turn_demand_hold_remaining[direction] = max(
+                    0.0,
+                    self.right_turn_demand_hold_remaining[direction] - dt,
+                )
+
+            was_green = self.right_turn_states[direction] == "green"
+            if was_green:
+                self.right_turn_green_elapsed[direction] += dt
+            else:
+                self.right_turn_green_elapsed[direction] = 0.0
             compatible = (
                 self.phase_state == "green"
                 and self.right_turn_is_compatible_with_phase(direction)
@@ -371,14 +406,33 @@ class SixPhaseTrafficLightController(TrafficLightController):
                 self.right_turn_activation_guard is None
                 or self.right_turn_activation_guard(direction)
             )
-            self.right_turn_states[direction] = (
-                "green"
-                if self.automatic_right_turn_arrows
-                and demanded
-                and compatible
-                and guard_allows
-                else "red"
+            safety_allows = compatible and guard_allows
+            held_demand = (
+                demanded
+                or self.right_turn_demand_hold_remaining[direction] > 0.0
             )
+            minimum_green_active = (
+                was_green
+                and self.right_turn_green_elapsed[direction]
+                < self.right_turn_min_green_s
+            )
+
+            if not self.automatic_right_turn_arrows:
+                next_state = "off"
+            elif not safety_allows:
+                # Pedestrians, conflicts, yellow, and all-red always override
+                # demand holding and minimum green immediately.
+                next_state = "red"
+            elif held_demand or minimum_green_active:
+                next_state = "green"
+            else:
+                # No dedicated arrow is active. A circular approach green can
+                # still permit a yielding right turn.
+                next_state = "off"
+
+            self.right_turn_states[direction] = next_state
+            if next_state != "green":
+                self.right_turn_green_elapsed[direction] = 0.0
 
     def _phase_observation(self):
         if self.phase_observation_provider is None:
@@ -537,8 +591,7 @@ class SixPhaseTrafficLightController(TrafficLightController):
             else:
                 self.left_red_elapsed[direction] += dt
             if (
-                self.right_turn_states[direction] == "green"
-                or self.states[direction] == "green"
+                self.get_right_turn_permission_state(direction) == "green"
                 or approaching_right.get(direction, 0) <= 0
             ):
                 self.right_red_elapsed[direction] = 0.0
@@ -611,7 +664,7 @@ class SixPhaseTrafficLightController(TrafficLightController):
                 self.pending_phase = None
                 self.timer = 0.0
 
-        self._update_automatic_right_turns(observation)
+        self._update_automatic_right_turns(observation, dt)
 
     def _has_competing_demand(self, observation):
         return any(
@@ -755,6 +808,468 @@ class SixPhaseTrafficLightController(TrafficLightController):
             exclude=(self.active_phase,),
             observation=self._phase_observation(),
         )
+
+    def get_remaining_time(self):
+        if self.phase_state == "green":
+            return max(0.0, self.max_green_duration - self.timer)
+        if self.phase_state == "yellow":
+            return max(0.0, self.yellow_duration - self.timer)
+        return 0.0
+
+
+class MovementTrafficLightController(SixPhaseTrafficLightController):
+    """Decode independent movement scores into a safe concurrent green set."""
+
+    MOVEMENTS = (
+        "north_through",
+        "south_through",
+        "east_through",
+        "west_through",
+        "north_left",
+        "south_left",
+        "east_left",
+        "west_left",
+    )
+    MOVEMENT_INDEX = {
+        movement: index for index, movement in enumerate(MOVEMENTS)
+    }
+
+    def __init__(self, config):
+        super().__init__(config)
+        controller_config = config.get("movement_controller", {})
+        self.output_threshold = min(
+            1.0,
+            max(0.0, float(controller_config.get("output_threshold", 0.5))),
+        )
+        self.switch_hysteresis = max(
+            0.0,
+            float(controller_config.get("switch_hysteresis", 0.15)),
+        )
+        self.active_movements = frozenset(
+            ("north_through", "south_through")
+        )
+        self.pending_movements = None
+        self.active_phase = self.encode_movements(self.active_movements)
+        self.pending_phase = None
+        self.movement_score_provider = None
+        self.movement_activation_guard = None
+        self.movement_red_elapsed = {
+            movement: 0.0 for movement in self.MOVEMENTS
+        }
+        self.last_movement_scores = {
+            movement: 0.5 for movement in self.MOVEMENTS
+        }
+        self.last_raw_requested_movements = frozenset()
+        self.last_demanded_movements = frozenset()
+        self.last_decoded_movements = self.active_movements
+        self.last_controller_decision = self.active_phase
+
+    @classmethod
+    def movement_direction(cls, movement):
+        return movement.split("_", 1)[0]
+
+    @classmethod
+    def movement_kind(cls, movement):
+        return movement.split("_", 1)[1]
+
+    @classmethod
+    def encode_movements(cls, movements):
+        ordered = sorted(
+            set(movements),
+            key=lambda movement: cls.MOVEMENT_INDEX[movement],
+        )
+        return "+".join(ordered) if ordered else "none"
+
+    @classmethod
+    def decode_movements(cls, encoded):
+        if not encoded or encoded == "none":
+            return frozenset()
+        legacy = {
+            "ns": frozenset(("north_through", "south_through")),
+            "ew": frozenset(("east_through", "west_through")),
+            "north_only": frozenset(("north_through", "north_left")),
+            "south_only": frozenset(("south_through", "south_left")),
+            "east_only": frozenset(("east_through", "east_left")),
+            "west_only": frozenset(("west_through", "west_left")),
+            "north_left": frozenset(("north_left",)),
+            "south_left": frozenset(("south_left",)),
+            "east_left": frozenset(("east_left",)),
+            "west_left": frozenset(("west_left",)),
+        }
+        if encoded in legacy:
+            return legacy[encoded]
+        return frozenset(
+            movement
+            for movement in str(encoded).split("+")
+            if movement in cls.MOVEMENT_INDEX
+        )
+
+    @classmethod
+    def phase_directions(cls, phase):
+        return tuple(
+            direction
+            for direction in cls.DIRECTIONS
+            if any(
+                cls.movement_direction(movement) == direction
+                for movement in cls.decode_movements(phase)
+            )
+        )
+
+    @classmethod
+    def movements_conflict(cls, first, second):
+        if first == second:
+            return False
+        first_direction = cls.movement_direction(first)
+        second_direction = cls.movement_direction(second)
+        first_kind = cls.movement_kind(first)
+        second_kind = cls.movement_kind(second)
+        vertical = {"north", "south"}
+        first_axis_vertical = first_direction in vertical
+        second_axis_vertical = second_direction in vertical
+        if first_axis_vertical != second_axis_vertical:
+            return True
+        if first_kind == second_kind:
+            return False
+        # A through movement can share green with the protected left from its
+        # own approach, but conflicts with the opposing protected left.
+        return first_direction != second_direction
+
+    @classmethod
+    def is_conflict_free(cls, movements):
+        movements = tuple(movements)
+        return all(
+            not cls.movements_conflict(first, second)
+            for index, first in enumerate(movements)
+            for second in movements[index + 1 :]
+        )
+
+    def set_movement_score_provider(self, provider):
+        self.movement_score_provider = provider
+
+    def set_movement_activation_guard(self, guard):
+        self.movement_activation_guard = guard
+
+    def _movement_demand(self, observation):
+        vehicles = observation.get("vehicle_counts", {})
+        queues = observation.get("queue_lengths", {})
+        approaching_left = observation.get("approaching_left_turn_counts", {})
+        queued_left = observation.get("queued_left_turn_counts", {})
+        approaching_right = observation.get("approaching_right_turn_counts", {})
+        queued_right = observation.get("queued_right_turn_counts", {})
+        demand = {}
+        for direction in self.DIRECTIONS:
+            demand[f"{direction}_through"] = max(
+                0,
+                int(vehicles.get(direction, 0))
+                - int(approaching_left.get(direction, 0))
+                - int(approaching_right.get(direction, 0)),
+                int(queues.get(direction, 0))
+                - int(queued_left.get(direction, 0))
+                - int(queued_right.get(direction, 0)),
+            )
+            demand[f"{direction}_left"] = max(
+                int(approaching_left.get(direction, 0)),
+                int(queued_left.get(direction, 0)),
+            )
+        return demand
+
+    def _movement_crossings(self, movement):
+        direction = self.movement_direction(movement)
+        crossings = {direction}
+        if self.movement_kind(movement) == "left":
+            crossings.add(self.LEFT_TURN_EXIT_CROSSINGS[direction])
+        return crossings
+
+    def phase_conflicting_crossings(self, phase):
+        crossings = set()
+        for movement in self.decode_movements(phase):
+            crossings.update(self._movement_crossings(movement))
+        return crossings
+
+    def right_turn_is_compatible_with_phase(self, direction, phase=None):
+        movements = (
+            self.active_movements
+            if phase is None
+            else self.decode_movements(phase)
+        )
+        right_target = self.RIGHT_TURN_TARGETS[direction]
+        for movement in movements:
+            movement_direction = self.movement_direction(movement)
+            movement_kind = self.movement_kind(movement)
+            if movement_direction == direction:
+                continue
+            if movement_kind == "through" and movement_direction == right_target:
+                return False
+            if (
+                movement_kind == "left"
+                and self.LEFT_TURN_TARGETS[movement_direction] == right_target
+            ):
+                return False
+        return True
+
+    def _candidate_is_scene_safe(self, movements):
+        return (
+            self.movement_activation_guard is None
+            or self.movement_activation_guard(frozenset(movements))
+        )
+
+    def _candidate_sets(self, demanded):
+        demanded = tuple(
+            movement for movement in self.MOVEMENTS if movement in demanded
+        )
+        candidates = []
+        for mask in range(1, 1 << len(demanded)):
+            movements = frozenset(
+                movement
+                for index, movement in enumerate(demanded)
+                if mask & (1 << index)
+            )
+            if (
+                self.is_conflict_free(movements)
+                and self._candidate_is_scene_safe(movements)
+            ):
+                candidates.append(movements)
+        return candidates
+
+    def _right_turns_served_by(self, movements, observation):
+        approaching_right = observation.get("approaching_right_turn_counts", {})
+        phase = self.encode_movements(movements)
+        return {
+            direction
+            for direction in self.DIRECTIONS
+            if approaching_right.get(direction, 0) > 0
+            and self.right_turn_is_compatible_with_phase(direction, phase)
+        }
+
+    def _score_candidate(self, movements, scores, demand, observation):
+        overdue = {
+            movement
+            for movement, elapsed in self.movement_red_elapsed.items()
+            if demand.get(movement, 0) > 0
+            and elapsed >= self.max_red_duration
+        }
+        overdue_right = {
+            direction
+            for direction, elapsed in self.right_red_elapsed.items()
+            if observation.get("approaching_right_turn_counts", {}).get(
+                direction,
+                0,
+            ) > 0
+            and elapsed >= self.max_red_duration
+        }
+        served_right = self._right_turns_served_by(movements, observation)
+        utility = sum(
+            float(scores.get(movement, 0.5)) - self.output_threshold
+            for movement in movements
+            if demand.get(movement, 0) > 0
+        )
+        demand_served = sum(demand.get(movement, 0) for movement in movements)
+        return (
+            len(overdue.intersection(movements))
+            + len(overdue_right.intersection(served_right)),
+            sum(
+                self.movement_red_elapsed[movement]
+                for movement in overdue.intersection(movements)
+            )
+            + sum(
+                self.right_red_elapsed[direction]
+                for direction in overdue_right.intersection(served_right)
+            ),
+            utility,
+            demand_served,
+            len(movements),
+        )
+
+    def decode_scores(self, scores, observation, force_change=False):
+        demand = self._movement_demand(observation)
+        demanded = frozenset(
+            movement
+            for movement, count in demand.items()
+            if count > 0
+            and self.config["roads"][self.movement_direction(movement)]["enabled"]
+        )
+        self.last_demanded_movements = demanded
+        self.last_raw_requested_movements = frozenset(
+            movement
+            for movement in demanded
+            if float(scores.get(movement, 0.0)) >= self.output_threshold
+        )
+        if not demanded:
+            self.last_decoded_movements = self.active_movements
+            return self.active_movements
+
+        candidates = self._candidate_sets(demanded)
+        active_can_hold = bool(
+            self.active_movements
+            and self.is_conflict_free(self.active_movements)
+            and self._candidate_is_scene_safe(self.active_movements)
+            and any(movement in demanded for movement in self.active_movements)
+        )
+        if active_can_hold and self.active_movements not in candidates:
+            candidates.append(self.active_movements)
+        if not candidates:
+            self.last_decoded_movements = self.active_movements
+            return self.active_movements
+
+        competing_demand = any(
+            movement not in self.active_movements for movement in demanded
+        )
+        selectable = candidates
+        if force_change and competing_demand:
+            alternatives = [
+                movements
+                for movements in candidates
+                if movements != self.active_movements
+            ]
+            if alternatives:
+                selectable = alternatives
+
+        best = max(
+            selectable,
+            key=lambda movements: self._score_candidate(
+                movements,
+                scores,
+                demand,
+                observation,
+            ),
+        )
+        any_overdue = any(
+            demand.get(movement, 0) > 0
+            and elapsed >= self.max_red_duration
+            for movement, elapsed in self.movement_red_elapsed.items()
+        ) or any(
+            observation.get("approaching_right_turn_counts", {}).get(direction, 0)
+            > 0
+            and elapsed >= self.max_red_duration
+            for direction, elapsed in self.right_red_elapsed.items()
+        )
+        if (
+            not force_change
+            and not any_overdue
+            and active_can_hold
+            and best != self.active_movements
+        ):
+            best_utility = self._score_candidate(
+                best,
+                scores,
+                demand,
+                observation,
+            )[2]
+            active_utility = self._score_candidate(
+                self.active_movements,
+                scores,
+                demand,
+                observation,
+            )[2]
+            if best_utility < active_utility + self.switch_hysteresis:
+                best = self.active_movements
+
+        self.last_decoded_movements = frozenset(best)
+        return self.last_decoded_movements
+
+    def _set_movement_states(self, movements, state):
+        for movement in movements:
+            direction = self.movement_direction(movement)
+            if self.movement_kind(movement) == "left":
+                self.left_turn_states[direction] = state
+            else:
+                self.states[direction] = state
+
+    def _start_movement_yellow(self, pending_movements):
+        self.pending_movements = frozenset(pending_movements)
+        self.pending_phase = self.encode_movements(self.pending_movements)
+        self._set_movement_states(self.active_movements, "yellow")
+        self.phase_state = "yellow"
+        self.timer = 0.0
+
+    def _activate_pending_movements(self):
+        for direction in self.DIRECTIONS:
+            self.states[direction] = "red"
+            self.left_turn_states[direction] = "red"
+        self.active_movements = frozenset(self.pending_movements or ())
+        self.active_phase = self.encode_movements(self.active_movements)
+        self._set_movement_states(self.active_movements, "green")
+        self.phase_state = "green"
+        self.pending_movements = None
+        self.pending_phase = None
+        self.next_extension_check = self.min_green_duration
+        self.timer = 0.0
+
+    def update(self, dt):
+        dt = max(0.0, dt)
+        self.timer += dt
+        observation = self._phase_observation()
+        demand = self._movement_demand(observation)
+        direction_demand = self._direction_demand(observation)
+        approaching_left = observation.get("approaching_left_turn_counts", {})
+        approaching_right = observation.get("approaching_right_turn_counts", {})
+
+        for movement in self.MOVEMENTS:
+            if (
+                movement in self.active_movements
+                and self.phase_state == "green"
+            ) or demand.get(movement, 0) <= 0:
+                self.movement_red_elapsed[movement] = 0.0
+            else:
+                self.movement_red_elapsed[movement] += dt
+        for direction in self.DIRECTIONS:
+            through = f"{direction}_through"
+            left = f"{direction}_left"
+            if through in self.active_movements or direction_demand[direction] <= 0:
+                self.red_elapsed[direction] = 0.0
+            else:
+                self.red_elapsed[direction] += dt
+            if left in self.active_movements or approaching_left.get(direction, 0) <= 0:
+                self.left_red_elapsed[direction] = 0.0
+            else:
+                self.left_red_elapsed[direction] += dt
+            if (
+                self.get_right_turn_permission_state(direction) == "green"
+                or approaching_right.get(direction, 0) <= 0
+            ):
+                self.right_red_elapsed[direction] = 0.0
+            else:
+                self.right_red_elapsed[direction] += dt
+
+        if self.phase_state == "green" and self.timer >= self.next_extension_check:
+            scores = (
+                self.movement_score_provider(observation)
+                if self.movement_score_provider is not None
+                else self.last_movement_scores
+            )
+            self.last_movement_scores = {
+                movement: min(1.0, max(0.0, float(scores.get(movement, 0.0))))
+                for movement in self.MOVEMENTS
+            }
+            force_change = self.timer >= self.max_green_duration
+            requested = self.decode_scores(
+                self.last_movement_scores,
+                observation,
+                force_change=force_change,
+            )
+            self.last_policy_requested_phase = self.encode_movements(
+                self.last_raw_requested_movements
+            )
+            self.last_controller_decision = self.encode_movements(requested)
+            if requested != self.active_movements:
+                self._start_movement_yellow(requested)
+            else:
+                self.next_extension_check += self.extension_check_interval
+        elif self.phase_state == "yellow" and self.timer >= self.yellow_duration:
+            self._set_movement_states(self.active_movements, "red")
+            self.phase_state = "all_red"
+            self.timer = 0.0
+        elif self.phase_state == "all_red":
+            pending = self.pending_movements or self.active_movements
+            encoded = self.encode_movements(pending)
+            can_activate = (
+                self.phase_activation_guard is None
+                or self.phase_activation_guard(encoded)
+            )
+            if self.timer >= self.all_red_clearance_duration and can_activate:
+                self._activate_pending_movements()
+
+        self._update_automatic_right_turns(observation, dt)
 
     def get_remaining_time(self):
         if self.phase_state == "green":

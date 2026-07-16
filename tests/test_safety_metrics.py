@@ -54,6 +54,7 @@ class SafetyMetricTests(unittest.TestCase):
         summary = metrics.get_summary()
         self.assertEqual(summary["total_pedestrians_finished"], 1)
         self.assertAlmostEqual(summary["avg_pedestrian_wait_time"], 2.0)
+        self.assertAlmostEqual(summary["avg_pedestrian_wait_time_all"], 2.0)
         self.assertAlmostEqual(summary["max_pedestrian_wait_time"], 2.0)
 
     def test_hard_braking_counts_continuous_episode_once(self):
@@ -125,41 +126,32 @@ class SafetyMetricTests(unittest.TestCase):
 
     def test_new_metrics_reduce_fitness(self):
         metrics = {
-            "throughput": 1,
-            "avg_wait_time": 0.0,
-            "avg_active_wait_time": 0.0,
-            "max_wait_time": 0.0,
-            "queue_lengths": {},
-            "avg_pedestrian_wait_time": 2.0,
-            "avg_active_pedestrian_wait_time": 4.0,
-            "total_excess_braking_intensity": 2.0,
+            "throughput_rate": 0.5,
+            "avg_vehicle_wait_time_all": 2.0,
+            "stops_per_vehicle": 0.5,
+            "avg_pedestrian_wait_time_all": 4.0,
+            "avg_excess_braking_intensity_per_vehicle": 2.0,
         }
 
-        self.assertAlmostEqual(calculate_fitness(metrics), 60.0)
+        self.assertAlmostEqual(calculate_fitness(metrics), 4650.0)
 
     def test_all_fitness_coefficients_are_configurable(self):
         metrics = {
-            "throughput": 2.0,
-            "avg_wait_time": 3.0,
-            "avg_active_wait_time": 4.0,
-            "max_wait_time": 5.0,
-            "queue_lengths": {"north": 6.0},
-            "avg_pedestrian_wait_time": 7.0,
-            "avg_active_pedestrian_wait_time": 8.0,
-            "total_excess_braking_intensity": 9.0,
+            "throughput_rate": 0.2,
+            "avg_vehicle_wait_time_all": 3.0,
+            "stops_per_vehicle": 4.0,
+            "avg_pedestrian_wait_time_all": 5.0,
+            "avg_excess_braking_intensity_per_vehicle": 6.0,
         }
         weights = {
-            "throughput_reward": 1.0,
-            "vehicle_wait_time_penalty": 1.0,
-            "active_vehicle_wait_time_penalty": 1.0,
-            "max_vehicle_wait_time_penalty": 1.0,
-            "queued_vehicle_penalty": 1.0,
-            "pedestrian_wait_time_penalty": 1.0,
-            "active_pedestrian_wait_time_penalty": 1.0,
-            "excess_braking_intensity_penalty": 1.0,
+            "throughput_rate_reward": 1.0,
+            "avg_vehicle_wait_time_penalty": 1.0,
+            "vehicle_stop_rate_penalty": 1.0,
+            "avg_pedestrian_wait_time_penalty": 1.0,
+            "avg_excess_braking_penalty": 1.0,
         }
 
-        self.assertAlmostEqual(calculate_fitness(metrics, weights), -40.0)
+        self.assertAlmostEqual(calculate_fitness(metrics, weights), -17.8)
 
 
 if __name__ == "__main__":

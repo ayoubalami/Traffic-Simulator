@@ -1,4 +1,4 @@
-"""Train and save the separate paired/individual-approach neural policy."""
+"""Train and save the independent-score movement policy."""
 
 import argparse
 import json
@@ -10,14 +10,14 @@ os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 
 from config import CONFIG, build_runtime_config
 from simulation import (
-    SixPhasePolicyEvolution,
-    evaluate_six_phase_policy_across_seeds,
+    MovementPolicyEvolution,
+    evaluate_movement_policy_across_seeds,
 )
-from simulation.six_phase_neuroevolution import (
-    INPUT_FEATURE_NAMES,
-    PHASE_NAMES,
-    SIX_PHASE_POLICY_FORMAT_VERSION,
-    SixPhasePolicy,
+from simulation.movement_neuroevolution import (
+    MOVEMENT_INPUT_FEATURE_NAMES,
+    MOVEMENT_NAMES,
+    MOVEMENT_POLICY_FORMAT_VERSION,
+    MovementPolicy,
 )
 
 
@@ -37,9 +37,7 @@ def parse_profile_names(value):
 
 def parse_arguments():
     parser = argparse.ArgumentParser(
-        description=(
-            "Train main phases with independently actuated safe right arrows."
-        ),
+        description="Train independent movement scores with safe multi-hot decoding.",
     )
     parser.add_argument("--population", type=int, default=50)
     parser.add_argument("--generations", type=int, default=10)
@@ -81,7 +79,7 @@ def parse_arguments():
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("models/six_phase_policy_v9.json"),
+        default=Path("models/movement_policy_v1.json"),
     )
     return parser.parse_args()
 
@@ -130,7 +128,8 @@ def main():
         if unknown:
             raise SystemExit(f"unknown traffic profiles: {', '.join(unknown)}")
         traffic_profiles = [profiles_by_name[name] for name in args.profiles]
-    trainer = SixPhasePolicyEvolution(
+
+    trainer = MovementPolicyEvolution(
         runtime_config,
         duration_bounds_s=duration_bounds_s,
         population_size=args.population,
@@ -144,7 +143,7 @@ def main():
         random_seed=args.random_seed,
     )
     print(
-        "Training six-phase neural policy "
+        "Training movement neural policy "
         f"({args.population} candidates, {args.generations} generations, "
         f"{len(traffic_profiles)} profiles, seeds={args.seeds}, "
         f"speed={args.speed_factor:g}x, workers={trainer.workers})..."
@@ -158,7 +157,7 @@ def main():
             f"{args.validation_seeds}...",
             flush=True,
         )
-        validation = evaluate_six_phase_policy_across_seeds(
+        validation = evaluate_movement_policy_across_seeds(
             runtime_config,
             best["policy"],
             seeds=args.validation_seeds,
@@ -172,19 +171,19 @@ def main():
         )
     output = {
         "fitness_version": 2,
-        "format_version": SIX_PHASE_POLICY_FORMAT_VERSION,
-        "policy_type": "six_phase",
-        "phases": list(PHASE_NAMES),
+        "format_version": MOVEMENT_POLICY_FORMAT_VERSION,
+        "policy_type": "movement_multi_hot",
+        "movements": list(MOVEMENT_NAMES),
         "network": {
-            "input_size": SixPhasePolicy.input_size,
-            "input_features": list(INPUT_FEATURE_NAMES),
-            "hidden_size": SixPhasePolicy.hidden_size,
-            "output_size": SixPhasePolicy.output_size,
+            "input_size": MovementPolicy.input_size,
+            "input_features": list(MOVEMENT_INPUT_FEATURE_NAMES),
+            "hidden_size": MovementPolicy.hidden_size,
+            "output_size": MovementPolicy.output_size,
+            "output_activation": "sigmoid",
         },
+        "decoder": dict(runtime_config.get("movement_controller", {})),
         "duration_bounds_s": duration_bounds_s,
-        "max_red_duration_s": runtime_config["traffic_lights"].get(
-            "max_red_duration_s", 60.0
-        ),
+        "max_red_duration_s": timing.get("max_red_duration_s", 60.0),
         "weights": best["policy"].weights,
         "fitness": best["fitness"],
         "mean_metrics": best["mean_metrics"],
@@ -214,7 +213,7 @@ def main():
     args.output.write_text(json.dumps(output, indent=2), encoding="utf-8")
     print(f"Best fitness: {best['fitness']:.2f}")
     print(f"Total training time: {result['training_time_s']:.2f}s")
-    print(f"Saved six-phase policy to: {args.output}")
+    print(f"Saved movement policy to: {args.output}")
 
 
 if __name__ == "__main__":

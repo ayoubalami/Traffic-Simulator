@@ -9,8 +9,12 @@ from .simulation import Simulation
 DIRECTIONS = ("north", "south", "east", "west")
 MEAN_METRIC_NAMES = (
     "throughput",
+    "throughput_rate",
     "avg_wait_time",
+    "avg_vehicle_wait_time_all",
+    "total_vehicle_wait_time",
     "avg_active_wait_time",
+    "stops_per_vehicle",
     "avg_travel_time",
     "max_wait_time",
     "avg_pre_intersection_wait_time",
@@ -19,6 +23,7 @@ MEAN_METRIC_NAMES = (
     "active_vehicles",
     "avg_pedestrian_wait_time",
     "avg_active_pedestrian_wait_time",
+    "avg_pedestrian_wait_time_all",
     "max_pedestrian_wait_time",
     "hard_braking_events",
     "hard_braking_vehicles",
@@ -33,10 +38,22 @@ MEAN_METRIC_NAMES = (
     "total_turning_stuck_time",
     "max_turning_vehicles_stuck",
     "phase_switches",
+    "movement_set_changes",
+    "changed_movement_count",
+    "transition_clearance_time",
+    "transition_clearance_fraction",
+    "total_green_movement_time",
+    "useful_green_movement_time",
+    "wasted_green_movement_time",
+    "green_movement_utilization",
+    "wasted_green_movement_fraction",
     "empty_phase_time",
     "intersection_blocking_time",
+    "intersection_blocking_rate",
     "left_turn_delay",
     "right_turn_delay",
+    "avg_left_turn_delay",
+    "avg_right_turn_delay",
     "paired_phase_time",
     "single_phase_time",
 )
@@ -76,26 +93,25 @@ def _effective_timestep(config, timestep_s, speed_factor=None):
 
 
 def calculate_fitness(metrics, fitness_config=None):
-    """Return a score that rewards exits and penalizes delay and queues."""
+    """Return normalized outcome fitness for vehicles and pedestrians."""
     fitness_config = fitness_config or {}
-    queue_size = sum(metrics["queue_lengths"].values())
+    throughput_rate = metrics.get("throughput_rate")
+    if throughput_rate is None:
+        throughput_rate = metrics.get("throughput", 0.0) / max(
+            1,
+            metrics.get("total_vehicles_spawned", metrics.get("throughput", 0.0)),
+        )
     return (
-        metrics["throughput"]
-        * float(fitness_config.get("throughput_reward", 100.0))
-        - metrics["avg_wait_time"]
-        * float(fitness_config.get("vehicle_wait_time_penalty", 10.0))
-        - metrics["avg_active_wait_time"]
-        * float(fitness_config.get("active_vehicle_wait_time_penalty", 5.0))
-        - metrics["max_wait_time"]
-        * float(fitness_config.get("max_vehicle_wait_time_penalty", 1.0))
-        - queue_size
-        * float(fitness_config.get("queued_vehicle_penalty", 10.0))
-        - metrics.get("avg_pedestrian_wait_time", 0.0)
-        * float(fitness_config.get("pedestrian_wait_time_penalty", 5.0))
-        - metrics.get("avg_active_pedestrian_wait_time", 0.0)
-        * float(fitness_config.get("active_pedestrian_wait_time_penalty", 2.5))
-        - metrics.get("total_excess_braking_intensity", 0.0)
-        * float(fitness_config.get("excess_braking_intensity_penalty", 10.0))
+        throughput_rate
+        * float(fitness_config.get("throughput_rate_reward", 10000.0))
+        - metrics.get("avg_vehicle_wait_time_all", 0.0)
+        * float(fitness_config.get("avg_vehicle_wait_time_penalty", 30.0))
+        - metrics.get("stops_per_vehicle", 0.0)
+        * float(fitness_config.get("vehicle_stop_rate_penalty", 100.0))
+        - metrics.get("avg_pedestrian_wait_time_all", 0.0)
+        * float(fitness_config.get("avg_pedestrian_wait_time_penalty", 10.0))
+        - metrics.get("avg_excess_braking_intensity_per_vehicle", 0.0)
+        * float(fitness_config.get("avg_excess_braking_penalty", 100.0))
     )
 
 
@@ -261,6 +277,18 @@ def evaluate_six_phase_policy(
         raise ValueError("duration_s and timestep_s must be positive")
 
     evaluation_config = deepcopy(config)
+    policy_timing = evaluation_config.setdefault("traffic_lights", {})
+    if hasattr(policy, "minimum_duration_s"):
+        policy_timing["min_green_duration_s"] = policy.minimum_duration_s
+    if hasattr(policy, "maximum_duration_s"):
+        policy_timing["max_green_duration_s"] = policy.maximum_duration_s
+    if hasattr(policy, "max_red_duration_s"):
+        policy_timing["max_red_duration_s"] = policy.max_red_duration_s
+    decoder_config = getattr(policy, "decoder_config", None)
+    if decoder_config:
+        evaluation_config.setdefault("movement_controller", {}).update(
+            decoder_config
+        )
     profile = traffic_profile or {"name": "configured"}
     simulation_profile = evaluation_config.setdefault("simulation", {})
     if "direction_spawn_weights" in profile:
@@ -278,11 +306,14 @@ def evaluate_six_phase_policy(
     effective_timestep_s = _effective_timestep(
         evaluation_config, timestep_s, speed_factor
     )
-    simulation = Simulation(
-        evaluation_config,
-        random_seed=random_seed,
-        phase_selector=policy.select_phase,
-    )
+    simulation_options = {"random_seed": random_seed}
+    if hasattr(policy, "predict_movement_scores"):
+        simulation_options["movement_score_provider"] = (
+            policy.predict_movement_scores
+        )
+    else:
+        simulation_options["phase_selector"] = policy.select_phase
+    simulation = Simulation(evaluation_config, **simulation_options)
     gridlock_config = evaluation_config.get("six_phase_fitness", {})
     gridlock_min_vehicles = max(
         1,
@@ -331,6 +362,9 @@ def evaluate_six_phase_policy(
             "gridlock_detected": int(gridlock_detected),
             "max_intersection_stuck_vehicles": max_intersection_stuck_vehicles,
             "evaluation_elapsed_s": elapsed,
+            "gridlock_remaining_time_s": (
+                max(0.0, duration_s - elapsed) if gridlock_detected else 0.0
+            ),
         }
     )
     return {
@@ -348,28 +382,38 @@ def evaluate_six_phase_policy(
 
 
 def calculate_six_phase_fitness(metrics, fitness_config=None, six_phase_config=None):
-    """Add non-overlapping control and intersection-safety objectives."""
+    """Add normalized control costs and hard intersection-safety constraints."""
     six_phase_config = six_phase_config or {}
     return (
         calculate_fitness(metrics, fitness_config)
-        - metrics.get("total_turning_stuck_time", 0.0)
-        * float(six_phase_config.get("turning_stuck_time_penalty", 0.0))
-        - metrics.get("turning_stuck_events", 0)
-        * float(six_phase_config.get("turning_stuck_event_penalty", 0.0))
         - int(bool(metrics.get("gridlock_detected", False)))
         * float(six_phase_config.get("gridlock_penalty", 100000.0))
-        - metrics.get("phase_switches", 0)
-        * float(six_phase_config.get("phase_switch_penalty", 50.0))
-        - metrics.get("empty_phase_time", 0.0)
-        * float(six_phase_config.get("empty_phase_time_penalty", 0.0))
-        - metrics.get("intersection_blocking_time", 0.0)
+        - metrics.get("gridlock_remaining_time_s", 0.0)
         * float(
-            six_phase_config.get("intersection_blocking_time_penalty", 40.0)
+            six_phase_config.get("gridlock_remaining_time_penalty", 1000.0)
         )
-        - metrics.get("left_turn_delay", 0.0)
-        * float(six_phase_config.get("left_turn_delay_penalty", 15.0))
-        - metrics.get("right_turn_delay", 0.0)
-        * float(six_phase_config.get("right_turn_delay_penalty", 15.0))
+        - metrics.get("transition_clearance_fraction", 0.0)
+        * float(
+            six_phase_config.get(
+                "transition_clearance_fraction_penalty",
+                250.0,
+            )
+        )
+        - metrics.get("wasted_green_movement_fraction", 0.0)
+        * float(
+            six_phase_config.get(
+                "wasted_green_movement_fraction_penalty",
+                250.0,
+            )
+        )
+        - metrics.get("intersection_blocking_rate", 0.0)
+        * float(
+            six_phase_config.get("intersection_blocking_rate_penalty", 2000.0)
+        )
+        - metrics.get("avg_left_turn_delay", 0.0)
+        * float(six_phase_config.get("avg_left_turn_delay_penalty", 15.0))
+        - metrics.get("avg_right_turn_delay", 0.0)
+        * float(six_phase_config.get("avg_right_turn_delay_penalty", 15.0))
         - metrics.get("max_avg_pre_intersection_wait_time", 0.0)
         * float(
             six_phase_config.get("worst_approach_wait_time_penalty", 5.0)
@@ -422,6 +466,7 @@ def evaluate_six_phase_policy_across_seeds(
             break
     six_phase_metric_names = MEAN_METRIC_NAMES + (
         "gridlock_detected",
+        "gridlock_remaining_time_s",
         "max_intersection_stuck_vehicles",
         "evaluation_elapsed_s",
     )
@@ -441,3 +486,19 @@ def evaluate_six_phase_policy_across_seeds(
         ),
         "evaluations": evaluations,
     }
+
+
+def evaluate_movement_policy(*args, **kwargs):
+    """Evaluate the independent-score movement policy with the same metrics."""
+    policy = args[1] if len(args) > 1 else kwargs.get("policy")
+    if policy is None or not hasattr(policy, "predict_movement_scores"):
+        raise TypeError("policy must provide predict_movement_scores")
+    return evaluate_six_phase_policy(*args, **kwargs)
+
+
+def evaluate_movement_policy_across_seeds(*args, **kwargs):
+    """Evaluate a movement policy across the configured profiles and seeds."""
+    policy = args[1] if len(args) > 1 else kwargs.get("policy")
+    if policy is None or not hasattr(policy, "predict_movement_scores"):
+        raise TypeError("policy must provide predict_movement_scores")
+    return evaluate_six_phase_policy_across_seeds(*args, **kwargs)

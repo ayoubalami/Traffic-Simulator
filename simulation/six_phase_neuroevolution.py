@@ -259,6 +259,8 @@ class SixPhasePolicy:
 class SixPhasePolicyEvolution:
     """Evolve policies that choose paired and individual approach phases."""
 
+    policy_class = SixPhasePolicy
+
     def __init__(
         self,
         config,
@@ -312,7 +314,7 @@ class SixPhasePolicyEvolution:
 
     def run(self):
         population = [
-            SixPhasePolicy.random(
+            self.policy_class.random(
                 self.random,
                 self.duration_bounds_s,
                 self.max_red_duration_s,
@@ -392,13 +394,13 @@ class SixPhasePolicyEvolution:
                 first.weights[index]
                 if self.random.random() < 0.5
                 else second.weights[index]
-                for index in range(SixPhasePolicy.genome_size)
+            for index in range(self.policy_class.genome_size)
             ]
             for index, weight in enumerate(weights):
                 if self.random.random() < self.mutation_rate:
                     weights[index] = weight + self.random.gauss(0.0, self.mutation_sigma)
             population.append(
-                SixPhasePolicy(
+                self.policy_class(
                     weights,
                     self.duration_bounds_s,
                     self.max_red_duration_s,

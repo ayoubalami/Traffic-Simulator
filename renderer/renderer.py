@@ -130,6 +130,10 @@ class Renderer:
             getattr(render_data["lights"], "active_phase", None),
             render_data.get("phase_decision_debug"),
         )
+        self.draw_movement_scores(
+            render_data.get("movement_scores"),
+            render_data.get("movement_decision_debug"),
+        )
         self.draw_density_controls()
         self.draw_distance_scale()
         
@@ -324,6 +328,8 @@ class Renderer:
                 draw_signal(box_x, box_y, state, horizontal=False)
         
     def draw_metrics(self, metrics):
+        if not self.config.get("debug", {}).get("show_metrics", True):
+            return
         y = 10
         for key, value in metrics.items():
             text = f"{key}: {value:.2f}" if isinstance(value, float) else f"{key}: {value}"
@@ -524,6 +530,114 @@ class Renderer:
         )
         self.screen.blit(help_1, (panel_x + 10, panel_y + 72))
         self.screen.blit(help_2, (panel_x + 10, panel_y + 90))
+
+    def draw_movement_scores(self, scores, decision_debug=None):
+        """Draw independent sigmoid scores and the safe decoded movement set."""
+        if not scores:
+            return
+
+        labels = (
+            ("north_through", "North through"),
+            ("south_through", "South through"),
+            ("east_through", "East through"),
+            ("west_through", "West through"),
+            ("north_left", "North left"),
+            ("south_left", "South left"),
+            ("east_left", "East left"),
+            ("west_left", "West left"),
+        )
+        decision_debug = decision_debug or {}
+        threshold = min(
+            1.0,
+            max(0.0, float(decision_debug.get("threshold", 0.5))),
+        )
+        demanded = set(decision_debug.get("demanded") or ())
+        raw_requested = set(decision_debug.get("raw_requested") or ())
+        decoded = set(decision_debug.get("decoded") or ())
+        active = set(decision_debug.get("active") or ())
+        pending = set(decision_debug.get("pending") or ())
+        phase_state = decision_debug.get("phase_state") or "-"
+
+        panel_width = 320
+        panel_height = 326
+        panel_x = self.config["window"]["width"] - panel_width - 14
+        panel_y = 14
+        panel = pygame.Surface((panel_width, panel_height), pygame.SRCALPHA)
+        panel.fill((15, 18, 24, 225))
+        self.screen.blit(panel, (panel_x, panel_y))
+        pygame.draw.rect(
+            self.screen,
+            (105, 115, 130),
+            (panel_x, panel_y, panel_width, panel_height),
+            1,
+            border_radius=4,
+        )
+        title = self.font.render(
+            "Movement outputs (independent sigmoid)",
+            True,
+            (255, 255, 255),
+        )
+        self.screen.blit(title, (panel_x + 12, panel_y + 10))
+
+        bar_x = panel_x + 126
+        bar_width = 120
+        threshold_x = bar_x + round(bar_width * threshold)
+        row_y = panel_y + 42
+        for movement, label in labels:
+            score = min(1.0, max(0.0, float(scores.get(movement, 0.0))))
+            color = (225, 225, 225) if movement in demanded else (105, 110, 120)
+            if movement in raw_requested:
+                color = (90, 225, 255)
+            if movement in decoded or movement in pending:
+                color = (255, 190, 75)
+            if movement in active:
+                color = (100, 255, 135)
+            self.screen.blit(
+                self.vehicle_debug_font.render(label, True, color),
+                (panel_x + 12, row_y + 1),
+            )
+            pygame.draw.rect(
+                self.screen,
+                (50, 55, 65),
+                (bar_x, row_y + 2, bar_width, 12),
+                border_radius=2,
+            )
+            fill_color = color if movement in demanded else (65, 68, 75)
+            fill_width = round(bar_width * score)
+            if fill_width:
+                pygame.draw.rect(
+                    self.screen,
+                    fill_color,
+                    (bar_x, row_y + 2, fill_width, 12),
+                    border_radius=2,
+                )
+            pygame.draw.line(
+                self.screen,
+                (235, 235, 235),
+                (threshold_x, row_y),
+                (threshold_x, row_y + 16),
+                1,
+            )
+            self.screen.blit(
+                self.vehicle_debug_font.render(
+                    f"{score * 100:5.1f}%",
+                    True,
+                    (240, 240, 240),
+                ),
+                (bar_x + bar_width + 7, row_y + 1),
+            )
+            row_y += 25
+
+        footer_lines = (
+            f"Raw: {len(raw_requested)}  Safe set: {len(decoded)}",
+            f"Active: {len(active)}  Pending: {len(pending)}",
+            f"Threshold: {threshold:.2f}  State: {phase_state}",
+        )
+        for index, footer_text in enumerate(footer_lines):
+            self.screen.blit(
+                self.font.render(footer_text, True, (190, 200, 215)),
+                (panel_x + 12, panel_y + panel_height - 61 + index * 18),
+            )
 
     def draw_distance_scale(self):
         """Draw a metres-to-pixels reference key in the lower-right corner."""
@@ -1205,7 +1319,14 @@ class Renderer:
                 1,
                 border_radius=2,
             )
-            arrow_color = bright.get(state, faded["red"])
+            # ``off`` means the dedicated arrow is inactive; a circular main
+            # green may still permit a yielding right turn. It must not look
+            # like a prohibitive red arrow.
+            arrow_color = (
+                (65, 65, 65)
+                if state == "off"
+                else bright.get(state, faded["red"])
+            )
             local_points = [
                 (4, 9), (9, 4), (9, 7), (14, 7), (14, 14),
                 (11, 14), (11, 10), (9, 10), (9, 13),

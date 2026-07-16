@@ -3,7 +3,11 @@ import math
 from collections import defaultdict
 from .vehicle import EmergencyVehicle, Vehicle
 from .pedestrian import Pedestrian
-from .traffic_light import SixPhaseTrafficLightController, TrafficLightController
+from .traffic_light import (
+    MovementTrafficLightController,
+    SixPhaseTrafficLightController,
+    TrafficLightController,
+)
 from .metrics import Metrics
 
 class Simulation:
@@ -14,12 +18,20 @@ class Simulation:
         duration_selector=None,
         extension_decider=None,
         phase_selector=None,
+        movement_score_provider=None,
     ):
+        if phase_selector is not None and movement_score_provider is not None:
+            raise ValueError(
+                "phase_selector and movement_score_provider are mutually exclusive"
+            )
         self.config = config
         self.random = random.Random(random_seed) if random_seed is not None else random
-        controller_class = (
-            SixPhaseTrafficLightController if phase_selector is not None else TrafficLightController
-        )
+        if movement_score_provider is not None:
+            controller_class = MovementTrafficLightController
+        elif phase_selector is not None:
+            controller_class = SixPhaseTrafficLightController
+        else:
+            controller_class = TrafficLightController
         self.light_controller = controller_class(config)
         self.vehicles = []
         self.pedestrians = []
@@ -55,6 +67,18 @@ class Simulation:
                 lambda: self.get_signal_observation(
                     self.light_controller.active_phase
                 )
+            )
+        if movement_score_provider is not None:
+            self.light_controller.set_movement_score_provider(
+                lambda observation: movement_score_provider(observation)
+            )
+            self.light_controller.set_phase_observation_provider(
+                lambda: self.get_signal_observation(
+                    self.light_controller.active_phase
+                )
+            )
+            self.light_controller.set_movement_activation_guard(
+                self._can_activate_movements
             )
         self.light_controller.set_phase_activation_guard(self._can_activate_phase)
         if hasattr(self.light_controller, "set_right_turn_activation_guard"):
@@ -162,7 +186,11 @@ class Simulation:
             
             if not blocked:
                 self.vehicles.append(candidate)
-                self.metrics.register_vehicle(id(candidate), direction)
+                self.metrics.register_vehicle(
+                    id(candidate),
+                    direction,
+                    getattr(candidate, "turn_side", None),
+                )
                 return
 
     def get_signal_observation(self, active_phase):
@@ -256,6 +284,9 @@ class Simulation:
                 else {direction: 0.0 for direction in queue_lengths}
             ),
             "active_phase": active_phase,
+            "active_movements": tuple(
+                getattr(self.light_controller, "active_movements", ())
+            ),
             "green_elapsed_s": self.light_controller.timer,
         }
 
@@ -361,6 +392,19 @@ class Simulation:
         protected_crossings = {direction, exit_crossing}
         return not any(
             pedestrian.crossing in protected_crossings
+            and not pedestrian.is_safely_waiting()
+            for pedestrian in self.pedestrians
+        )
+
+    def _can_activate_movements(self, movements):
+        """Demand-decoder pedestrian mask for a proposed concurrent set."""
+        crossings = set()
+        for movement in movements:
+            crossings.update(
+                self.light_controller._movement_crossings(movement)
+            )
+        return not any(
+            pedestrian.crossing in crossings
             and not pedestrian.is_safely_waiting()
             for pedestrian in self.pedestrians
         )

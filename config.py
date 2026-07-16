@@ -32,6 +32,9 @@ CONFIG = {
         "length_m": 100.0,
     },
     "debug": {
+        # Show the live Metrics.get_summary() values in the upper-left corner.
+        # Collection and fitness calculations continue when this is disabled.
+        "show_metrics": False,
         # Draw the current physical deceleration beside every vehicle.
         "show_vehicle_braking_rate": False,
         "vehicle_braking_rate_decimals": 2,
@@ -41,7 +44,7 @@ CONFIG = {
         # running. These are relative arrival weights: increasing one side
         # sends a larger share of newly spawned vehicles to that approach.
         "enabled": True,
-        "step": 0.25,
+        "step": 0.05,
         "max_weight": 10.0,
     },
     "traffic_lights": {
@@ -58,6 +61,9 @@ CONFIG = {
         # Right arrows are actuated independently from the neural main phase.
         # Every demanded, compatible direction may be green simultaneously.
         "automatic_right_turn_arrows": True,
+        # Debounce brief detector gaps without delaying a safety shutdown.
+        "right_turn_demand_hold_s": 1.0,
+        "right_turn_min_green_s": 2.0,
         "green_durations_s": {
             "north": 8.0,
             "south": 8.0,
@@ -65,6 +71,14 @@ CONFIG = {
             "west": 8.0,
         },
         "yellow_duration_s": 2.0,
+    },
+    "movement_controller": {
+        # Independent sigmoid outputs above this value are raw movement
+        # requests. The decoder still evaluates every compatible subset.
+        "output_threshold": 0.50,
+        # Required utility improvement before replacing a still-useful green.
+        # This prevents small score fluctuations from causing rapid switches.
+        "switch_hysteresis": 0.15,
     },
     "pedestrian_signals": {
         # Pedestrian WALK is controlled independently from the vehicle red
@@ -80,35 +94,30 @@ CONFIG = {
         "require_new_walk_signal_at_divider": True,
     },
     "fitness": {
-        # Reward and penalty coefficients used by calculate_fitness. Setting
-        # any penalty to zero removes that objective from training.
-        "throughput_reward": 100.0,
-        "vehicle_wait_time_penalty": 10.0,
-        "active_vehicle_wait_time_penalty": 5.0,
-        "max_vehicle_wait_time_penalty": 1.0,
-        "queued_vehicle_penalty": 10.0,
-        # Penalty applied per second of mean pedestrian signal/divider wait.
-        "pedestrian_wait_time_penalty": 5.0,
-        # Active pedestrians are included separately so an evaluation cannot
-        # improve its score by ending while people are still waiting.
-        "active_pedestrian_wait_time_penalty": 2.5,
-        # Penalty per vehicle-second of braking intensity above the vehicle's
-        # own comfortable deceleration. Normal braking therefore adds zero.
-        "excess_braking_intensity_penalty": 10.0,
+        # Fitness v2 uses normalized outcomes so coefficients do not grow
+        # merely because more vehicles spawn or an evaluation runs longer.
+        "throughput_rate_reward": 10000.0,
+        # Mean stopped time includes both exited and still-active vehicles.
+        "avg_vehicle_wait_time_penalty": 30.0,
+        "vehicle_stop_rate_penalty": 100.0,
+        # Mean pedestrian wait includes finished and active pedestrians.
+        "avg_pedestrian_wait_time_penalty": 10.0,
+        # Excess deceleration intensity is normalized per spawned vehicle.
+        "avg_excess_braking_penalty": 100.0,
     },
     "six_phase_fitness": {
-        # Additional objectives used only by the separate six-phase model.
-        # These two diagnostics overlap with left-turn delay and physical
-        # intersection blocking. Keep reporting them, but do not count the
-        # same congestion multiple times in fitness.
-        "turning_stuck_time_penalty": 0.0,
-        "turning_stuck_event_penalty": 0.0,
-        "phase_switch_penalty": 50.0,
-        # Empty phases are already prevented by the controller's demand mask.
-        "empty_phase_time_penalty": 0.0,
-        "intersection_blocking_time_penalty": 40.0,
-        "left_turn_delay_penalty": 15.0,
-        "right_turn_delay_penalty": 15.0,
+        # Clearance fraction measures actual yellow/all-red time instead of
+        # treating every small movement-set change as the same switch cost.
+        "transition_clearance_fraction_penalty": 250.0,
+        # Movement-level utilization penalizes green movements that serve no
+        # demand while another vehicle movement is waiting.
+        "wasted_green_movement_fraction_penalty": 250.0,
+        # Average stopped vehicles inside the physical conflict zone.
+        "intersection_blocking_rate_penalty": 2000.0,
+        # Turn delay is measured relative to the configured turn speed and
+        # normalized by the number of vehicles making that turn.
+        "avg_left_turn_delay_penalty": 15.0,
+        "avg_right_turn_delay_penalty": 15.0,
         # Penalize the approach with the highest average stopped time before
         # entering the junction, so light traffic on other sides cannot hide
         # one neglected direction in the global average.
@@ -116,10 +125,67 @@ CONFIG = {
         # Reject policies that form a persistent blockage in the physical
         # intersection. Evaluation stops as soon as this condition is met.
         "gridlock_penalty": 100000.0,
+        # Earlier gridlock leaves more horizon unserved and is therefore
+        # ranked worse than a candidate that remains feasible for longer.
+        "gridlock_remaining_time_penalty": 1000.0,
         "gridlock_min_stuck_vehicles": 4,
         "gridlock_speed_threshold_mps": 0.5,
         "gridlock_persistence_s": 4.0,
         "abort_remaining_seeds_on_gridlock": True,
+    },
+    "six_phase_training": {
+        # Seeds vary individual arrivals; profiles vary the underlying demand.
+        # Both categorical and movement-level policies train on this same set.
+        "traffic_profiles": [
+            {
+                "name": "balanced",
+                "direction_spawn_weights": {
+                    "north": 1.0,
+                    "south": 1.0,
+                    "east": 1.0,
+                    "west": 1.0,
+                },
+                "vehicle_spawn_interval_s": 0.25,
+                "left_turn_chance": 0.25,
+                "right_turn_chance": 0.25,
+            },
+            {
+                "name": "north_south_peak",
+                "direction_spawn_weights": {
+                    "north": 1.6,
+                    "south": 1.6,
+                    "east": 0.4,
+                    "west": 0.4,
+                },
+                "vehicle_spawn_interval_s": 0.25,
+                "left_turn_chance": 0.25,
+                "right_turn_chance": 0.25,
+            },
+            {
+                "name": "east_west_peak",
+                "direction_spawn_weights": {
+                    "north": 0.4,
+                    "south": 0.4,
+                    "east": 1.6,
+                    "west": 1.6,
+                },
+                "vehicle_spawn_interval_s": 0.25,
+                "left_turn_chance": 0.25,
+                "right_turn_chance": 0.25,
+            },
+            {
+                "name": "turning_peak",
+                "direction_spawn_weights": {
+                    "north": 1.0,
+                    "south": 1.0,
+                    "east": 1.0,
+                    "west": 1.0,
+                },
+                "vehicle_spawn_interval_s": 0.25,
+                "left_turn_chance": 0.38,
+                "right_turn_chance": 0.32,
+            },
+        ],
     },
     "simulation": {
         "pixels_per_meter": 6,
@@ -127,7 +193,7 @@ CONFIG = {
         # headless neuroevolution evaluations both use this value.  Values
         # above 1 run faster by using larger simulation-time increments.
         "time_scale": 1.0,
-        "vehicle_spawn_interval_s": 0.250,
+        "vehicle_spawn_interval_s": 0.5,
         # Relative arrival rates for each enabled approach.  Set a weight to
         # zero to prevent new vehicles from spawning on that approach.
         "direction_spawn_weights": {
@@ -178,7 +244,7 @@ CONFIG = {
         "braking_deceleration_mps2": 3.5,
         # Hard braking is relative to each vehicle's comfortable deceleration:
         # 1.0 is normal braking and 1.5 is the configured emergency rate.
-        "hard_braking_intensity_threshold": 150.0,
+        "hard_braking_intensity_threshold": 150,
         # Show a hard-braking vehicle in the warning color for this many
         # real display seconds (independent of simulation.time_scale).
         "hard_braking_highlight_duration_s": 1.0,

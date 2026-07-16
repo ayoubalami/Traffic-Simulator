@@ -375,6 +375,44 @@ class SixPhasePolicyTests(unittest.TestCase):
             "red",
         )
 
+    def test_right_arrow_debounces_temporary_demand_loss(self):
+        timing = self.config["traffic_lights"]
+        timing["right_turn_demand_hold_s"] = 1.0
+        timing["right_turn_min_green_s"] = 2.0
+        right_demand = {"north": 1}
+        controller = SixPhaseTrafficLightController(self.config)
+        controller.set_phase_observation_provider(
+            lambda: {
+                "vehicle_counts": {"north": right_demand["north"]},
+                "queue_lengths": {},
+                "approaching_right_turn_counts": right_demand.copy(),
+            }
+        )
+
+        controller.update(0.01)
+        self.assertEqual(controller.get_right_turn_state("north"), "green")
+
+        right_demand["north"] = 0
+        controller.update(0.5)
+        self.assertEqual(controller.get_right_turn_state("north"), "green")
+
+        controller.update(1.6)
+        self.assertEqual(controller.get_right_turn_state("north"), "off")
+
+    def test_inactive_right_arrow_uses_permissive_main_green(self):
+        controller = SixPhaseTrafficLightController(self.config)
+        right_vehicle = SimpleNamespace(
+            road_direction="north",
+            is_turning_vehicle=True,
+            turn_side="right",
+            has_turned=False,
+        )
+
+        controller.update(0.01)
+
+        self.assertEqual(controller.get_right_turn_state("north"), "off")
+        self.assertEqual(controller.get_vehicle_state(right_vehicle), "green")
+
     def test_right_turn_demand_exposes_only_a_compatible_main_phase(self):
         controller = SixPhaseTrafficLightController(self.config)
         observation = {
@@ -392,6 +430,12 @@ class SixPhasePolicyTests(unittest.TestCase):
 
     def test_pedestrian_guard_blocks_only_its_right_arrow(self):
         controller = SixPhaseTrafficLightController(self.config)
+        north_right = SimpleNamespace(
+            road_direction="north",
+            is_turning_vehicle=True,
+            turn_side="right",
+            has_turned=False,
+        )
         controller.set_phase_observation_provider(
             lambda: {
                 "vehicle_counts": {"north": 1, "south": 1},
@@ -408,6 +452,24 @@ class SixPhasePolicyTests(unittest.TestCase):
 
         self.assertEqual(controller.get_right_turn_state("north"), "red")
         self.assertEqual(controller.get_right_turn_state("south"), "green")
+        self.assertEqual(controller.get_vehicle_state(north_right), "red")
+
+    def test_right_arrow_safety_red_overrides_minimum_green(self):
+        controller = SixPhaseTrafficLightController(self.config)
+        controller.set_phase_observation_provider(
+            lambda: {
+                "vehicle_counts": {"north": 1},
+                "queue_lengths": {"north": 1},
+                "approaching_right_turn_counts": {"north": 1},
+            }
+        )
+        controller.update(0.01)
+        self.assertEqual(controller.get_right_turn_state("north"), "green")
+
+        controller.set_right_turn_activation_guard(lambda direction: False)
+        controller.update(0.01)
+
+        self.assertEqual(controller.get_right_turn_state("north"), "red")
 
     def test_left_arrow_tracks_red_time_separately(self):
         controller = SixPhaseTrafficLightController(self.config)
@@ -542,77 +604,75 @@ class SixPhasePolicyTests(unittest.TestCase):
         metrics.update_control(controller, [vehicle, right_vehicle], dt=1.0)
         summary = metrics.get_summary()
 
-        self.assertAlmostEqual(summary["empty_phase_time"], 2.0)
+        self.assertAlmostEqual(summary["empty_phase_time"], 3.0)
+        self.assertAlmostEqual(summary["green_movement_utilization"], 0.0)
+        self.assertAlmostEqual(
+            summary["wasted_green_movement_fraction"],
+            1.0,
+        )
         self.assertAlmostEqual(summary["intersection_blocking_time"], 4.0)
         self.assertAlmostEqual(summary["left_turn_delay"], 3.0)
         self.assertAlmostEqual(summary["right_turn_delay"], 3.0)
         self.assertEqual(summary["phase_switches"], 1)
+        self.assertEqual(summary["movement_set_changes"], 1)
 
-    def test_turning_penalty_applies_only_to_six_phase_fitness(self):
+    def test_normalized_turn_delay_applies_only_to_control_fitness(self):
         metrics = {
-            "throughput": 1.0,
-            "avg_wait_time": 0.0,
-            "avg_active_wait_time": 0.0,
-            "max_wait_time": 0.0,
-            "queue_lengths": {},
-            "total_turning_stuck_time": 2.0,
-            "turning_stuck_events": 1,
+            "throughput_rate": 1.0,
+            "avg_left_turn_delay": 2.0,
+            "avg_right_turn_delay": 1.0,
         }
         base = calculate_fitness(metrics)
         six_phase = calculate_six_phase_fitness(
             metrics,
             six_phase_config={
-                "turning_stuck_time_penalty": 20.0,
-                "turning_stuck_event_penalty": 25.0,
+                "avg_left_turn_delay_penalty": 20.0,
+                "avg_right_turn_delay_penalty": 25.0,
             },
         )
 
-        self.assertAlmostEqual(base, 100.0)
-        self.assertAlmostEqual(six_phase, 35.0)
+        self.assertAlmostEqual(base, 10000.0)
+        self.assertAlmostEqual(six_phase, 9935.0)
 
     def test_gridlock_receives_heavy_fitness_penalty(self):
         metrics = {
-            "throughput": 1.0,
-            "avg_wait_time": 0.0,
-            "avg_active_wait_time": 0.0,
-            "max_wait_time": 0.0,
-            "queue_lengths": {},
+            "throughput_rate": 1.0,
             "gridlock_detected": 1,
-        }
-
-        fitness = calculate_six_phase_fitness(
-            metrics,
-            six_phase_config={"gridlock_penalty": 100000.0},
-        )
-
-        self.assertAlmostEqual(fitness, -99900.0)
-
-    def test_dense_control_metrics_reduce_six_phase_fitness(self):
-        metrics = {
-            "throughput": 0.0,
-            "avg_wait_time": 0.0,
-            "avg_active_wait_time": 0.0,
-            "max_wait_time": 0.0,
-            "queue_lengths": {},
-            "phase_switches": 2,
-            "empty_phase_time": 3.0,
-            "intersection_blocking_time": 4.0,
-            "left_turn_delay": 5.0,
-            "right_turn_delay": 2.0,
+            "gridlock_remaining_time_s": 20.0,
         }
 
         fitness = calculate_six_phase_fitness(
             metrics,
             six_phase_config={
-                "phase_switch_penalty": 50.0,
-                "empty_phase_time_penalty": 25.0,
-                "intersection_blocking_time_penalty": 40.0,
-                "left_turn_delay_penalty": 15.0,
-                "right_turn_delay_penalty": 10.0,
+                "gridlock_penalty": 100000.0,
+                "gridlock_remaining_time_penalty": 1000.0,
             },
         )
 
-        self.assertAlmostEqual(fitness, -430.0)
+        self.assertAlmostEqual(fitness, -110000.0)
+
+    def test_dense_control_metrics_reduce_six_phase_fitness(self):
+        metrics = {
+            "throughput_rate": 0.0,
+            "transition_clearance_fraction": 0.2,
+            "wasted_green_movement_fraction": 0.3,
+            "intersection_blocking_rate": 0.4,
+            "avg_left_turn_delay": 5.0,
+            "avg_right_turn_delay": 2.0,
+        }
+
+        fitness = calculate_six_phase_fitness(
+            metrics,
+            six_phase_config={
+                "transition_clearance_fraction_penalty": 50.0,
+                "wasted_green_movement_fraction_penalty": 25.0,
+                "intersection_blocking_rate_penalty": 40.0,
+                "avg_left_turn_delay_penalty": 15.0,
+                "avg_right_turn_delay_penalty": 10.0,
+            },
+        )
+
+        self.assertAlmostEqual(fitness, -128.5)
 
     def test_worst_approach_wait_reduces_six_phase_fitness(self):
         metrics = {
@@ -634,13 +694,36 @@ class SixPhasePolicyTests(unittest.TestCase):
     def test_default_six_phase_fitness_avoids_overlapping_penalties(self):
         weights = self.config["six_phase_fitness"]
 
-        self.assertEqual(weights["turning_stuck_time_penalty"], 0.0)
-        self.assertEqual(weights["turning_stuck_event_penalty"], 0.0)
-        self.assertEqual(weights["empty_phase_time_penalty"], 0.0)
-        self.assertGreater(weights["intersection_blocking_time_penalty"], 0.0)
-        self.assertGreater(weights["left_turn_delay_penalty"], 0.0)
-        self.assertGreater(weights["right_turn_delay_penalty"], 0.0)
+        self.assertGreater(
+            weights["transition_clearance_fraction_penalty"],
+            0.0,
+        )
+        self.assertGreater(
+            weights["wasted_green_movement_fraction_penalty"],
+            0.0,
+        )
+        self.assertGreater(weights["intersection_blocking_rate_penalty"], 0.0)
+        self.assertGreater(weights["avg_left_turn_delay_penalty"], 0.0)
+        self.assertGreater(weights["avg_right_turn_delay_penalty"], 0.0)
         self.assertGreater(weights["worst_approach_wait_time_penalty"], 0.0)
+
+    def test_normal_turn_speed_does_not_create_turn_delay(self):
+        metrics = Metrics(self.config)
+        controller = SixPhaseTrafficLightController(self.config)
+        vehicle = SimpleNamespace(
+            cleared_intersection=False,
+            road_direction="north",
+            current_speed=20.0,
+            speed=50.0,
+            left_turn_speed=20.0,
+            is_turning_vehicle=True,
+            turn_side="left",
+            has_turned=False,
+        )
+
+        metrics.update_control(controller, [vehicle], dt=2.0)
+
+        self.assertAlmostEqual(metrics.get_summary()["left_turn_delay"], 0.0)
 
     def test_intersection_stuck_count_uses_physical_position_and_speed(self):
         simulation = object.__new__(Simulation)
