@@ -26,11 +26,14 @@ def parse_arguments():
     parser.add_argument(
         "--speed-factor",
         type=float,
-        default=10,
-        help=(
-            "Simulation acceleration factor (defaults to simulation.time_scale "
-            "in config.py). Higher values train faster with lower time resolution."
-        ),
+        default=1.0,
+        help="deprecated compatibility option; it no longer changes physics",
+    )
+    parser.add_argument(
+        "--timestep",
+        type=float,
+        default=1 / 30,
+        help="fixed physics timestep in seconds",
     )
     parser.add_argument("--minimum-green", type=float, default=10.0)
     parser.add_argument("--maximum-green", type=float, default=30.0)
@@ -53,6 +56,8 @@ def main():
     )
     if speed_factor <= 0:
         raise SystemExit("--speed-factor must be positive")
+    if args.timestep <= 0:
+        raise SystemExit("--timestep must be positive")
 
     def log_generation(progress):
         print(
@@ -73,6 +78,7 @@ def main():
         generations=args.generations,
         seeds=args.seeds,
         evaluation_duration_s=args.evaluation_duration,
+        timestep_s=args.timestep,
         speed_factor=speed_factor,
         progress_callback=log_generation,
         random_seed=args.random_seed,
@@ -81,7 +87,7 @@ def main():
     print(
         "Training neural policy "
         f"({args.population} candidates, {args.generations} generations, "
-        f"seeds={args.seeds}, speed={speed_factor:g}x)..."
+        f"seeds={args.seeds}, dt={args.timestep:g}s)..."
     )
     result = trainer.run()
     best = result["best"]
@@ -97,7 +103,8 @@ def main():
             "generations": args.generations,
             "seeds": args.seeds,
             "evaluation_duration_s": args.evaluation_duration,
-            "speed_factor": speed_factor,
+            "physics_timestep_s": args.timestep,
+            "speed_factor_compatibility_value": speed_factor,
             "training_time_s": result["training_time_s"],
             "fitness_weights": dict(CONFIG.get("fitness", {})),
             "hard_braking_intensity_threshold": CONFIG.get(

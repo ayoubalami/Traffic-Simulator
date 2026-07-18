@@ -39,13 +39,19 @@ CONFIG = {
         "show_vehicle_braking_rate": False,
         "vehicle_braking_rate_decimals": 2,
     },
+    "metrics": {
+        # A momentary zero-speed frame is not a meaningful traffic stop.
+        # Count a stop only after it persists, and require real movement
+        # before another stop event can be registered.
+        "vehicle_stop_min_duration_s": 1.0,
+        "vehicle_stop_resume_speed_mps": 0.8,
+    },
     "interactive_density_control": {
-        # Change direction_spawn_weights while an interactive simulation is
-        # running. These are relative arrival weights: increasing one side
-        # sends a larger share of newly spawned vehicles to that approach.
+        # Change each approach's absolute arrival rate while an interactive
+        # simulation is running. A value of zero stops new demand on that side.
         "enabled": True,
         "step": 0.05,
-        "max_weight": 10.0,
+        "max_rate_per_s": 3.0,
     },
     "traffic_lights": {
         # Adaptive policies decide whether to extend green every second after
@@ -73,20 +79,46 @@ CONFIG = {
         "yellow_duration_s": 2.0,
     },
     "movement_controller": {
+        # Start with every vehicle signal red and let the policy choose the
+        # first demanded safe movement set.  This removes the repeated fixed
+        # North/South minimum-green prefix from every training evaluation.
+        # Set False only to reproduce models evaluated with the legacy start.
+        "policy_selected_initial_phase": True,
         # Independent sigmoid outputs above this value are raw movement
         # requests. The decoder still evaluates every compatible subset.
         "output_threshold": 0.50,
+        # The movement policy has four explicit right-turn outputs. They are
+        # actuated independently, while safety masks remain non-negotiable.
+        "network_controls_right_turns": True,
         # Required utility improvement before replacing a still-useful green.
         # This prevents small score fluctuations from causing rapid switches.
         "switch_hysteresis": 0.15,
     },
     "pedestrian_signals": {
-        # Pedestrian WALK is controlled independently from the vehicle red
-        # light.  It opens only at the beginning of a compatible, stable
-        # vehicle-green phase, preventing pedestrians from entering just
-        # before traffic is released.
+        # Pedestrian WALK is independent from the circular vehicle signal.
+        # Format-3 movement policies request each crosswalk separately; older
+        # controllers retain the automatic compatible-phase WALK window.
         "enabled": True,
         "walk_duration_s": 5.0,
+        # Neural WALK requests are held for at least this long.  The output
+        # is a request score; it never bypasses vehicle/crosswalk safety.
+        "min_walk_duration_s": 5.0,
+        # Close even a continuously requested WALK after this entry window.
+        # This produces the STOP edge required by pedestrians waiting at the
+        # protected divider before a new WALK can start their second stage.
+        "max_walk_duration_s": 10.0,
+        # After WALK closes, retain a short STOP clearance before admitting a
+        # conflicting vehicle movement. Pedestrians already in the roadway
+        # keep the vehicle guard closed until they have physically cleared.
+        "clearance_duration_s": 1.0,
+        # Fairness override: a waiting pedestrian cannot remain on STOP
+        # indefinitely even if the neural score stays low.
+        "max_red_duration_s": 45.0,
+        "output_threshold": 0.50,
+        # A reported near-conflict requires the pedestrian circle to come
+        # within this distance of the vehicle's actual body polygon. Mere
+        # occupancy of different lanes in one crosswalk remains diagnostic.
+        "conflict_safety_margin_m": 0.5,
         # Split a crossing into two stages.  A pedestrian waits on the
         # protected centre divider for the next WALK signal before crossing
         # the second carriageway.
@@ -94,14 +126,20 @@ CONFIG = {
         "require_new_walk_signal_at_divider": True,
     },
     "fitness": {
-        # Fitness v2 uses normalized outcomes so coefficients do not grow
+        # Fitness v4 uses normalized outcomes so coefficients do not grow
         # merely because more vehicles spawn or an evaluation runs longer.
         "throughput_rate_reward": 10000.0,
         # Mean stopped time includes both exited and still-active vehicles.
         "avg_vehicle_wait_time_penalty": 30.0,
-        "vehicle_stop_rate_penalty": 100.0,
+        # Waiting time already captures most congestion cost. Keep the stop
+        # term smaller so timestep-sensitive stop/start jitter cannot dominate.
+        "vehicle_stop_rate_penalty": 20.0,
         # Mean pedestrian wait includes finished and active pedestrians.
         "avg_pedestrian_wait_time_penalty": 10.0,
+        # Tail wait prevents a good mean from hiding one starved crosswalk.
+        "pedestrian_wait_time_p95_penalty": 2.0,
+        # Reward actual completed crossings, not merely time showing WALK.
+        "pedestrian_completion_rate_reward": 1000.0,
         # Excess deceleration intensity is normalized per spawned vehicle.
         "avg_excess_braking_penalty": 100.0,
     },
@@ -122,6 +160,13 @@ CONFIG = {
         # entering the junction, so light traffic on other sides cannot hide
         # one neglected direction in the global average.
         "worst_approach_wait_time_penalty": 5.0,
+        # Discourage WALK requests with no waiting or crossing pedestrian.
+        "wasted_pedestrian_walk_fraction_penalty": 250.0,
+        # These should stay exactly zero under the safety decoder. A spatially
+        # close vehicle/pedestrian near-conflict (not harmless occupancy in
+        # separate lanes) effectively eliminates a candidate.
+        "vehicle_pedestrian_crosswalk_conflict_event_penalty": 100000.0,
+        "vehicle_pedestrian_crosswalk_conflict_time_penalty": 10000.0,
         # Reject policies that form a persistent blockage in the physical
         # intersection. Evaluation stops as soon as this condition is met.
         "gridlock_penalty": 100000.0,
@@ -139,49 +184,45 @@ CONFIG = {
         "traffic_profiles": [
             {
                 "name": "balanced",
-                "direction_spawn_weights": {
+                "arrival_rates_per_s": {
                     "north": 1.0,
                     "south": 1.0,
                     "east": 1.0,
                     "west": 1.0,
                 },
-                "vehicle_spawn_interval_s": 0.25,
                 "left_turn_chance": 0.25,
                 "right_turn_chance": 0.25,
             },
             {
                 "name": "north_south_peak",
-                "direction_spawn_weights": {
+                "arrival_rates_per_s": {
                     "north": 1.6,
                     "south": 1.6,
                     "east": 0.4,
                     "west": 0.4,
                 },
-                "vehicle_spawn_interval_s": 0.25,
                 "left_turn_chance": 0.25,
                 "right_turn_chance": 0.25,
             },
             {
                 "name": "east_west_peak",
-                "direction_spawn_weights": {
+                "arrival_rates_per_s": {
                     "north": 0.4,
                     "south": 0.4,
                     "east": 1.6,
                     "west": 1.6,
                 },
-                "vehicle_spawn_interval_s": 0.25,
                 "left_turn_chance": 0.25,
                 "right_turn_chance": 0.25,
             },
             {
                 "name": "turning_peak",
-                "direction_spawn_weights": {
+                "arrival_rates_per_s": {
                     "north": 1.0,
                     "south": 1.0,
                     "east": 1.0,
                     "west": 1.0,
                 },
-                "vehicle_spawn_interval_s": 0.25,
                 "left_turn_chance": 0.38,
                 "right_turn_chance": 0.32,
             },
@@ -189,19 +230,20 @@ CONFIG = {
     },
     "simulation": {
         "pixels_per_meter": 6,
-        # Simulation acceleration factor.  The interactive renderer and
-        # headless neuroevolution evaluations both use this value.  Values
-        # above 1 run faster by using larger simulation-time increments.
+        # Interactive display acceleration. Headless optimization deliberately
+        # keeps a fixed physics timestep and gets speed from parallel workers.
         "time_scale": 1.0,
-        "vehicle_spawn_interval_s": 0.5,
-        # Relative arrival rates for each enabled approach.  Set a weight to
-        # zero to prevent new vehicles from spawning on that approach.
-        "direction_spawn_weights": {
-            "north": 0.50,
-            "south": 1.50,
-            "east": 0.50,
-            "west": 0.310,
+        # Independent absolute demand in vehicles per simulation-second. The
+        # defaults preserve the previous total demand of about 2 vehicles/s.
+        "arrival_rates_per_s": {
+            "north": 0.356,
+            "south": 1.068,
+            "east": 0.356,
+            "west": 0.221,
         },
+        # Arrivals wait outside the rendered road when insertion is unsafe.
+        # This cap prevents an unbounded queue during severe congestion.
+        "max_pending_arrivals_per_direction": 100,
         "right_turn_chance" : .3250,
         "left_turn_chance"  : .3350,
         # Probability that a turning vehicle uses its indicator.
@@ -280,13 +322,21 @@ CONFIG = {
         ]
     },
     "pedestrian_defaults": {
-        "spawn_interval_min": 5.8,
-        "spawn_interval_max": 10.0,
-        "max_active": 10,
+        "spawn_interval_min": 0,
+        "spawn_interval_max": 0.0,
+        "max_active": 0,
         "walking_speed_min_mps": 1.2,
         "walking_speed_max_mps": 2.4,
         "radius": 7
     },
+    # "pedestrian_defaults": {
+    #     "spawn_interval_min": 5.8,
+    #     "spawn_interval_max": 10.0,
+    #     "max_active": 10,
+    #     "walking_speed_min_mps": 1.2,
+    #     "walking_speed_max_mps": 2.4,
+    #     "radius": 7
+    # },
     "roads": {
         "north": {"enabled": True, "incoming": 4, "outgoing": 4 ,"inverse": "south"},
         "south": {"enabled": True, "incoming": 4, "outgoing": 4 ,"inverse": "north"},

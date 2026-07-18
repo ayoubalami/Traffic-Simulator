@@ -45,7 +45,18 @@ def parse_arguments():
     parser.add_argument("--generations", type=int, default=10)
     parser.add_argument("--seeds", type=parse_seeds, default=(1,))
     parser.add_argument("--evaluation-duration", type=float, default=60.0)
-    parser.add_argument("--speed-factor", type=float, default=10.0)
+    parser.add_argument(
+        "--timestep",
+        type=float,
+        default=1 / 30,
+        help="fixed physics timestep in seconds",
+    )
+    parser.add_argument(
+        "--speed-factor",
+        type=float,
+        default=1.0,
+        help="deprecated compatibility option; it no longer changes physics",
+    )
     parser.add_argument(
         "--validation-seeds",
         type=parse_seeds,
@@ -61,7 +72,7 @@ def parse_arguments():
     parser.add_argument(
         "--skip-validation",
         action="store_true",
-        help="skip the final 1x holdout evaluation",
+        help="skip the final fixed-timestep holdout evaluation",
     )
     parser.add_argument("--minimum-green", type=float, default=10.0)
     parser.add_argument("--maximum-green", type=float, default=30.0)
@@ -90,6 +101,8 @@ def main():
     args = parse_arguments()
     if args.speed_factor <= 0:
         raise SystemExit("--speed-factor must be positive")
+    if args.timestep <= 0:
+        raise SystemExit("--timestep must be positive")
     if args.workers < 1:
         raise SystemExit("--workers must be a positive integer")
     validation_duration = (
@@ -137,6 +150,7 @@ def main():
         generations=args.generations,
         seeds=args.seeds,
         evaluation_duration_s=args.evaluation_duration,
+        timestep_s=args.timestep,
         speed_factor=args.speed_factor,
         traffic_profiles=traffic_profiles,
         workers=args.workers,
@@ -147,14 +161,14 @@ def main():
         "Training six-phase neural policy "
         f"({args.population} candidates, {args.generations} generations, "
         f"{len(traffic_profiles)} profiles, seeds={args.seeds}, "
-        f"speed={args.speed_factor:g}x, workers={trainer.workers})..."
+        f"dt={args.timestep:g}s, workers={trainer.workers})..."
     )
     result = trainer.run()
     best = result["best"]
     validation = None
     if not args.skip_validation:
         print(
-            "Validating best policy at 1x on holdout seeds "
+            "Validating best policy with the fixed physics timestep on holdout seeds "
             f"{args.validation_seeds}...",
             flush=True,
         )
@@ -163,15 +177,16 @@ def main():
             best["policy"],
             seeds=args.validation_seeds,
             duration_s=validation_duration,
+            timestep_s=args.timestep,
             speed_factor=1.0,
             traffic_profiles=traffic_profiles,
         )
         print(
-            f"Holdout fitness at 1x: {validation['mean_fitness']:.2f}",
+            f"Holdout fitness: {validation['mean_fitness']:.2f}",
             flush=True,
         )
     output = {
-        "fitness_version": 2,
+        "fitness_version": 4,
         "format_version": SIX_PHASE_POLICY_FORMAT_VERSION,
         "policy_type": "six_phase",
         "phases": list(PHASE_NAMES),
@@ -196,8 +211,8 @@ def main():
             "generations": args.generations,
             "seeds": args.seeds,
             "evaluation_duration_s": args.evaluation_duration,
-            "speed_factor": args.speed_factor,
-            "validation_speed_factor": 1.0,
+            "physics_timestep_s": args.timestep,
+            "speed_factor_compatibility_value": args.speed_factor,
             "validation_seeds": args.validation_seeds,
             "validation_duration_s": validation_duration,
             "workers": trainer.workers,

@@ -856,6 +856,144 @@ class SixPhasePolicyTests(unittest.TestCase):
 
         evaluate.assert_called_once()
         self.assertEqual(result["evaluated_seeds"], (1,))
+        self.assertEqual(result["evaluated_scenario_count"], 1)
+        self.assertEqual(
+            result["requested_scenario_count"],
+            len(self.config["six_phase_training"]["traffic_profiles"]) * 3,
+        )
+        self.assertEqual(
+            result["skipped_scenario_count"],
+            result["requested_scenario_count"] - 1,
+        )
+        self.assertAlmostEqual(result["mean_fitness"], -100000.0)
+        self.assertTrue(result["candidate_rejected"])
+
+    def test_exact_scenario_pairs_bypass_cartesian_profiles_and_seeds(self):
+        requested_pairs = (
+            ({"name": "turning", "left_turn_chance": 0.4}, 17),
+            ({"name": "quiet", "arrival_rates_per_s": {}}, 4),
+        )
+        calls = []
+
+        def evaluate_exact(*args, **kwargs):
+            profile = kwargs["traffic_profile"]
+            seed = kwargs["random_seed"]
+            calls.append((profile["name"], seed))
+            return {
+                "fitness": float(seed),
+                "metrics": {},
+                "random_seed": seed,
+                "traffic_profile": profile["name"],
+                "terminated_early": False,
+                "termination_reason": None,
+            }
+
+        policy = SimpleNamespace(select_phase=lambda *args: "ns")
+        with patch(
+            "simulation.evaluation.evaluate_six_phase_policy",
+            side_effect=evaluate_exact,
+        ):
+            result = evaluate_six_phase_policy_across_seeds(
+                self.config,
+                policy,
+                seeds=(999,),
+                traffic_profiles=({"name": "ignored"},),
+                scenario_pairs=requested_pairs,
+            )
+
+        self.assertEqual(calls, [("turning", 17), ("quiet", 4)])
+        self.assertEqual(result["requested_scenarios"], tuple(calls))
+        self.assertEqual(result["evaluated_scenarios"], tuple(calls))
+        self.assertEqual(result["skipped_scenarios"], ())
+        self.assertEqual(result["requested_scenario_count"], 2)
+        self.assertEqual(result["evaluated_scenario_count"], 2)
+        self.assertAlmostEqual(result["mean_fitness"], 10.5)
+
+    def test_gridlock_imputes_failure_fitness_for_every_skipped_scenario(self):
+        scenario_pairs = tuple(
+            ({"name": f"scenario_{index}"}, index)
+            for index in range(4)
+        )
+        completed = {
+            "fitness": 100.0,
+            "metrics": {},
+            "random_seed": 0,
+            "traffic_profile": "scenario_0",
+            "terminated_early": False,
+            "termination_reason": None,
+        }
+        gridlocked = {
+            "fitness": -100000.0,
+            "metrics": {"gridlock_detected": 1.0},
+            "random_seed": 1,
+            "traffic_profile": "scenario_1",
+            "terminated_early": True,
+            "termination_reason": "intersection_gridlock",
+        }
+        policy = SimpleNamespace(select_phase=lambda *args: "ns")
+
+        with patch(
+            "simulation.evaluation.evaluate_six_phase_policy",
+            side_effect=(completed, gridlocked),
+        ) as evaluate:
+            result = evaluate_six_phase_policy_across_seeds(
+                self.config,
+                policy,
+                scenario_pairs=scenario_pairs,
+            )
+
+        self.assertEqual(evaluate.call_count, 2)
+        self.assertEqual(result["evaluated_scenario_count"], 2)
+        self.assertEqual(result["skipped_scenario_count"], 2)
+        self.assertEqual(
+            result["skipped_scenarios"],
+            (("scenario_2", 2), ("scenario_3", 3)),
+        )
+        self.assertAlmostEqual(
+            result["mean_fitness"],
+            (100.0 - 3 * 100000.0) / 4,
+        )
+
+    def test_gridlock_does_not_skip_scenarios_when_abort_is_disabled(self):
+        config = {
+            **self.config,
+            "six_phase_fitness": {
+                **self.config.get("six_phase_fitness", {}),
+                "abort_remaining_seeds_on_gridlock": False,
+            },
+        }
+        scenario_pairs = tuple(
+            ({"name": f"scenario_{index}"}, index)
+            for index in range(3)
+        )
+
+        def gridlock_result(*args, **kwargs):
+            profile = kwargs["traffic_profile"]
+            seed = kwargs["random_seed"]
+            return {
+                "fitness": -100000.0,
+                "metrics": {"gridlock_detected": 1.0},
+                "random_seed": seed,
+                "traffic_profile": profile["name"],
+                "terminated_early": True,
+                "termination_reason": "intersection_gridlock",
+            }
+
+        policy = SimpleNamespace(select_phase=lambda *args: "ns")
+        with patch(
+            "simulation.evaluation.evaluate_six_phase_policy",
+            side_effect=gridlock_result,
+        ) as evaluate:
+            result = evaluate_six_phase_policy_across_seeds(
+                config,
+                policy,
+                scenario_pairs=scenario_pairs,
+            )
+
+        self.assertEqual(evaluate.call_count, 3)
+        self.assertEqual(result["evaluated_scenario_count"], 3)
+        self.assertEqual(result["skipped_scenario_count"], 0)
+        self.assertTrue(result["candidate_rejected"])
 
 
 if __name__ == "__main__":

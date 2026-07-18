@@ -1,8 +1,10 @@
 """Renderer-free evaluation utilities for traffic-signal optimization."""
 
+from collections.abc import Mapping
 from copy import deepcopy
 from statistics import fmean
 
+from .arrivals import resolve_arrival_rates
 from .simulation import Simulation
 
 
@@ -10,8 +12,15 @@ DIRECTIONS = ("north", "south", "east", "west")
 MEAN_METRIC_NAMES = (
     "throughput",
     "throughput_rate",
+    "arrival_insertion_rate",
+    "arrival_requests",
+    "pending_arrivals",
+    "dropped_arrivals",
+    "boundary_queue_time",
+    "avg_boundary_wait_time",
     "avg_wait_time",
     "avg_vehicle_wait_time_all",
+    "avg_system_wait_time_all",
     "total_vehicle_wait_time",
     "avg_active_wait_time",
     "stops_per_vehicle",
@@ -24,7 +33,19 @@ MEAN_METRIC_NAMES = (
     "avg_pedestrian_wait_time",
     "avg_active_pedestrian_wait_time",
     "avg_pedestrian_wait_time_all",
+    "pedestrian_wait_time_p95",
     "max_pedestrian_wait_time",
+    "pedestrian_completion_rate",
+    "pedestrian_walk_time",
+    "useful_pedestrian_walk_time",
+    "wasted_pedestrian_walk_time",
+    "wasted_pedestrian_walk_fraction",
+    "vehicle_pedestrian_crosswalk_cooccupancy_events",
+    "vehicle_pedestrian_crosswalk_cooccupancy_time",
+    "vehicle_pedestrian_crosswalk_cooccupancy_fraction",
+    "vehicle_pedestrian_crosswalk_conflict_events",
+    "vehicle_pedestrian_crosswalk_conflict_time",
+    "vehicle_pedestrian_crosswalk_conflict_fraction",
     "hard_braking_events",
     "hard_braking_vehicles",
     "hard_braking_vehicle_rate",
@@ -56,9 +77,20 @@ MEAN_METRIC_NAMES = (
     "avg_right_turn_delay",
     "paired_phase_time",
     "single_phase_time",
+    "mean_policy_output_score",
+    "policy_output_saturation_fraction",
+    "policy_request_rejection_fraction",
+    "policy_pedestrian_request_rejection_fraction",
 )
 DIRECTIONAL_MEAN_METRIC_NAMES = (
     "avg_pre_intersection_wait_time_by_direction",
+    "avg_inserted_pre_intersection_wait_time_by_direction",
+    "avg_boundary_wait_time_by_direction",
+    "arrival_requests_by_direction",
+    "pending_arrivals_by_direction",
+    "dropped_arrivals_by_direction",
+    "boundary_queue_time_by_direction",
+    "vehicles_spawned_by_direction",
 )
 
 
@@ -80,7 +112,13 @@ def _average_metrics(evaluations, metric_names):
 
 
 def _effective_timestep(config, timestep_s, speed_factor=None):
-    """Return the accelerated timestep used by headless evaluations."""
+    """Return the fixed physics timestep used by headless evaluations.
+
+    ``speed_factor`` is retained as a validated compatibility argument.  A
+    headless evaluation already runs without a frame-rate delay, so enlarging
+    its timestep changes the vehicle dynamics rather than merely making the
+    same simulation run faster.
+    """
     if speed_factor is None:
         speed_factor = config.get("simulation", {}).get("time_scale", 1.0)
     try:
@@ -89,7 +127,7 @@ def _effective_timestep(config, timestep_s, speed_factor=None):
         raise ValueError("speed_factor must be a positive number") from error
     if speed_factor <= 0:
         raise ValueError("speed_factor must be positive")
-    return timestep_s * speed_factor
+    return float(timestep_s)
 
 
 def calculate_fitness(metrics, fitness_config=None):
@@ -104,12 +142,19 @@ def calculate_fitness(metrics, fitness_config=None):
     return (
         throughput_rate
         * float(fitness_config.get("throughput_rate_reward", 10000.0))
-        - metrics.get("avg_vehicle_wait_time_all", 0.0)
+        - metrics.get(
+            "avg_system_wait_time_all",
+            metrics.get("avg_vehicle_wait_time_all", 0.0),
+        )
         * float(fitness_config.get("avg_vehicle_wait_time_penalty", 30.0))
         - metrics.get("stops_per_vehicle", 0.0)
         * float(fitness_config.get("vehicle_stop_rate_penalty", 100.0))
         - metrics.get("avg_pedestrian_wait_time_all", 0.0)
         * float(fitness_config.get("avg_pedestrian_wait_time_penalty", 10.0))
+        - metrics.get("pedestrian_wait_time_p95", 0.0)
+        * float(fitness_config.get("pedestrian_wait_time_p95_penalty", 2.0))
+        + metrics.get("pedestrian_completion_rate", 0.0)
+        * float(fitness_config.get("pedestrian_completion_rate_reward", 1000.0))
         - metrics.get("avg_excess_braking_intensity_per_vehicle", 0.0)
         * float(fitness_config.get("avg_excess_braking_penalty", 100.0))
     )
@@ -289,11 +334,42 @@ def evaluate_six_phase_policy(
         evaluation_config.setdefault("movement_controller", {}).update(
             decoder_config
         )
+    pedestrian_decoder_config = getattr(
+        policy,
+        "pedestrian_decoder_config",
+        None,
+    )
+    if pedestrian_decoder_config:
+        evaluation_config.setdefault("pedestrian_signals", {}).update(
+            pedestrian_decoder_config
+        )
     profile = traffic_profile or {"name": "configured"}
     simulation_profile = evaluation_config.setdefault("simulation", {})
-    if "direction_spawn_weights" in profile:
-        simulation_profile["direction_spawn_weights"] = dict(
-            profile["direction_spawn_weights"]
+    if "arrival_rates_per_s" in profile:
+        simulation_profile["arrival_rates_per_s"] = dict(
+            profile["arrival_rates_per_s"]
+        )
+    elif (
+        "direction_spawn_weights" in profile
+        or "vehicle_spawn_interval_s" in profile
+    ):
+        # Convert legacy profile fields even when the base configuration has
+        # already migrated to absolute rates.
+        legacy_profile = {
+            key: value
+            for key, value in simulation_profile.items()
+            if key != "arrival_rates_per_s"
+        }
+        if "direction_spawn_weights" in profile:
+            legacy_profile["direction_spawn_weights"] = dict(
+                profile["direction_spawn_weights"]
+            )
+        if "vehicle_spawn_interval_s" in profile:
+            legacy_profile["vehicle_spawn_interval_s"] = profile[
+                "vehicle_spawn_interval_s"
+            ]
+        simulation_profile["arrival_rates_per_s"] = resolve_arrival_rates(
+            legacy_profile
         )
     for key in (
         "right_turn_chance",
@@ -418,6 +494,27 @@ def calculate_six_phase_fitness(metrics, fitness_config=None, six_phase_config=N
         * float(
             six_phase_config.get("worst_approach_wait_time_penalty", 5.0)
         )
+        - metrics.get("wasted_pedestrian_walk_fraction", 0.0)
+        * float(
+            six_phase_config.get(
+                "wasted_pedestrian_walk_fraction_penalty",
+                250.0,
+            )
+        )
+        - metrics.get("vehicle_pedestrian_crosswalk_conflict_events", 0.0)
+        * float(
+            six_phase_config.get(
+                "vehicle_pedestrian_crosswalk_conflict_event_penalty",
+                100000.0,
+            )
+        )
+        - metrics.get("vehicle_pedestrian_crosswalk_conflict_time", 0.0)
+        * float(
+            six_phase_config.get(
+                "vehicle_pedestrian_crosswalk_conflict_time_penalty",
+                10000.0,
+            )
+        )
     )
 
 
@@ -429,17 +526,60 @@ def evaluate_six_phase_policy_across_seeds(
     timestep_s=1 / 30,
     speed_factor=None,
     traffic_profiles=None,
+    scenario_pairs=None,
 ):
-    seeds = tuple(seeds)
-    if not seeds:
-        raise ValueError("at least one random seed is required")
-    if traffic_profiles is None:
-        traffic_profiles = config.get("six_phase_training", {}).get(
-            "traffic_profiles",
-            (),
+    if scenario_pairs is None:
+        seeds = tuple(seeds)
+        if not seeds:
+            raise ValueError("at least one random seed is required")
+        if traffic_profiles is None:
+            traffic_profiles = config.get("six_phase_training", {}).get(
+                "traffic_profiles",
+                (),
+            )
+        traffic_profiles = tuple(traffic_profiles) or ({"name": "configured"},)
+        requested_pairs = tuple(
+            (profile, seed)
+            for profile in traffic_profiles
+            for seed in seeds
         )
-    traffic_profiles = tuple(traffic_profiles) or ({"name": "configured"},)
+        traffic_profile_names = tuple(
+            profile.get("name", "unnamed") for profile in traffic_profiles
+        )
+    else:
+        try:
+            requested_pairs = tuple(scenario_pairs)
+        except TypeError as error:
+            raise ValueError(
+                "scenario_pairs must be an iterable of (profile, seed) pairs"
+            ) from error
+        if not requested_pairs:
+            raise ValueError("at least one scenario pair is required")
+
+        normalized_pairs = []
+        for index, pair in enumerate(requested_pairs):
+            try:
+                profile, seed = pair
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    f"scenario pair {index} must contain exactly (profile, seed)"
+                ) from error
+            if not isinstance(profile, Mapping):
+                raise ValueError(f"scenario pair {index} profile must be a mapping")
+            normalized_pairs.append((profile, seed))
+        requested_pairs = tuple(normalized_pairs)
+        seeds = tuple(seed for _, seed in requested_pairs)
+        traffic_profile_names = tuple(
+            profile.get("name", "unnamed") for profile, _ in requested_pairs
+        )
+
+    requested_scenarios = tuple(
+        (profile.get("name", "unnamed"), seed)
+        for profile, seed in requested_pairs
+    )
     evaluations = []
+    fitness_samples = []
+    skipped_scenarios = ()
     abort_on_gridlock = bool(
         config.get("six_phase_fitness", {}).get(
             "abort_remaining_seeds_on_gridlock",
@@ -447,22 +587,25 @@ def evaluate_six_phase_policy_across_seeds(
         )
     )
     candidate_rejected = False
-    for profile in traffic_profiles:
-        for seed in seeds:
-            evaluation = evaluate_six_phase_policy(
-                config,
-                policy,
-                duration_s=duration_s,
-                timestep_s=timestep_s,
-                random_seed=seed,
-                speed_factor=speed_factor,
-                traffic_profile=profile,
+    for scenario_index, (profile, seed) in enumerate(requested_pairs):
+        evaluation = evaluate_six_phase_policy(
+            config,
+            policy,
+            duration_s=duration_s,
+            timestep_s=timestep_s,
+            random_seed=seed,
+            speed_factor=speed_factor,
+            traffic_profile=profile,
+        )
+        evaluations.append(evaluation)
+        fitness_samples.append(evaluation["fitness"])
+        if evaluation["terminated_early"]:
+            candidate_rejected = True
+        if abort_on_gridlock and evaluation["terminated_early"]:
+            skipped_scenarios = requested_scenarios[scenario_index + 1 :]
+            fitness_samples.extend(
+                evaluation["fitness"] for _ in skipped_scenarios
             )
-            evaluations.append(evaluation)
-            if abort_on_gridlock and evaluation["terminated_early"]:
-                candidate_rejected = True
-                break
-        if candidate_rejected:
             break
     six_phase_metric_names = MEAN_METRIC_NAMES + (
         "gridlock_detected",
@@ -471,19 +614,23 @@ def evaluate_six_phase_policy_across_seeds(
         "evaluation_elapsed_s",
     )
     return {
-        "mean_fitness": fmean(result["fitness"] for result in evaluations),
+        "mean_fitness": fmean(fitness_samples),
         "mean_metrics": _average_metrics(evaluations, six_phase_metric_names),
         "seeds": seeds,
         "evaluated_seeds": tuple(
             result["random_seed"] for result in evaluations
         ),
-        "traffic_profiles": tuple(
-            profile.get("name", "unnamed") for profile in traffic_profiles
-        ),
+        "traffic_profiles": traffic_profile_names,
+        "requested_scenarios": requested_scenarios,
         "evaluated_scenarios": tuple(
             (result["traffic_profile"], result["random_seed"])
             for result in evaluations
         ),
+        "skipped_scenarios": skipped_scenarios,
+        "requested_scenario_count": len(requested_scenarios),
+        "evaluated_scenario_count": len(evaluations),
+        "skipped_scenario_count": len(skipped_scenarios),
+        "candidate_rejected": candidate_rejected,
         "evaluations": evaluations,
     }
 

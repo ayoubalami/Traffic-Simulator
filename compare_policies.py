@@ -20,6 +20,11 @@ METRICS = (
     "stops_per_vehicle",
     "max_avg_pre_intersection_wait_time",
     "avg_pedestrian_wait_time_all",
+    "pedestrian_wait_time_p95",
+    "pedestrian_completion_rate",
+    "wasted_pedestrian_walk_fraction",
+    "vehicle_pedestrian_crosswalk_cooccupancy_fraction",
+    "vehicle_pedestrian_crosswalk_conflict_events",
     "hard_braking_vehicle_rate",
     "avg_excess_braking_intensity_per_vehicle",
     "phase_switches",
@@ -53,7 +58,7 @@ def parse_arguments():
     parser.add_argument(
         "--movement-model",
         type=Path,
-        default=Path("models/movement_policy_v1.json"),
+        default=Path("models/movement_policy_v2.json"),
     )
     parser.add_argument("--seeds", type=parse_seeds, default=(1, 2, 3))
     parser.add_argument("--evaluation-duration", type=float, default=300.0)
@@ -61,20 +66,26 @@ def parse_arguments():
         "--speed-factor",
         type=float,
         default=1.0,
-        help="use 1 for final scientific comparison",
+        help="deprecated compatibility option; it no longer changes physics",
     )
+    parser.add_argument("--timestep", type=float, default=1 / 30)
     parser.add_argument("--json-output", type=Path, default=None)
     return parser.parse_args()
 
 
 def main():
     args = parse_arguments()
+    if args.timestep <= 0:
+        raise SystemExit("--timestep must be positive")
+    if args.speed_factor <= 0:
+        raise SystemExit("--speed-factor must be positive")
     config = build_runtime_config(CONFIG)
     categorical = load_six_phase_policy(args.categorical_model)
     movement = load_movement_policy(args.movement_model)
     options = {
         "seeds": args.seeds,
         "duration_s": args.evaluation_duration,
+        "timestep_s": args.timestep,
         "speed_factor": args.speed_factor,
     }
     categorical_result = evaluate_six_phase_policy_across_seeds(
@@ -118,7 +129,8 @@ def main():
                     "movement": movement_result,
                     "seeds": args.seeds,
                     "evaluation_duration_s": args.evaluation_duration,
-                    "speed_factor": args.speed_factor,
+                    "physics_timestep_s": args.timestep,
+                    "speed_factor_compatibility_value": args.speed_factor,
                 },
                 indent=2,
             ),

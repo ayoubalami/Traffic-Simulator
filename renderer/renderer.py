@@ -2,6 +2,8 @@ import math
 
 import pygame
 
+from simulation.arrivals import resolve_arrival_rates
+
 class Renderer:
     DENSITY_DIRECTIONS = ("north", "south", "east", "west")
 
@@ -29,14 +31,15 @@ class Renderer:
     def _initialize_density_control(self):
         settings = self.config.get("interactive_density_control", {})
         self.density_control_enabled = bool(settings.get("enabled", True))
-        weights = self.config.setdefault("simulation", {}).setdefault(
-            "direction_spawn_weights",
-            {},
+        simulation_config = self.config.setdefault("simulation", {})
+        rates = simulation_config.setdefault(
+            "arrival_rates_per_s",
+            resolve_arrival_rates(simulation_config),
         )
         for direction in self.DENSITY_DIRECTIONS:
-            weights.setdefault(direction, 0.0)
-        self.initial_direction_spawn_weights = {
-            direction: float(weights[direction])
+            rates.setdefault(direction, 0.0)
+        self.initial_arrival_rates_per_s = {
+            direction: float(rates[direction])
             for direction in self.DENSITY_DIRECTIONS
         }
         self.selected_density_direction = next(
@@ -49,7 +52,7 @@ class Renderer:
         )
 
     def _handle_density_key(self, key):
-        """Handle one key press and update live direction arrival weights."""
+        """Handle one key press and update live direction arrival rates."""
         if not self.density_control_enabled:
             return False
 
@@ -67,10 +70,13 @@ class Renderer:
             self.selected_density_direction = selection_keys[key]
             return True
 
-        weights = self.config["simulation"]["direction_spawn_weights"]
+        rates = self.config["simulation"]["arrival_rates_per_s"]
         settings = self.config.get("interactive_density_control", {})
         step = max(0.0, float(settings.get("step", 0.05)))
-        max_weight = max(0.0, float(settings.get("max_weight", 10.0)))
+        max_rate = max(
+            0.0,
+            float(settings.get("max_rate_per_s", settings.get("max_weight", 10.0))),
+        )
         direction = self.selected_density_direction
 
         increase_keys = {pygame.K_UP, pygame.K_EQUALS, pygame.K_KP_PLUS}
@@ -79,22 +85,22 @@ class Renderer:
             increase_keys.add(plus_key)
 
         if key in increase_keys:
-            weights[direction] = round(
-                min(max_weight, float(weights[direction]) + step),
+            rates[direction] = round(
+                min(max_rate, float(rates[direction]) + step),
                 6,
             )
             return True
         if key in {pygame.K_DOWN, pygame.K_MINUS, pygame.K_KP_MINUS}:
-            weights[direction] = round(
-                max(0.0, float(weights[direction]) - step),
+            rates[direction] = round(
+                max(0.0, float(rates[direction]) - step),
                 6,
             )
             return True
         if key in {pygame.K_0, pygame.K_KP0}:
-            weights[direction] = 0.0
+            rates[direction] = 0.0
             return True
         if key == pygame.K_r:
-            weights.update(self.initial_direction_spawn_weights)
+            rates.update(self.initial_arrival_rates_per_s)
             return True
         return False
 
@@ -134,7 +140,7 @@ class Renderer:
             render_data.get("movement_scores"),
             render_data.get("movement_decision_debug"),
         )
-        self.draw_density_controls()
+        self.draw_density_controls(render_data.get("metrics"))
         self.draw_distance_scale()
         
         pygame.display.flip()
@@ -465,8 +471,8 @@ class Renderer:
         )
         self.screen.blit(active_footer, (panel_x + 12, panel_y + panel_height - 25))
 
-    def draw_density_controls(self):
-        """Show and explain the live per-approach arrival-weight controls."""
+    def draw_density_controls(self, metrics=None):
+        """Show live absolute demand and the off-screen boundary queues."""
         if not self.density_control_enabled:
             return
 
@@ -488,13 +494,14 @@ class Renderer:
         )
 
         title = self.font.render(
-            "Live arrival weights (relative)",
+            "Live arrivals (vehicles/s)",
             True,
             (255, 255, 255),
         )
         self.screen.blit(title, (panel_x + 10, panel_y + 8))
 
-        weights = self.config["simulation"]["direction_spawn_weights"]
+        rates = self.config["simulation"]["arrival_rates_per_s"]
+        pending = (metrics or {}).get("pending_arrivals_by_direction", {})
         roads = self.config.get("roads", {})
         labels = (
             ("north", "1 North"),
@@ -512,7 +519,7 @@ class Renderer:
             color = (90, 225, 255) if is_selected else (225, 225, 225)
             suffix = "" if is_enabled else " (road off)"
             surface = self.font.render(
-                f"[{label}]: {float(weights[direction]):.2f}{suffix}",
+                f"[{label}]: {float(rates[direction]):.2f}  Q:{int(pending.get(direction, 0))}{suffix}",
                 True,
                 color,
             )
@@ -532,11 +539,11 @@ class Renderer:
         self.screen.blit(help_2, (panel_x + 10, panel_y + 90))
 
     def draw_movement_scores(self, scores, decision_debug=None):
-        """Draw independent sigmoid scores and the safe decoded movement set."""
+        """Draw vehicle and pedestrian scores plus the safely decoded set."""
         if not scores:
             return
 
-        labels = (
+        all_labels = (
             ("north_through", "North through"),
             ("south_through", "South through"),
             ("east_through", "East through"),
@@ -545,11 +552,31 @@ class Renderer:
             ("south_left", "South left"),
             ("east_left", "East left"),
             ("west_left", "West left"),
+            ("north_right", "North right"),
+            ("south_right", "South right"),
+            ("east_right", "East right"),
+            ("west_right", "West right"),
+            ("north_walk", "North WALK"),
+            ("south_walk", "South WALK"),
+            ("east_walk", "East WALK"),
+            ("west_walk", "West WALK"),
+        )
+        labels = tuple(
+            item for item in all_labels if item[0] in scores
         )
         decision_debug = decision_debug or {}
         threshold = min(
             1.0,
             max(0.0, float(decision_debug.get("threshold", 0.5))),
+        )
+        pedestrian_threshold = min(
+            1.0,
+            max(
+                0.0,
+                float(
+                    decision_debug.get("pedestrian_threshold", threshold)
+                ),
+            ),
         )
         demanded = set(decision_debug.get("demanded") or ())
         raw_requested = set(decision_debug.get("raw_requested") or ())
@@ -557,9 +584,13 @@ class Renderer:
         active = set(decision_debug.get("active") or ())
         pending = set(decision_debug.get("pending") or ())
         phase_state = decision_debug.get("phase_state") or "-"
+        pedestrian_aware = any(
+            output in scores
+            for output in ("north_walk", "south_walk", "east_walk", "west_walk")
+        )
 
         panel_width = 320
-        panel_height = 326
+        panel_height = 126 + 25 * len(labels)
         panel_x = self.config["window"]["width"] - panel_width - 14
         panel_y = 14
         panel = pygame.Surface((panel_width, panel_height), pygame.SRCALPHA)
@@ -573,7 +604,11 @@ class Renderer:
             border_radius=4,
         )
         title = self.font.render(
-            "Movement outputs (independent sigmoid)",
+            (
+                "Vehicle + pedestrian outputs"
+                if pedestrian_aware
+                else "Movement outputs (legacy)"
+            ),
             True,
             (255, 255, 255),
         )
@@ -581,7 +616,6 @@ class Renderer:
 
         bar_x = panel_x + 126
         bar_width = 120
-        threshold_x = bar_x + round(bar_width * threshold)
         row_y = panel_y + 42
         for movement, label in labels:
             score = min(1.0, max(0.0, float(scores.get(movement, 0.0))))
@@ -611,6 +645,12 @@ class Renderer:
                     (bar_x, row_y + 2, fill_width, 12),
                     border_radius=2,
                 )
+            row_threshold = (
+                pedestrian_threshold
+                if movement.endswith("_walk")
+                else threshold
+            )
+            threshold_x = bar_x + round(bar_width * row_threshold)
             pygame.draw.line(
                 self.screen,
                 (235, 235, 235),
@@ -631,7 +671,10 @@ class Renderer:
         footer_lines = (
             f"Raw: {len(raw_requested)}  Safe set: {len(decoded)}",
             f"Active: {len(active)}  Pending: {len(pending)}",
-            f"Threshold: {threshold:.2f}  State: {phase_state}",
+            (
+                f"Threshold V:{threshold:.2f} P:{pedestrian_threshold:.2f} "
+                f"State:{phase_state}"
+            ),
         )
         for index, footer_text in enumerate(footer_lines):
             self.screen.blit(
