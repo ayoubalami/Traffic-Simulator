@@ -184,6 +184,47 @@ class MovementEvolutionTests(unittest.TestCase):
         self.assertEqual(len(result["history"]), 2)
         self.assertIn("sigma_mean", result["history"][0])
         self.assertTrue(result["history"][0]["anchor_evaluated"])
+        self.assertEqual(result["history"][0]["anchor_scenarios_count"], 4)
+        self.assertIn("global_best_raw_mean_fitness", result["history"][0])
+        self.assertIn("global_best_robust_fitness", result["history"][0])
+
+    def test_anchor_defaults_to_all_profile_seed_scenarios(self):
+        trainer = self.trainer(promotion_scenarios=1)
+
+        self.assertEqual(len(trainer.anchor_scenarios), 4)
+        self.assertEqual(
+            {
+                (profile["name"], seed)
+                for profile, seed in trainer.anchor_scenarios
+            },
+            {
+                (profile["name"], seed)
+                for profile in self.profiles
+                for seed in (1, 2)
+            },
+        )
+
+    def test_anchor_cap_is_stratified_across_profiles_and_seeds(self):
+        profiles = tuple({"name": f"profile_{index}"} for index in range(4))
+        trainer = self.trainer(
+            traffic_profiles=profiles,
+            seeds=(1, 2, 3),
+            anchor_scenarios_count=4,
+        )
+
+        self.assertEqual(len(trainer.anchor_scenarios), 4)
+        self.assertEqual(
+            {profile["name"] for profile, _ in trainer.anchor_scenarios},
+            {profile["name"] for profile in profiles},
+        )
+        self.assertGreater(
+            len({seed for _, seed in trainer.anchor_scenarios}),
+            1,
+        )
+
+    def test_anchor_cap_cannot_exceed_scenario_pool(self):
+        with self.assertRaisesRegex(ValueError, "cannot exceed"):
+            self.trainer(anchor_scenarios_count=5)
 
     def test_warm_start_is_the_initial_distribution_center(self):
         warm_policy = MovementPolicy(

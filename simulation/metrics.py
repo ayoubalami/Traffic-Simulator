@@ -45,6 +45,10 @@ class Metrics:
         self.simulation_time = 0.0
         self.total_vehicles_spawned = 0
         self.total_vehicles_exited = 0
+        self.total_emergency_vehicles_spawned = 0
+        self.total_emergency_vehicles_exited = 0
+        self.total_emergency_vehicle_wait_time = 0.0
+        self.max_emergency_vehicle_wait_time = 0.0
         self.left_turn_vehicles_spawned = 0
         self.right_turn_vehicles_spawned = 0
         self.total_wait_time = 0.0
@@ -73,10 +77,18 @@ class Metrics:
         self.movement_set_changes = 0
         self.changed_movement_count = 0
         self.transition_clearance_time = 0.0
+        self.yellow_clearance_time = 0.0
+        self.all_red_time = 0.0
+        self.scheduled_all_red_time = 0.0
+        self.safety_blocked_all_red_time = 0.0
+        self.initial_idle_all_red_time = 0.0
+        self.all_red_stopped_vehicle_time = 0.0
         self.total_green_movement_time = 0.0
         self.useful_green_movement_time = 0.0
         self.wasted_green_movement_time = 0.0
         self.empty_phase_time = 0.0
+        self.empty_green_gap_outs = 0
+        self.emergency_preemptions = 0
         self.intersection_blocking_time = 0.0
         self.left_turn_delay = 0.0
         self.right_turn_delay = 0.0
@@ -141,7 +153,13 @@ class Metrics:
             self.pending_arrivals_by_direction[direction] = pending
             self.boundary_queue_time_by_direction[direction] += pending * dt
 
-    def register_vehicle(self, vehicle_id, direction=None, turn_side=None):
+    def register_vehicle(
+        self,
+        vehicle_id,
+        direction=None,
+        turn_side=None,
+        is_emergency=False,
+    ):
         if vehicle_id in self.vehicles_tracked:
             return
         turn_side = turn_side if turn_side in ("left", "right") else None
@@ -152,6 +170,7 @@ class Metrics:
             "spawn_time": self.simulation_time,
             "direction": direction,
             "turn_side": turn_side,
+            "is_emergency": bool(is_emergency),
             "was_stopped": False,
             "stop_candidate_elapsed_s": 0.0,
             "previous_speed": None,
@@ -162,6 +181,8 @@ class Metrics:
         }
 
         self.total_vehicles_spawned += 1
+        if is_emergency:
+            self.total_emergency_vehicles_spawned += 1
         if turn_side == "left":
             self.left_turn_vehicles_spawned += 1
         elif turn_side == "right":
@@ -179,6 +200,7 @@ class Metrics:
                     id(v),
                     v.road_direction,
                     getattr(v, "turn_side", None),
+                    getattr(v, "is_emergency", False),
                 )
 
             data = self.vehicles_tracked[id(v)]
@@ -191,6 +213,9 @@ class Metrics:
                     self.left_turn_vehicles_spawned += 1
                 else:
                     self.right_turn_vehicles_spawned += 1
+            if not data["is_emergency"] and getattr(v, "is_emergency", False):
+                data["is_emergency"] = True
+                self.total_emergency_vehicles_spawned += 1
             v.hard_braking_highlight_remaining_s = max(
                 0.0,
                 getattr(v, "hard_braking_highlight_remaining_s", 0.0) - dt,
@@ -287,6 +312,11 @@ class Metrics:
                     data["was_stopped"] = False
 
             self.max_wait_time = max(self.max_wait_time, data["wait_time"])
+            if data["is_emergency"]:
+                self.max_emergency_vehicle_wait_time = max(
+                    self.max_emergency_vehicle_wait_time,
+                    data["wait_time"],
+                )
             if v.stopped and not v.cleared_intersection:
                 direction = v.road_direction
                 if direction in self.queue_lengths:
@@ -366,8 +396,67 @@ class Metrics:
                 raw_pedestrian.difference(decoded_pedestrian)
             ) * dt
         active_phase = light_controller.active_phase
-        if light_controller.phase_state in ("yellow", "all_red"):
+        self.empty_green_gap_outs = max(
+            self.empty_green_gap_outs,
+            int(getattr(light_controller, "empty_green_gap_out_count", 0)),
+        )
+        self.emergency_preemptions = max(
+            self.emergency_preemptions,
+            int(getattr(light_controller, "emergency_preemption_count", 0)),
+        )
+        if light_controller.phase_state == "yellow":
+            self.yellow_clearance_time += dt
             self.transition_clearance_time += dt
+        elif light_controller.phase_state == "all_red":
+            self.all_red_time += dt
+            stopped_before_entry = sum(
+                bool(
+                    getattr(vehicle, "stopped", False)
+                    and not getattr(vehicle, "cleared_intersection", False)
+                )
+                for vehicle in vehicles
+            )
+            self.all_red_stopped_vehicle_time += stopped_before_entry * dt
+
+            awaiting_initial_demand = bool(
+                getattr(light_controller, "_awaiting_initial_movement", False)
+                and getattr(light_controller, "pending_movements", None) is None
+            )
+            if awaiting_initial_demand:
+                # No movement has been requested yet. This is startup/idle
+                # time, not clearance caused by a policy switch.
+                self.initial_idle_all_red_time += dt
+            else:
+                clearance_duration = max(
+                    0.0,
+                    float(
+                        getattr(
+                            light_controller,
+                            "all_red_clearance_duration",
+                            0.0,
+                        )
+                    ),
+                )
+                interval_end = max(
+                    0.0,
+                    float(getattr(light_controller, "timer", 0.0)),
+                )
+                interval_start = max(0.0, interval_end - dt)
+                if clearance_duration > 0.0 and interval_end <= 1e-12:
+                    # The controller has just changed yellow -> all-red and
+                    # reset its timer during this update step.
+                    scheduled = dt
+                else:
+                    scheduled = max(
+                        0.0,
+                        min(interval_end, clearance_duration)
+                        - min(interval_start, clearance_duration),
+                    )
+                scheduled = min(dt, scheduled)
+                safety_blocked = max(0.0, dt - scheduled)
+                self.scheduled_all_red_time += scheduled
+                self.safety_blocked_all_red_time += safety_blocked
+                self.transition_clearance_time += dt
         if light_controller.phase_state == "green":
             if self.previous_active_phase is None:
                 self.phase_activation_counts[active_phase] = 1
@@ -602,6 +691,9 @@ class Metrics:
             self.total_vehicles_exited += 1
             data = self.vehicles_tracked[vehicle_id]
             self.total_wait_time += data["wait_time"]
+            if data["is_emergency"]:
+                self.total_emergency_vehicles_exited += 1
+                self.total_emergency_vehicle_wait_time += data["wait_time"]
             self.total_stops += data["stops"]
             self.total_travel_time += self.simulation_time - data["spawn_time"]
             del self.vehicles_tracked[vehicle_id]
@@ -623,6 +715,23 @@ class Metrics:
             self.total_vehicles_spawned,
         )
         avg_active_wait = sum(active_wait_times) / max(1, len(active_wait_times))
+        active_emergency_wait_times = [
+            data["wait_time"]
+            for data in self.vehicles_tracked.values()
+            if data["is_emergency"]
+        ]
+        total_emergency_vehicle_wait_time = (
+            self.total_emergency_vehicle_wait_time
+            + sum(active_emergency_wait_times)
+        )
+        avg_emergency_vehicle_wait_time_all = (
+            total_emergency_vehicle_wait_time
+            / max(1, self.total_emergency_vehicles_spawned)
+        )
+        emergency_vehicle_completion_rate = (
+            self.total_emergency_vehicles_exited
+            / max(1, self.total_emergency_vehicles_spawned)
+        )
         active_pedestrian_wait_times = [
             data["wait_time"] for data in self.pedestrians_tracked.values()
         ]
@@ -767,6 +876,28 @@ class Metrics:
             self.transition_clearance_time
             / max(1e-9, self.simulation_time)
         )
+        yellow_clearance_fraction = (
+            self.yellow_clearance_time / max(1e-9, self.simulation_time)
+        )
+        all_red_fraction = self.all_red_time / max(
+            1e-9,
+            self.simulation_time,
+        )
+        scheduled_all_red_fraction = (
+            self.scheduled_all_red_time / max(1e-9, self.simulation_time)
+        )
+        safety_blocked_all_red_fraction = (
+            self.safety_blocked_all_red_time
+            / max(1e-9, self.simulation_time)
+        )
+        initial_idle_all_red_fraction = (
+            self.initial_idle_all_red_time
+            / max(1e-9, self.simulation_time)
+        )
+        avg_all_red_stopped_wait_time = (
+            self.all_red_stopped_vehicle_time
+            / max(1, throughput_denominator)
+        )
         intersection_blocking_rate = (
             self.intersection_blocking_time
             / max(1e-9, self.simulation_time)
@@ -824,6 +955,24 @@ class Metrics:
             "avg_vehicle_wait_time_all": avg_vehicle_wait_time_all,
             "avg_system_wait_time_all": avg_system_wait_time_all,
             "total_vehicle_wait_time": total_vehicle_wait_time,
+            "total_emergency_vehicles_spawned": (
+                self.total_emergency_vehicles_spawned
+            ),
+            "total_emergency_vehicles_exited": (
+                self.total_emergency_vehicles_exited
+            ),
+            "emergency_vehicle_completion_rate": (
+                emergency_vehicle_completion_rate
+            ),
+            "total_emergency_vehicle_wait_time": (
+                total_emergency_vehicle_wait_time
+            ),
+            "avg_emergency_vehicle_wait_time_all": (
+                avg_emergency_vehicle_wait_time_all
+            ),
+            "max_emergency_vehicle_wait_time": (
+                self.max_emergency_vehicle_wait_time
+            ),
             "avg_stops": avg_stops,
             "stops_per_vehicle": stops_per_vehicle,
             "avg_travel_time": avg_travel_time,
@@ -903,6 +1052,26 @@ class Metrics:
             "changed_movement_count": self.changed_movement_count,
             "transition_clearance_time": self.transition_clearance_time,
             "transition_clearance_fraction": transition_clearance_fraction,
+            "yellow_clearance_time": self.yellow_clearance_time,
+            "yellow_clearance_fraction": yellow_clearance_fraction,
+            "all_red_time": self.all_red_time,
+            "all_red_fraction": all_red_fraction,
+            "scheduled_all_red_time": self.scheduled_all_red_time,
+            "scheduled_all_red_fraction": scheduled_all_red_fraction,
+            "safety_blocked_all_red_time": (
+                self.safety_blocked_all_red_time
+            ),
+            "safety_blocked_all_red_fraction": (
+                safety_blocked_all_red_fraction
+            ),
+            "initial_idle_all_red_time": self.initial_idle_all_red_time,
+            "initial_idle_all_red_fraction": initial_idle_all_red_fraction,
+            "all_red_stopped_vehicle_time": (
+                self.all_red_stopped_vehicle_time
+            ),
+            "avg_all_red_stopped_wait_time": (
+                avg_all_red_stopped_wait_time
+            ),
             "total_green_movement_time": self.total_green_movement_time,
             "useful_green_movement_time": self.useful_green_movement_time,
             "wasted_green_movement_time": self.wasted_green_movement_time,
@@ -911,6 +1080,8 @@ class Metrics:
                 wasted_green_movement_fraction
             ),
             "empty_phase_time": self.empty_phase_time,
+            "empty_green_gap_outs": self.empty_green_gap_outs,
+            "emergency_preemptions": self.emergency_preemptions,
             "intersection_blocking_time": self.intersection_blocking_time,
             "intersection_blocking_rate": intersection_blocking_rate,
             "left_turn_delay": self.left_turn_delay,

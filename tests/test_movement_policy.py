@@ -162,6 +162,31 @@ class MovementPolicyTests(unittest.TestCase):
         self.assertEqual(controller.states["east"], "green")
         self.assertEqual(controller.states["north"], "red")
 
+    def test_startup_accepts_low_score_right_only_demand(self):
+        config = self.startup_config()
+        config["traffic_lights"]["all_red_clearance_duration_s"] = 0.05
+        controller = MovementTrafficLightController(config)
+        observation = self.observation(
+            vehicles={"east": 1},
+            right={"east": 1},
+        )
+        observation["active_movements"] = ()
+        controller.set_phase_observation_provider(lambda: observation)
+        controller.set_movement_score_provider(
+            lambda current: {
+                movement: 0.1 if movement == "east_right" else 0.0
+                for movement in MOVEMENT_NAMES
+            }
+        )
+
+        controller.update(0.01)
+        self.assertEqual(controller.pending_movements, frozenset())
+        controller.update(0.06)
+
+        self.assertEqual(controller.phase_state, "green")
+        self.assertEqual(controller.active_movements, frozenset())
+        self.assertEqual(controller.get_right_turn_state("east"), "green")
+
     def test_minimum_green_begins_after_initial_phase_activation(self):
         config = self.startup_config()
         timing = config["traffic_lights"]
@@ -417,6 +442,36 @@ class MovementPolicyTests(unittest.TestCase):
         self.assertEqual(controller.active_movements, frozenset())
         self.assertEqual(controller.get_right_turn_state("east"), "green")
 
+    def test_low_score_right_only_demand_clears_an_empty_main_phase(self):
+        timing = self.config["traffic_lights"]
+        timing["min_green_duration_s"] = 0.1
+        timing["max_green_duration_s"] = 1.0
+        timing["green_extension_check_interval_s"] = 0.1
+        timing["yellow_duration_s"] = 0.1
+        timing["all_red_clearance_duration_s"] = 0.05
+        controller = MovementTrafficLightController(self.config)
+        observation = self.observation(
+            vehicles={"east": 1},
+            right={"east": 1},
+        )
+        controller.set_phase_observation_provider(lambda: observation)
+        controller.set_movement_score_provider(
+            lambda current: {
+                movement: 0.1 if movement == "east_right" else 0.0
+                for movement in MOVEMENT_NAMES
+            }
+        )
+
+        controller.update(0.11)
+        self.assertEqual(controller.phase_state, "yellow")
+        controller.update(0.11)
+        self.assertEqual(controller.phase_state, "all_red")
+        controller.update(0.06)
+
+        self.assertEqual(controller.phase_state, "green")
+        self.assertEqual(controller.active_movements, frozenset())
+        self.assertEqual(controller.get_right_turn_state("east"), "green")
+
     def test_decoder_selects_multiple_compatible_through_movements(self):
         controller = MovementTrafficLightController(self.config)
         observation = self.observation(vehicles={"north": 5, "south": 4})
@@ -539,6 +594,107 @@ class MovementPolicyTests(unittest.TestCase):
         self.assertIn("north_through", decoded)
         self.assertNotIn("east_through", decoded)
         self.assertTrue(controller.is_conflict_free(decoded))
+
+    def test_queue_pressure_outweighs_one_higher_network_score(self):
+        self.config["movement_controller"]["switch_hysteresis"] = 0.15
+        controller = MovementTrafficLightController(self.config)
+        observation = self.observation(
+            vehicles={"north": 1, "east": 10},
+        )
+        scores = {movement: 0.0 for movement in MOVEMENT_NAMES}
+        scores.update({"north_through": 0.547, "east_through": 0.353})
+
+        decoded = controller.decode_scores(scores, observation)
+
+        self.assertEqual(decoded, frozenset(("east_through",)))
+
+    def test_empty_green_gaps_out_to_a_real_competing_queue(self):
+        timing = self.config["traffic_lights"]
+        timing["min_green_duration_s"] = 0.2
+        timing["green_extension_check_interval_s"] = 0.05
+        timing["yellow_duration_s"] = 0.1
+        self.config["movement_controller"]["empty_green_gap_out_s"] = 0.1
+        controller = MovementTrafficLightController(self.config)
+        observation = self.observation(
+            vehicles={"north": 1, "east": 5},
+        )
+        observation["near_stop_movement_counts"] = {
+            movement: int(movement == "east_through") * 5
+            for movement in MOVEMENT_NAMES
+        }
+        observation["queued_movement_counts"] = dict(
+            observation["near_stop_movement_counts"]
+        )
+        controller.set_phase_observation_provider(lambda: observation)
+        controller.set_movement_score_provider(
+            lambda current: {
+                movement: (
+                    0.9 if movement == "north_through"
+                    else 0.1 if movement == "east_through"
+                    else 0.0
+                )
+                for movement in MOVEMENT_NAMES
+            }
+        )
+
+        controller.update(0.19)
+        self.assertEqual(controller.phase_state, "green")
+        controller.update(0.02)
+
+        self.assertEqual(controller.phase_state, "yellow")
+        self.assertEqual(
+            controller.pending_movements,
+            frozenset(("east_through",)),
+        )
+        self.assertEqual(controller.empty_green_gap_out_count, 1)
+
+    def test_empty_green_gap_timer_resets_for_an_approaching_vehicle(self):
+        self.config["movement_controller"]["empty_green_gap_out_s"] = 0.1
+        controller = MovementTrafficLightController(self.config)
+        observation = self.observation(
+            vehicles={"north": 1, "east": 5},
+        )
+        near_stop = {movement: 0 for movement in MOVEMENT_NAMES}
+        queued = {movement: 0 for movement in MOVEMENT_NAMES}
+        near_stop["east_through"] = 5
+        queued["east_through"] = 5
+        observation["near_stop_movement_counts"] = near_stop
+        observation["queued_movement_counts"] = queued
+        controller.set_phase_observation_provider(lambda: observation)
+
+        controller.update(0.06)
+        self.assertAlmostEqual(controller.empty_green_elapsed, 0.06)
+        near_stop["north_through"] = 1
+        controller.update(0.01)
+        self.assertEqual(controller.empty_green_elapsed, 0.0)
+        near_stop["north_through"] = 0
+        controller.update(0.06)
+
+        self.assertEqual(controller.phase_state, "green")
+        self.assertAlmostEqual(controller.empty_green_elapsed, 0.06)
+
+    def test_empty_green_without_competing_queue_does_not_gap_out(self):
+        timing = self.config["traffic_lights"]
+        timing["min_green_duration_s"] = 0.1
+        timing["green_extension_check_interval_s"] = 0.05
+        self.config["movement_controller"]["empty_green_gap_out_s"] = 0.05
+        controller = MovementTrafficLightController(self.config)
+        observation = self.observation()
+        observation["near_stop_movement_counts"] = {
+            movement: 0 for movement in MOVEMENT_NAMES
+        }
+        observation["queued_movement_counts"] = {
+            movement: 0 for movement in MOVEMENT_NAMES
+        }
+        controller.set_phase_observation_provider(lambda: observation)
+        controller.set_movement_score_provider(
+            lambda current: {movement: 0.0 for movement in MOVEMENT_NAMES}
+        )
+
+        controller.update(0.2)
+
+        self.assertEqual(controller.phase_state, "green")
+        self.assertEqual(controller.empty_green_gap_out_count, 0)
 
     def test_pedestrian_guard_masks_unsafe_candidate(self):
         controller = MovementTrafficLightController(self.config)

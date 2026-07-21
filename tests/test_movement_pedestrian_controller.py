@@ -9,6 +9,9 @@ class MovementPedestrianControllerTests(unittest.TestCase):
 
     def setUp(self):
         self.config = build_runtime_config(CONFIG)
+        self.config.setdefault("road_users", {})[
+            "pedestrians_enabled"
+        ] = True
         # These tests arrange established green/pedestrian states directly;
         # policy-selected startup is covered separately by movement tests.
         self.config["movement_controller"][

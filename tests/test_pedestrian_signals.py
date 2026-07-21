@@ -16,6 +16,9 @@ class FixedRandom:
 class PedestrianSignalTests(unittest.TestCase):
     def setUp(self):
         self.config = build_runtime_config(CONFIG)
+        self.config.setdefault("road_users", {})[
+            "pedestrians_enabled"
+        ] = True
 
     def test_walk_window_is_separate_from_vehicle_red(self):
         controller = TrafficLightController(self.config)

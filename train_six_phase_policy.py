@@ -186,7 +186,7 @@ def main():
             flush=True,
         )
     output = {
-        "fitness_version": 4,
+        "fitness_version": 5,
         "format_version": SIX_PHASE_POLICY_FORMAT_VERSION,
         "policy_type": "six_phase",
         "phases": list(PHASE_NAMES),

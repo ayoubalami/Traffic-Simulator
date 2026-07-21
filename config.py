@@ -53,6 +53,12 @@ CONFIG = {
         "step": 0.05,
         "max_rate_per_s": 3.0,
     },
+    "road_users": {
+        # First paper configuration: optimize only vehicle signal movements.
+        # Set this to True, restore a positive pedestrian max_active value,
+        # and train a combined policy for the later pedestrian experiment.
+        "pedestrians_enabled": False,
+    },
     "traffic_lights": {
         # Adaptive policies decide whether to extend green every second after
         # the minimum.  The maximum is a fairness/safety guardrail, not a
@@ -93,9 +99,19 @@ CONFIG = {
         # Required utility improvement before replacing a still-useful green.
         # This prevents small score fluctuations from causing rapid switches.
         "switch_hysteresis": 0.15,
+        # Once an emergency movement receives green, do not let a conflicting
+        # emergency reverse it on the next inference tick. It keeps priority
+        # until it clears, or until this bounded service window expires.
+        "emergency_min_green_duration_s": 10.0,
+        # Actuated gap-out: when no queued/near-stop vehicle can use the active
+        # green while another movement has a queue, request a new phase after
+        # this debounce instead of waiting for the full maximum green.
+        "empty_green_gap_out_s": 2.0,
+        "empty_green_detection_distance_m": 15.0,
     },
     "pedestrian_signals": {
-        # Pedestrian WALK is independent from the circular vehicle signal.
+        # Used only when road_users.pedestrians_enabled is True. Pedestrian
+        # WALK is independent from the circular vehicle signal.
         # Format-3 movement policies request each crosswalk separately; older
         # controllers retain the automatic compatible-phase WALK window.
         "enabled": True,
@@ -126,11 +142,14 @@ CONFIG = {
         "require_new_walk_signal_at_divider": True,
     },
     "fitness": {
-        # Fitness v4 uses normalized outcomes so coefficients do not grow
-        # merely because more vehicles spawn or an evaluation runs longer.
+        # Fitness v5 uses normalized outcomes and gives emergency delay an
+        # explicit cost, so rare priority vehicles cannot be averaged away.
         "throughput_rate_reward": 10000.0,
         # Mean stopped time includes both exited and still-active vehicles.
         "avg_vehicle_wait_time_penalty": 30.0,
+        # Emergency delay is charged again at a higher rate so rare emergency
+        # vehicles cannot disappear inside the fleet-wide average.
+        "avg_emergency_vehicle_wait_time_penalty": 100.0,
         # Waiting time already captures most congestion cost. Keep the stop
         # term smaller so timestep-sensitive stop/start jitter cannot dominate.
         "vehicle_stop_rate_penalty": 20.0,
@@ -245,12 +264,12 @@ CONFIG = {
         # This cap prevents an unbounded queue during severe congestion.
         "max_pending_arrivals_per_direction": 100,
         "right_turn_chance" : .3250,
-        "left_turn_chance"  : .3350,
+        "left_turn_chance"  : .2350,
         # Probability that a turning vehicle uses its indicator.
         "turn_signal_use_chance": 0.50,
         # A small chance per spawn keeps emergency vehicles occasional while
         # making the feature visible during a normal simulation run.
-        "emergency_vehicle_spawn_chance": 0.01
+        "emergency_vehicle_spawn_chance": 0.04
     },
     "vehicle_defaults": {
         "max_speed_kmh": 50,
@@ -344,6 +363,50 @@ CONFIG = {
         "west": {"enabled": True, "incoming": 4  , "outgoing": 4 ,"inverse": "east"}
     }
 }
+
+
+VEHICLES_ONLY_SCOPE = "vehicles_only"
+VEHICLES_AND_PEDESTRIANS_SCOPE = "vehicles_and_pedestrians"
+MOVEMENT_CONTROL_SCOPES = (
+    VEHICLES_ONLY_SCOPE,
+    VEHICLES_AND_PEDESTRIANS_SCOPE,
+)
+PEDESTRIAN_FITNESS_KEYS = (
+    "avg_pedestrian_wait_time_penalty",
+    "pedestrian_wait_time_p95_penalty",
+    "pedestrian_completion_rate_reward",
+)
+PEDESTRIAN_SIX_PHASE_FITNESS_KEYS = (
+    "wasted_pedestrian_walk_fraction_penalty",
+    "vehicle_pedestrian_crosswalk_conflict_event_penalty",
+    "vehicle_pedestrian_crosswalk_conflict_time_penalty",
+)
+
+
+def apply_movement_control_scope(runtime_config, control_scope):
+    """Apply one explicit, reversible road-user scope to a runtime config."""
+    if control_scope not in MOVEMENT_CONTROL_SCOPES:
+        raise ValueError(f"unknown movement control scope: {control_scope}")
+
+    pedestrians_enabled = control_scope == VEHICLES_AND_PEDESTRIANS_SCOPE
+    runtime_config.setdefault("road_users", {})[
+        "pedestrians_enabled"
+    ] = pedestrians_enabled
+    return runtime_config
+
+
+def movement_fitness_weights_for_scope(runtime_config, control_scope):
+    """Return the effective, publication-ready weights for one scope."""
+    if control_scope not in MOVEMENT_CONTROL_SCOPES:
+        raise ValueError(f"unknown movement control scope: {control_scope}")
+    fitness = dict(runtime_config.get("fitness", {}))
+    six_phase_fitness = dict(runtime_config.get("six_phase_fitness", {}))
+    if control_scope == VEHICLES_ONLY_SCOPE:
+        for key in PEDESTRIAN_FITNESS_KEYS:
+            fitness[key] = 0.0
+        for key in PEDESTRIAN_SIX_PHASE_FITNESS_KEYS:
+            six_phase_fitness[key] = 0.0
+    return fitness, six_phase_fitness
 
 
 def build_runtime_config(config=CONFIG):

@@ -8,6 +8,7 @@ from .traffic_light import (
     SixPhaseTrafficLightController,
     TrafficLightController,
 )
+from .fixed_time import FixedTimeMovementTrafficLightController
 from .metrics import Metrics
 from .arrivals import DIRECTIONS, resolve_arrival_rates
 from .crosswalk_geometry import (
@@ -24,22 +25,45 @@ class Simulation:
         extension_decider=None,
         phase_selector=None,
         movement_score_provider=None,
+        fixed_time_plan=None,
     ):
         if phase_selector is not None and movement_score_provider is not None:
             raise ValueError(
                 "phase_selector and movement_score_provider are mutually exclusive"
             )
+        if fixed_time_plan is not None and any(
+            control is not None
+            for control in (
+                duration_selector,
+                extension_decider,
+                phase_selector,
+                movement_score_provider,
+            )
+        ):
+            raise ValueError(
+                "fixed_time_plan is mutually exclusive with adaptive "
+                "controller callbacks"
+            )
         self.config = config
         self.random = random.Random(random_seed) if random_seed is not None else random
-        if movement_score_provider is not None:
+        if fixed_time_plan is not None:
+            controller_class = FixedTimeMovementTrafficLightController
+        elif movement_score_provider is not None:
             controller_class = MovementTrafficLightController
         elif phase_selector is not None:
             controller_class = SixPhaseTrafficLightController
         else:
             controller_class = TrafficLightController
-        self.light_controller = controller_class(config)
+        self.light_controller = (
+            controller_class(config, fixed_time_plan)
+            if fixed_time_plan is not None
+            else controller_class(config)
+        )
         self.vehicles = []
         self.pedestrians = []
+        self.pedestrians_enabled = bool(
+            config.get("road_users", {}).get("pedestrians_enabled", True)
+        )
         self._crosswalk_rectangles = crosswalk_rectangles(config)
         self._last_signal_observation = None
         simulation_config = config.get("simulation", {})
@@ -91,6 +115,7 @@ class Simulation:
             self.light_controller.set_movement_score_provider(
                 lambda observation: movement_score_provider(observation)
             )
+        if movement_score_provider is not None or fixed_time_plan is not None:
             self.light_controller.set_phase_observation_provider(
                 lambda: self.get_signal_observation(
                     self.light_controller.active_phase
@@ -120,35 +145,37 @@ class Simulation:
         self._update_lane_changes(dt)
         self._update_vehicles(dt)
         self._remove_off_screen()
-        self._update_pedestrians(dt)
+        if self.pedestrians_enabled:
+            self._update_pedestrians(dt)
         self.metrics.update(self.vehicles, dt)
         crosswalk_observation = self._last_signal_observation
         if crosswalk_observation is None:
             crosswalk_observation = self.get_signal_observation(
                 self.light_controller.active_phase
             )
-        self.metrics.update_crosswalk_safety(
-            crosswalk_observation.get(
-                "active_crossing_pedestrian_counts",
-                {},
-            ),
-            crosswalk_observation.get(
-                "crosswalk_vehicle_occupancy_counts",
-                {},
-            ),
-            crosswalk_observation.get("waiting_pedestrian_counts", {}),
-            {
-                crossing: self.light_controller.get_pedestrian_state(
-                    crossing
-                )
-                for crossing in DIRECTIONS
-            },
-            dt,
-            conflict_counts=crosswalk_observation.get(
-                "vehicle_pedestrian_crosswalk_conflict_counts",
-                {},
-            ),
-        )
+        if self.pedestrians_enabled:
+            self.metrics.update_crosswalk_safety(
+                crosswalk_observation.get(
+                    "active_crossing_pedestrian_counts",
+                    {},
+                ),
+                crosswalk_observation.get(
+                    "crosswalk_vehicle_occupancy_counts",
+                    {},
+                ),
+                crosswalk_observation.get("waiting_pedestrian_counts", {}),
+                {
+                    crossing: self.light_controller.get_pedestrian_state(
+                        crossing
+                    )
+                    for crossing in DIRECTIONS
+                },
+                dt,
+                conflict_counts=crosswalk_observation.get(
+                    "vehicle_pedestrian_crosswalk_conflict_counts",
+                    {},
+                ),
+            )
         gridlock_config = self.config.get("six_phase_fitness", {})
         intersection_stuck_vehicles = self.count_stuck_vehicles_in_intersection(
             gridlock_config.get("gridlock_speed_threshold_mps", 0.5)
@@ -273,6 +300,7 @@ class Simulation:
                     id(candidate),
                     direction,
                     getattr(candidate, "turn_side", None),
+                    getattr(candidate, "is_emergency", False),
                 )
                 return True
         return False
@@ -282,6 +310,18 @@ class Simulation:
         queue_lengths = {direction: 0 for direction in ("north", "south", "east", "west")}
         vehicle_counts = {direction: 0 for direction in ("north", "south", "east", "west")}
         emergency_counts = {direction: 0 for direction in ("north", "south", "east", "west")}
+        emergency_movement_counts = {
+            movement: 0
+            for movement in MovementTrafficLightController.MOVEMENTS
+        }
+        queued_movement_counts = {
+            movement: 0
+            for movement in MovementTrafficLightController.MOVEMENTS
+        }
+        near_stop_movement_counts = {
+            movement: 0
+            for movement in MovementTrafficLightController.MOVEMENTS
+        }
         pedestrian_counts = {direction: 0 for direction in ("north", "south", "east", "west")}
         waiting_pedestrian_counts = {direction: 0 for direction in ("north", "south", "east", "west")}
         active_crossing_pedestrian_counts = {
@@ -300,16 +340,68 @@ class Simulation:
         approaching_right_turn_counts = {direction: 0 for direction in ("north", "south", "east", "west")}
         queued_right_turn_counts = {direction: 0 for direction in ("north", "south", "east", "west")}
         speed_ratio_sums = {direction: 0.0 for direction in ("north", "south", "east", "west")}
+        near_stop_distance = (
+            max(
+                0.0,
+                float(
+                    self.config.get("movement_controller", {}).get(
+                        "empty_green_detection_distance_m",
+                        15.0,
+                    )
+                ),
+            )
+            * max(
+                1e-9,
+                float(self.config["simulation"]["pixels_per_meter"]),
+            )
+        )
         for vehicle in self.vehicles:
             if not vehicle.cleared_intersection:
+                turn_side = getattr(vehicle, "turn_side", None)
+                is_pending_turn = bool(
+                    turn_side in ("left", "right")
+                    and (
+                        getattr(vehicle, "turning", False)
+                        or (
+                            getattr(vehicle, "is_turning_vehicle", False)
+                            and not getattr(vehicle, "has_turned", False)
+                        )
+                    )
+                )
+                movement_kind = turn_side if is_pending_turn else "through"
+                vehicle_movement = (
+                    f"{vehicle.road_direction}_{movement_kind}"
+                )
                 vehicle_counts[vehicle.road_direction] += 1
                 free_flow_speed = max(1e-9, float(vehicle.speed))
                 speed_ratio_sums[vehicle.road_direction] += min(
                     1.0,
                     max(0.0, float(vehicle.current_speed) / free_flow_speed),
                 )
+                if (
+                    vehicle.stopped
+                    and vehicle_movement in queued_movement_counts
+                ):
+                    queued_movement_counts[vehicle_movement] += 1
+                try:
+                    distance_from_stop = float(vehicle.distance_from_stop)
+                except (AttributeError, TypeError, ValueError):
+                    distance_from_stop = float("inf")
+                is_near_stop = bool(
+                    vehicle.stopped
+                    or getattr(vehicle, "turning", False)
+                    or getattr(vehicle, "committed_to_cross", False)
+                    or distance_from_stop <= near_stop_distance
+                )
+                if (
+                    is_near_stop
+                    and vehicle_movement in near_stop_movement_counts
+                ):
+                    near_stop_movement_counts[vehicle_movement] += 1
                 if vehicle.is_emergency:
                     emergency_counts[vehicle.road_direction] += 1
+                    if vehicle_movement in emergency_movement_counts:
+                        emergency_movement_counts[vehicle_movement] += 1
             if vehicle.stopped and not vehicle.cleared_intersection:
                 queue_lengths[vehicle.road_direction] += 1
             if vehicle.turning:
@@ -348,25 +440,26 @@ class Simulation:
             if not safely_waiting:
                 active_crossing_pedestrian_counts[pedestrian.crossing] += 1
 
-        (
-            detected_vehicle_occupancy,
-            detected_vehicle_pedestrian_conflicts,
-        ) = analyze_crosswalk_safety(
-            self.vehicles,
-            self.pedestrians,
-            self._crosswalk_rectangles,
-            self.config["simulation"]["pixels_per_meter"],
-            self.config.get("pedestrian_signals", {}).get(
-                "conflict_safety_margin_m",
-                0.5,
-            ),
-        )
-        crosswalk_vehicle_occupancy_counts.update(
-            detected_vehicle_occupancy
-        )
-        vehicle_pedestrian_crosswalk_conflict_counts.update(
-            detected_vehicle_pedestrian_conflicts
-        )
+        if self.pedestrians_enabled:
+            (
+                detected_vehicle_occupancy,
+                detected_vehicle_pedestrian_conflicts,
+            ) = analyze_crosswalk_safety(
+                self.vehicles,
+                self.pedestrians,
+                self._crosswalk_rectangles,
+                self.config["simulation"]["pixels_per_meter"],
+                self.config.get("pedestrian_signals", {}).get(
+                    "conflict_safety_margin_m",
+                    0.5,
+                ),
+            )
+            crosswalk_vehicle_occupancy_counts.update(
+                detected_vehicle_occupancy
+            )
+            vehicle_pedestrian_crosswalk_conflict_counts.update(
+                detected_vehicle_pedestrian_conflicts
+            )
         average_speed_ratios = {
             direction: speed_ratio_sums[direction] / max(1, vehicle_counts[direction])
             for direction in speed_ratio_sums
@@ -384,6 +477,9 @@ class Simulation:
             "vehicle_counts": vehicle_counts,
             "average_speed_ratios": average_speed_ratios,
             "emergency_counts": emergency_counts,
+            "emergency_movement_counts": emergency_movement_counts,
+            "queued_movement_counts": queued_movement_counts,
+            "near_stop_movement_counts": near_stop_movement_counts,
             "pedestrian_counts": pedestrian_counts,
             "waiting_pedestrian_counts": waiting_pedestrian_counts,
             "active_crossing_pedestrian_counts": (
@@ -524,15 +620,107 @@ class Simulation:
             return False
         return bool(extension_decider(observation))
 
-    def _can_activate_phase(self, phase):
-        """Keep vehicle lights red until pedestrians in the next crossings clear."""
-        # A vehicle already committed to a protected turn must finish clearing
-        # the conflict zone before any new movement receives green.
-        if any(
+    def _vehicle_committed_movement(self, vehicle):
+        """Return ``(is_committed, movement)`` for a vehicle in the junction.
+
+        ``movement`` is ``None`` when a lightweight/external vehicle object is
+        known to be committed but does not expose enough route information.
+        Callers handle that case conservatively.
+        """
+        if getattr(vehicle, "cleared_intersection", False):
+            return False, None
+
+        is_committed = bool(
             getattr(vehicle, "turning", False)
-            for vehicle in self.vehicles
-        ):
+            or getattr(vehicle, "committed_to_cross", False)
+        )
+        if getattr(vehicle, "is_emergency", False):
+            try:
+                distance_from_stop = float(vehicle.distance_from_stop)
+                stop_margin = float(getattr(vehicle, "stop_margin", 0.0))
+            except (AttributeError, TypeError, ValueError):
+                distance_from_stop = float("inf")
+                stop_margin = 0.0
+            # Emergency vehicles intentionally ignore a red signal. Once at
+            # the line, their path must therefore be treated as committed.
+            is_committed = is_committed or distance_from_stop <= stop_margin
+
+        if not is_committed:
+            return False, None
+
+        direction = getattr(vehicle, "road_direction", None)
+        if direction not in DIRECTIONS:
+            return True, None
+        turn_side = getattr(vehicle, "turn_side", None)
+        is_pending_turn = bool(
+            turn_side in ("left", "right")
+            and (
+                getattr(vehicle, "turning", False)
+                or (
+                    getattr(vehicle, "is_turning_vehicle", False)
+                    and not getattr(vehicle, "has_turned", False)
+                )
+            )
+        )
+        movement_kind = turn_side if is_pending_turn else "through"
+        movement = f"{direction}_{movement_kind}"
+        if movement not in MovementTrafficLightController.MOVEMENT_INDEX:
+            return True, None
+        return True, movement
+
+    def _movements_conflict_with_committed_vehicle(self, movements):
+        """Whether any proposed movement crosses a committed vehicle path."""
+        movements_conflict = getattr(
+            self.light_controller,
+            "movements_conflict",
+            None,
+        )
+        if not callable(movements_conflict):
+            # Legacy controllers have no movement-level conflict model. Keep
+            # their former conservative protected-turn behavior.
+            return any(
+                getattr(vehicle, "turning", False)
+                for vehicle in self.vehicles
+            )
+
+        proposed_movements = frozenset(movements)
+        for vehicle in self.vehicles:
+            is_committed, committed_movement = (
+                self._vehicle_committed_movement(vehicle)
+            )
+            if not is_committed:
+                continue
+            if committed_movement is None:
+                return True
+            if any(
+                movements_conflict(proposed, committed_movement)
+                for proposed in proposed_movements
+            ):
+                return True
+        return False
+
+    def _can_activate_phase(self, phase):
+        """Allow a phase only when its actual paths are spatially safe."""
+        decode_movements = getattr(
+            self.light_controller,
+            "decode_movements",
+            None,
+        )
+        if callable(decode_movements):
+            committed_conflict = (
+                self._movements_conflict_with_committed_vehicle(
+                    decode_movements(phase)
+                )
+            )
+        else:
+            committed_conflict = any(
+                getattr(vehicle, "turning", False)
+                for vehicle in self.vehicles
+            )
+        if committed_conflict:
             return False
+        if not self.pedestrians_enabled:
+            return True
         if hasattr(self.light_controller, "phase_conflicting_crossings"):
             protected_crossings = set(
                 self.light_controller.phase_conflicting_crossings(phase)
@@ -549,6 +737,12 @@ class Simulation:
 
     def _can_activate_right_turn(self, direction):
         """Keep an automatic right arrow red while either crosswalk is used."""
+        if self._movements_conflict_with_committed_vehicle(
+            (f"{direction}_right",)
+        ):
+            return False
+        if not self.pedestrians_enabled:
+            return True
         exit_crossing = (
             self.light_controller.RIGHT_TURN_EXIT_CROSSINGS[direction]
         )
@@ -561,6 +755,10 @@ class Simulation:
 
     def _can_activate_movements(self, movements):
         """Demand-decoder pedestrian mask for a proposed concurrent set."""
+        if self._movements_conflict_with_committed_vehicle(movements):
+            return False
+        if not self.pedestrians_enabled:
+            return True
         crossings = set()
         for movement in movements:
             crossings.update(
@@ -574,6 +772,8 @@ class Simulation:
 
     def _can_start_pedestrian_walk(self, crossing):
         """Allow WALK only after occupying and committed vehicles clear."""
+        if not self.pedestrians_enabled:
+            return False
         if crossing not in DIRECTIONS:
             return False
         observation = self._last_signal_observation
@@ -635,6 +835,9 @@ class Simulation:
         return not has_passed
 
     def _update_pedestrians(self, dt):
+        if not self.pedestrians_enabled:
+            self.pedestrians.clear()
+            return
         self.pedestrian_spawn_timer += dt
         defaults = self.config["pedestrian_defaults"]
         if (

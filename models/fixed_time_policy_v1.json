@@ -1,0 +1,72 @@
+{
+  "format_version": 1,
+  "policy_type": "fixed_time_movement",
+  "name": "conventional_six_stage_vehicle_baseline_v1",
+  "control_scope": "vehicles_only",
+  "stages": [
+    {
+      "name": "north_protected",
+      "duration_s": 8.0,
+      "movements": [
+        "north_through",
+        "north_left",
+        "north_right"
+      ]
+    },
+    {
+      "name": "north_south_through",
+      "duration_s": 20.0,
+      "movements": [
+        "north_through",
+        "south_through",
+        "north_right",
+        "south_right"
+      ]
+    },
+    {
+      "name": "south_protected",
+      "duration_s": 8.0,
+      "movements": [
+        "south_through",
+        "south_left",
+        "south_right"
+      ]
+    },
+    {
+      "name": "east_protected",
+      "duration_s": 8.0,
+      "movements": [
+        "east_through",
+        "east_left",
+        "east_right"
+      ]
+    },
+    {
+      "name": "east_west_through",
+      "duration_s": 20.0,
+      "movements": [
+        "east_through",
+        "west_through",
+        "east_right",
+        "west_right"
+      ]
+    },
+    {
+      "name": "west_protected",
+      "duration_s": 8.0,
+      "movements": [
+        "west_through",
+        "west_left",
+        "west_right"
+      ]
+    }
+  ],
+  "metadata": {
+    "description": "Conventional vehicle-only six-stage fixed-time baseline with protected single-approach turn stages and paired opposing through stages.",
+    "protected_stage_duration_s": 8.0,
+    "paired_through_stage_duration_s": 20.0,
+    "cycle_green_time_s": 72.0,
+    "stage_count": 6,
+    "purpose": "Scientific comparison baseline for categorical and movement-level adaptive controllers"
+  }
+}

@@ -4,9 +4,15 @@ import argparse
 import json
 from pathlib import Path
 
-from config import CONFIG, build_runtime_config
+from config import (
+    CONFIG,
+    VEHICLES_AND_PEDESTRIANS_SCOPE,
+    VEHICLES_ONLY_SCOPE,
+    apply_movement_control_scope,
+    build_runtime_config,
+)
 from renderer import Renderer
-from simulation import MovementPolicy, Simulation
+from simulation import MovementPolicy, Simulation, VehicleMovementPolicy
 from simulation.movement_neuroevolution import (
     LEGACY_MOVEMENT_INPUT_FEATURE_NAMES,
     LEGACY_MOVEMENT_POLICY_FORMAT_VERSION,
@@ -15,10 +21,16 @@ from simulation.movement_neuroevolution import (
     MOVEMENT_POLICY_FORMAT_VERSION,
     PEDESTRIAN_OUTPUT_NAMES,
     POLICY_OUTPUT_NAMES,
+    VEHICLE_ONLY_INPUT_FEATURE_NAMES,
+    VEHICLE_ONLY_POLICY_FORMAT_VERSION,
 )
 
 
-POLICY_PATH = Path(__file__).resolve().parent / "models" / "movement_policy_v3.json"
+POLICY_PATH = (
+    Path(__file__).resolve().parent
+    / "models"
+    / "vehicle_movement_policy_v1.json"
+)
 
 
 def parse_arguments():
@@ -39,6 +51,7 @@ def load_movement_policy(path=POLICY_PATH):
         not in (
             LEGACY_MOVEMENT_POLICY_FORMAT_VERSION,
             MOVEMENT_POLICY_FORMAT_VERSION,
+            VEHICLE_ONLY_POLICY_FORMAT_VERSION,
         )
         or data.get("policy_type") != "movement_multi_hot"
     ):
@@ -63,7 +76,8 @@ def load_movement_policy(path=POLICY_PATH):
             data["duration_bounds_s"],
             data["max_red_duration_s"],
         )
-    else:
+        control_scope = VEHICLES_ONLY_SCOPE
+    elif format_version == MOVEMENT_POLICY_FORMAT_VERSION:
         if (
             tuple(data.get("pedestrian_outputs", ()))
             != PEDESTRIAN_OUTPUT_NAMES
@@ -84,10 +98,36 @@ def load_movement_policy(path=POLICY_PATH):
             data["duration_bounds_s"],
             data["max_red_duration_s"],
         )
+        control_scope = VEHICLES_AND_PEDESTRIANS_SCOPE
+    else:
+        if (
+            data.get("control_scope") != VEHICLES_ONLY_SCOPE
+            or tuple(data.get("pedestrian_outputs", ()))
+            or tuple(data.get("outputs", ())) != MOVEMENT_NAMES
+        ):
+            raise ValueError("movement policy has an incompatible output order")
+        if (
+            network.get("input_size") != VehicleMovementPolicy.input_size
+            or tuple(network.get("input_features", ()))
+            != VEHICLE_ONLY_INPUT_FEATURE_NAMES
+            or network.get("hidden_size") != VehicleMovementPolicy.hidden_size
+            or network.get("output_size") != VehicleMovementPolicy.output_size
+            or tuple(network.get("output_names", ())) != MOVEMENT_NAMES
+        ):
+            raise ValueError("movement policy has an incompatible network schema")
+        policy = VehicleMovementPolicy(
+            data["weights"],
+            data["duration_bounds_s"],
+            data["max_red_duration_s"],
+        )
+        control_scope = VEHICLES_ONLY_SCOPE
     policy.decoder_config = dict(data.get("decoder", {}))
-    policy.pedestrian_decoder_config = dict(
-        data.get("pedestrian_decoder", {})
+    policy.pedestrian_decoder_config = (
+        {}
+        if control_scope == VEHICLES_ONLY_SCOPE
+        else dict(data.get("pedestrian_decoder", {}))
     )
+    policy.control_scope = control_scope
     return policy
 
 
@@ -102,10 +142,28 @@ def _controller_output_set(controller, attribute, default=()):
 def main():
     args = parse_arguments()
     runtime_config = build_runtime_config(CONFIG)
+    policy = load_movement_policy(args.model)
+    apply_movement_control_scope(
+        runtime_config,
+        policy.control_scope,
+    )
+    if (
+        policy.control_scope == VEHICLES_AND_PEDESTRIANS_SCOPE
+        and int(
+            runtime_config.get("pedestrian_defaults", {}).get(
+                "max_active",
+                0,
+            )
+        )
+        <= 0
+    ):
+        print(
+            "Warning: this model includes pedestrian control, but "
+            "pedestrian_defaults.max_active is 0; no pedestrians will spawn."
+        )
     time_scale = float(runtime_config["simulation"].get("time_scale", 1.0))
     if time_scale <= 0:
         raise ValueError("simulation.time_scale must be positive")
-    policy = load_movement_policy(args.model)
     timing = runtime_config["traffic_lights"]
     timing["min_green_duration_s"] = policy.minimum_duration_s
     timing["max_green_duration_s"] = policy.maximum_duration_s
@@ -113,9 +171,10 @@ def main():
     runtime_config.setdefault("movement_controller", {}).update(
         policy.decoder_config
     )
-    runtime_config.setdefault("pedestrian_signals", {}).update(
-        policy.pedestrian_decoder_config
-    )
+    if policy.control_scope == VEHICLES_AND_PEDESTRIANS_SCOPE:
+        runtime_config.setdefault("pedestrian_signals", {}).update(
+            policy.pedestrian_decoder_config
+        )
     simulation = Simulation(
         runtime_config,
         movement_score_provider=policy.predict_movement_scores,

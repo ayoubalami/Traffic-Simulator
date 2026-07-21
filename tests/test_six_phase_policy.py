@@ -243,6 +243,7 @@ class SixPhasePolicyTests(unittest.TestCase):
                 is_turning_vehicle=True,
                 has_turned=False,
                 turn_side="left",
+                distance_from_stop=1000.0,
             ),
             SimpleNamespace(
                 cleared_intersection=False,
@@ -255,6 +256,7 @@ class SixPhasePolicyTests(unittest.TestCase):
                 is_turning_vehicle=True,
                 has_turned=False,
                 turn_side="right",
+                distance_from_stop=80.0,
             ),
         ]
 
@@ -264,6 +266,10 @@ class SixPhasePolicyTests(unittest.TestCase):
         self.assertEqual(observation["queued_left_turn_counts"]["north"], 1)
         self.assertEqual(observation["approaching_right_turn_counts"]["south"], 1)
         self.assertEqual(observation["queued_right_turn_counts"]["south"], 0)
+        self.assertEqual(observation["queued_movement_counts"]["north_left"], 1)
+        self.assertEqual(observation["queued_movement_counts"]["south_right"], 0)
+        self.assertEqual(observation["near_stop_movement_counts"]["north_left"], 1)
+        self.assertEqual(observation["near_stop_movement_counts"]["south_right"], 1)
 
     def test_no_turn_demand_exposes_only_paired_axis_phase(self):
         controller = SixPhaseTrafficLightController(self.config)

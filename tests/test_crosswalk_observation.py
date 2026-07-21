@@ -36,6 +36,9 @@ class DetectorVehicle:
 class CrosswalkObservationTests(unittest.TestCase):
     def setUp(self):
         self.config = build_runtime_config(CONFIG)
+        self.config.setdefault("road_users", {})[
+            "pedestrians_enabled"
+        ] = True
 
     def test_crosswalk_rectangles_match_rendered_geometry(self):
         rectangles = crosswalk_rectangles(self.config)

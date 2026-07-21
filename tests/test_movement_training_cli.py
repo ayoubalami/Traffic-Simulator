@@ -36,6 +36,7 @@ class MovementTrainingCliTests(unittest.TestCase):
         self.assertIsNone(arguments.warm_start)
         self.assertIsNone(arguments.checkpoint)
         self.assertIsNone(arguments.resume)
+        self.assertIsNone(arguments.anchor_scenarios_count)
 
     def test_es_and_staged_evaluation_options_parse(self):
         arguments = self.parse(
@@ -73,6 +74,8 @@ class MovementTrainingCliTests(unittest.TestCase):
             "5",
             "--anchor-candidates",
             "3",
+            "--anchor-scenarios-count",
+            "7",
             "--robustness-penalty",
             "0.4",
             "--timestep",
@@ -101,6 +104,7 @@ class MovementTrainingCliTests(unittest.TestCase):
         self.assertEqual(arguments.promotion_scenarios, 4)
         self.assertEqual(arguments.anchor_interval, 5)
         self.assertEqual(arguments.anchor_candidates, 3)
+        self.assertEqual(arguments.anchor_scenarios_count, 7)
         self.assertAlmostEqual(arguments.robustness_penalty, 0.4)
         self.assertAlmostEqual(arguments.timestep, 0.02)
         self.assertAlmostEqual(arguments.speed_factor, 1.0)

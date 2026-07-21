@@ -26,6 +26,7 @@ PEDESTRIAN_OUTPUT_NAMES = tuple(PEDESTRIAN_OUTPUT_NAMES)
 POLICY_OUTPUT_NAMES = MOVEMENT_NAMES + PEDESTRIAN_OUTPUT_NAMES
 MOVEMENT_POLICY_FORMAT_VERSION = 3
 LEGACY_MOVEMENT_POLICY_FORMAT_VERSION = 2
+VEHICLE_ONLY_POLICY_FORMAT_VERSION = 4
 MOVEMENT_INPUT_FEATURE_NAMES = (
     *(f"vehicle_count_{direction}" for direction in DIRECTIONS),
     *(f"queue_length_{direction}" for direction in DIRECTIONS),
@@ -71,7 +72,26 @@ LEGACY_MOVEMENT_INPUT_FEATURE_NAMES = tuple(
     for feature in MOVEMENT_INPUT_FEATURE_NAMES
     if feature not in _PEDESTRIAN_INPUT_FEATURE_NAMES
 )
-MOVEMENT_OPTIMIZER_CHECKPOINT_VERSION = 1
+# Crosswalk occupancy is vehicle-derived, but it exists to protect WALK
+# activation and overlaps the junction-count/blocking inputs. Excluding the
+# entire crosswalk group keeps this first experiment a deliberate sensor
+# ablation rather than retaining pedestrian-infrastructure state indirectly.
+_VEHICLE_ONLY_EXCLUDED_INPUT_PREFIXES = (
+    "waiting_pedestrian_count_",
+    "active_crossing_pedestrian_count_",
+    "crosswalk_vehicle_occupancy_count_",
+    "pedestrian_red_elapsed_",
+    "active_pedestrian_walk_",
+)
+VEHICLE_ONLY_INPUT_FEATURE_NAMES = tuple(
+    feature
+    for feature in MOVEMENT_INPUT_FEATURE_NAMES
+    if not feature.startswith(_VEHICLE_ONLY_EXCLUDED_INPUT_PREFIXES)
+)
+# Version 2 invalidates optimizer state scored with the pre-lock emergency
+# decoder. Mixing those anchors with the corrected controller would make
+# resumed global-best comparisons scientifically meaningless.
+MOVEMENT_OPTIMIZER_CHECKPOINT_VERSION = 2
 _INVALID_FITNESS = -1e300
 
 
@@ -122,6 +142,58 @@ def migrate_legacy_movement_policy_weights(weights):
     return migrated
 
 
+def project_vehicle_only_movement_policy_weights(
+    weights,
+    source_input_features,
+    source_output_names,
+):
+    """Project a compatible format-2/3 network into the compact format 4."""
+    source_input_features = tuple(source_input_features)
+    source_output_names = tuple(source_output_names)
+    missing_inputs = set(VEHICLE_ONLY_INPUT_FEATURE_NAMES).difference(
+        source_input_features
+    )
+    missing_outputs = set(MOVEMENT_NAMES).difference(source_output_names)
+    if missing_inputs or missing_outputs:
+        raise ValueError("source policy cannot be projected to vehicle-only")
+
+    hidden_size = MovementPolicy.hidden_size
+    expected_size = (
+        (len(source_input_features) + 1) * hidden_size
+        + (hidden_size + 1) * len(source_output_names)
+    )
+    if len(weights) != expected_size:
+        raise ValueError(f"expected {expected_size} source neural weights")
+
+    input_indices = {
+        feature: index for index, feature in enumerate(source_input_features)
+    }
+    projected = []
+    cursor = 0
+    for _ in range(hidden_size):
+        row = weights[cursor : cursor + len(source_input_features)]
+        cursor += len(source_input_features)
+        projected.extend(
+            row[input_indices[feature]]
+            for feature in VEHICLE_ONLY_INPUT_FEATURE_NAMES
+        )
+        projected.append(weights[cursor])
+        cursor += 1
+
+    output_row_size = hidden_size + 1
+    output_indices = {
+        output: index for index, output in enumerate(source_output_names)
+    }
+    output_weights = weights[cursor:]
+    for movement in MOVEMENT_NAMES:
+        start = output_indices[movement] * output_row_size
+        projected.extend(output_weights[start : start + output_row_size])
+
+    if len(projected) != VehicleMovementPolicy.genome_size:
+        raise RuntimeError("vehicle-only projection produced a bad genome")
+    return projected
+
+
 def _finite_fitness(value):
     """Return a sortable, JSON-safe fitness value."""
     try:
@@ -131,8 +203,8 @@ def _finite_fitness(value):
     return value if math.isfinite(value) else _INVALID_FITNESS
 
 
-def _candidate_from_evaluation(policy, evaluation, robustness_penalty, stage):
-    """Convert an across-scenario evaluation into one optimizer candidate."""
+def summarize_scenario_fitness(evaluation, robustness_penalty=0.0):
+    """Return comparable raw and robustness-adjusted scenario fitness values."""
     scenario_fitnesses = [
         _finite_fitness(item.get("fitness"))
         for item in evaluation.get("evaluations", ())
@@ -155,10 +227,20 @@ def _candidate_from_evaluation(policy, evaluation, robustness_penalty, stage):
         mean_fitness - float(robustness_penalty) * fitness_std
     )
     return {
-        "policy": policy,
-        "fitness": robust_fitness,
         "scenario_mean_fitness": mean_fitness,
         "scenario_fitness_std": fitness_std,
+        "robust_fitness": robust_fitness,
+    }
+
+
+def _candidate_from_evaluation(policy, evaluation, robustness_penalty, stage):
+    """Convert an across-scenario evaluation into one optimizer candidate."""
+    summary = summarize_scenario_fitness(evaluation, robustness_penalty)
+    return {
+        "policy": policy,
+        "fitness": summary["robust_fitness"],
+        "scenario_mean_fitness": summary["scenario_mean_fitness"],
+        "scenario_fitness_std": summary["scenario_fitness_std"],
         "mean_metrics": evaluation.get("mean_metrics", {}),
         "scenario_evaluations": evaluation.get("evaluations", []),
         "evaluated_scenarios": evaluation.get("evaluated_scenarios", ()),
@@ -207,9 +289,12 @@ def _lists_to_tuples(value):
 class MovementPolicy:
     """Fixed-topology network producing vehicle and pedestrian request scores."""
 
-    input_size = len(MOVEMENT_INPUT_FEATURE_NAMES)
+    control_scope = "vehicles_and_pedestrians"
+    input_feature_names = MOVEMENT_INPUT_FEATURE_NAMES
+    output_names = POLICY_OUTPUT_NAMES
+    input_size = len(input_feature_names)
     hidden_size = 10
-    output_size = len(POLICY_OUTPUT_NAMES)
+    output_size = len(output_names)
     genome_size = (
         (input_size + 1) * hidden_size
         + (hidden_size + 1) * output_size
@@ -238,14 +323,15 @@ class MovementPolicy:
         initial_outputs = (
             MOVEMENT_NAMES
             if self.legacy_vehicle_only
-            else POLICY_OUTPUT_NAMES
+            else self.output_names
         )
         self.last_output_scores = {
             output: 0.5 for output in initial_outputs
         }
-        # Kept for callers written for the original vehicle-only policy. New
-        # policies expose all outputs here; migrated baselines expose only the
-        # original twelve so the controller retains automatic WALK timing.
+        # Kept for callers written for the original vehicle-only policy. Each
+        # policy exposes its configured outputs here; migrated baselines expose
+        # only the original twelve so the controller retains automatic WALK
+        # timing.
         self.last_movement_scores = self.last_output_scores
 
     @classmethod
@@ -256,12 +342,16 @@ class MovementPolicy:
         max_red_duration_s=60.0,
     ):
         """Load a format-2 policy without enabling pedestrian outputs."""
-        return cls(
+        policy = cls(
             migrate_legacy_movement_policy_weights(weights),
             duration_bounds_s,
             max_red_duration_s,
             legacy_vehicle_only=True,
         )
+        # Format 2 has vehicle outputs only. For reproducible new evaluations,
+        # treat its automatic WALK behavior as outside the policy scope.
+        policy.control_scope = "vehicles_only"
+        return policy
 
     @classmethod
     def random(cls, rng, duration_bounds_s, max_red_duration_s):
@@ -295,7 +385,7 @@ class MovementPolicy:
         return exponential / (1.0 + exponential)
 
     def predict_movement_scores(self, observation):
-        """Return independent vehicle and WALK desirabilities in [0, 1]."""
+        """Return independent configured-output desirabilities in [0, 1]."""
         inputs = self._build_inputs(observation)
         cursor = 0
         hidden = []
@@ -310,7 +400,7 @@ class MovementPolicy:
             hidden.append(math.tanh(total))
 
         scores = {}
-        for output in POLICY_OUTPUT_NAMES:
+        for output in self.output_names:
             total = sum(
                 self.weights[cursor + index] * value
                 for index, value in enumerate(hidden)
@@ -448,9 +538,33 @@ class MovementPolicy:
                 / self.maximum_duration_s,
             )
         )
-        if len(inputs) != self.input_size:
+        if len(inputs) != len(MOVEMENT_INPUT_FEATURE_NAMES):
+            raise RuntimeError(
+                f"expected {len(MOVEMENT_INPUT_FEATURE_NAMES)} raw "
+                "movement-policy inputs"
+            )
+        input_values = dict(zip(MOVEMENT_INPUT_FEATURE_NAMES, inputs))
+        selected_inputs = [
+            input_values[feature]
+            for feature in self.input_feature_names
+        ]
+        if len(selected_inputs) != self.input_size:
             raise RuntimeError(f"expected {self.input_size} movement-policy inputs")
-        return inputs
+        return selected_inputs
+
+
+class VehicleMovementPolicy(MovementPolicy):
+    """Compact vehicle-signal policy with no pedestrian observations/outputs."""
+
+    control_scope = "vehicles_only"
+    input_feature_names = VEHICLE_ONLY_INPUT_FEATURE_NAMES
+    output_names = MOVEMENT_NAMES
+    input_size = len(input_feature_names)
+    output_size = len(output_names)
+    genome_size = (
+        (input_size + 1) * MovementPolicy.hidden_size
+        + (MovementPolicy.hidden_size + 1) * output_size
+    )
 
 
 class MovementPolicyEvolution(SixPhasePolicyEvolution):
@@ -482,6 +596,7 @@ class MovementPolicyEvolution(SixPhasePolicyEvolution):
         anchor_interval=5,
         anchor_candidates=3,
         anchor_scenarios=None,
+        anchor_scenarios_count=None,
         robustness_penalty=0.25,
         checkpoint_path=None,
         checkpoint_every=1,
@@ -583,25 +698,34 @@ class MovementPolicyEvolution(SixPhasePolicyEvolution):
             for profile in profiles
             for seed in self.seeds
         )
-        if anchor_scenarios is None:
-            anchor_count = min(
-                max(4, self.promotion_scenarios),
-                len(self._scenario_pool),
+        if anchor_scenarios is not None and anchor_scenarios_count is not None:
+            raise ValueError(
+                "anchor_scenarios and anchor_scenarios_count are mutually exclusive"
             )
-            # Spread anchors across the full Cartesian pool.  With four
-            # profiles and three seeds this selects one stable seed/profile
-            # instead of accidentally taking the first profile's three seeds.
-            self.anchor_scenarios = tuple(
-                self._scenario_pool[
-                    math.floor(index * len(self._scenario_pool) / anchor_count)
-                ]
-                for index in range(anchor_count)
-            )
-        else:
+        if anchor_scenarios is not None:
             self.anchor_scenarios = self._normalize_scenario_pairs(
                 anchor_scenarios,
                 "anchor_scenarios",
             )
+        elif anchor_scenarios_count is None:
+            # Champion selection is comparable only when every configured
+            # profile/seed pairing participates.  Promotion-stage sampling is
+            # intentionally independent from this fixed anchor batch.
+            self.anchor_scenarios = tuple(self._scenario_pool)
+        else:
+            anchor_count = self._positive_int(
+                anchor_scenarios_count,
+                "anchor_scenarios_count",
+            )
+            if anchor_count > len(self._scenario_pool):
+                raise ValueError(
+                    "anchor_scenarios_count cannot exceed the number of "
+                    f"configured scenarios ({len(self._scenario_pool)})"
+                )
+            self.anchor_scenarios = self._stratified_scenario_subset(
+                anchor_count
+            )
+        self.anchor_scenarios_count = len(self.anchor_scenarios)
 
         self.checkpoint_path = Path(checkpoint_path) if checkpoint_path else None
         self.resume_checkpoint = (
@@ -675,6 +799,31 @@ class MovementPolicyEvolution(SixPhasePolicyEvolution):
             normalized.append((deepcopy(dict(profile)), seed))
         return tuple(normalized)
 
+    def _stratified_scenario_subset(self, count):
+        """Select a fixed subset balanced across profile and seed strata."""
+        seed_count = len(self.seeds)
+        profile_count = len(self._scenario_pool) // seed_count
+        profile_usage = [0] * profile_count
+        seed_usage = [0] * seed_count
+        remaining = set(range(len(self._scenario_pool)))
+        selected = []
+        for _ in range(count):
+            scenario_index = min(
+                remaining,
+                key=lambda index: (
+                    profile_usage[index // seed_count],
+                    seed_usage[index % seed_count],
+                    index,
+                ),
+            )
+            remaining.remove(scenario_index)
+            profile_index = scenario_index // seed_count
+            seed_index = scenario_index % seed_count
+            profile_usage[profile_index] += 1
+            seed_usage[seed_index] += 1
+            selected.append(self._scenario_pool[scenario_index])
+        return tuple(selected)
+
     def run(self):
         if self.optimizer == "genetic":
             return super().run()
@@ -738,6 +887,7 @@ class MovementPolicyEvolution(SixPhasePolicyEvolution):
                     or generation + 1 == self.generations
                 )
                 anchor_best_fitness = None
+                anchor_best_mean_fitness = None
                 if anchor_evaluated:
                     finalists = [
                         candidate["policy"]
@@ -755,6 +905,9 @@ class MovementPolicyEvolution(SixPhasePolicyEvolution):
                         reverse=True,
                     )
                     anchor_best_fitness = anchored[0]["fitness"]
+                    anchor_best_mean_fitness = anchored[0][
+                        "scenario_mean_fitness"
+                    ]
                     if (
                         self._best_anchor is None
                         or anchored[0]["fitness"] > self._best_anchor["fitness"]
@@ -798,10 +951,21 @@ class MovementPolicyEvolution(SixPhasePolicyEvolution):
                         candidate["fitness"] for candidate in promoted
                     ),
                     "global_best_fitness": self._best_anchor["fitness"],
+                    "promotion_best_raw_mean_fitness": promoted[0][
+                        "scenario_mean_fitness"
+                    ],
+                    "promotion_best_robust_fitness": promoted[0]["fitness"],
+                    "anchor_best_raw_mean_fitness": anchor_best_mean_fitness,
+                    "anchor_best_robust_fitness": anchor_best_fitness,
+                    "global_best_raw_mean_fitness": self._best_anchor[
+                        "scenario_mean_fitness"
+                    ],
+                    "global_best_robust_fitness": self._best_anchor["fitness"],
                     "screening_best_fitness": screened[0]["fitness"],
                     "promotion_best_fitness": promoted[0]["fitness"],
                     "anchor_best_fitness": anchor_best_fitness,
                     "anchor_evaluated": anchor_evaluated,
+                    "anchor_scenarios_count": self.anchor_scenarios_count,
                     "promoted_candidates": len(promoted),
                     "screening_scenarios": tuple(
                         (profile.get("name", "unnamed"), seed)
@@ -1053,6 +1217,7 @@ class MovementPolicyEvolution(SixPhasePolicyEvolution):
             "promotion_scenarios": self.promotion_scenarios,
             "anchor_interval": self.anchor_interval,
             "anchor_candidates": self.anchor_candidates,
+            "anchor_scenarios_count": self.anchor_scenarios_count,
             "robustness_penalty": self.robustness_penalty,
             "stagnation_patience": self.stagnation_patience,
             "reheat_factor": self.reheat_factor,
@@ -1122,3 +1287,9 @@ class MovementPolicyEvolution(SixPhasePolicyEvolution):
             self.random.setstate(_lists_to_tuples(checkpoint["random_state"]))
         except (KeyError, TypeError, ValueError) as error:
             raise ValueError("checkpoint contains an invalid random state") from error
+
+
+class VehicleMovementPolicyEvolution(MovementPolicyEvolution):
+    """Train the compact format-4 vehicle-only movement policy."""
+
+    policy_class = VehicleMovementPolicy

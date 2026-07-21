@@ -22,6 +22,12 @@ MEAN_METRIC_NAMES = (
     "avg_vehicle_wait_time_all",
     "avg_system_wait_time_all",
     "total_vehicle_wait_time",
+    "total_emergency_vehicles_spawned",
+    "total_emergency_vehicles_exited",
+    "emergency_vehicle_completion_rate",
+    "total_emergency_vehicle_wait_time",
+    "avg_emergency_vehicle_wait_time_all",
+    "max_emergency_vehicle_wait_time",
     "avg_active_wait_time",
     "stops_per_vehicle",
     "avg_travel_time",
@@ -63,12 +69,26 @@ MEAN_METRIC_NAMES = (
     "changed_movement_count",
     "transition_clearance_time",
     "transition_clearance_fraction",
+    "yellow_clearance_time",
+    "yellow_clearance_fraction",
+    "all_red_time",
+    "all_red_fraction",
+    "scheduled_all_red_time",
+    "scheduled_all_red_fraction",
+    "safety_blocked_all_red_time",
+    "safety_blocked_all_red_fraction",
+    "initial_idle_all_red_time",
+    "initial_idle_all_red_fraction",
+    "all_red_stopped_vehicle_time",
+    "avg_all_red_stopped_wait_time",
     "total_green_movement_time",
     "useful_green_movement_time",
     "wasted_green_movement_time",
     "green_movement_utilization",
     "wasted_green_movement_fraction",
     "empty_phase_time",
+    "empty_green_gap_outs",
+    "emergency_preemptions",
     "intersection_blocking_time",
     "intersection_blocking_rate",
     "left_turn_delay",
@@ -147,6 +167,13 @@ def calculate_fitness(metrics, fitness_config=None):
             metrics.get("avg_vehicle_wait_time_all", 0.0),
         )
         * float(fitness_config.get("avg_vehicle_wait_time_penalty", 30.0))
+        - metrics.get("avg_emergency_vehicle_wait_time_all", 0.0)
+        * float(
+            fitness_config.get(
+                "avg_emergency_vehicle_wait_time_penalty",
+                100.0,
+            )
+        )
         - metrics.get("stops_per_vehicle", 0.0)
         * float(fitness_config.get("vehicle_stop_rate_penalty", 100.0))
         - metrics.get("avg_pedestrian_wait_time_all", 0.0)
@@ -308,41 +335,8 @@ def evaluate_policy_across_seeds(
     }
 
 
-def evaluate_six_phase_policy(
-    config,
-    policy,
-    duration_s=300.0,
-    timestep_s=1 / 30,
-    random_seed=1,
-    speed_factor=None,
-    traffic_profile=None,
-):
-    """Evaluate a policy that selects paired or individual approach phases."""
-    if duration_s <= 0 or timestep_s <= 0:
-        raise ValueError("duration_s and timestep_s must be positive")
-
-    evaluation_config = deepcopy(config)
-    policy_timing = evaluation_config.setdefault("traffic_lights", {})
-    if hasattr(policy, "minimum_duration_s"):
-        policy_timing["min_green_duration_s"] = policy.minimum_duration_s
-    if hasattr(policy, "maximum_duration_s"):
-        policy_timing["max_green_duration_s"] = policy.maximum_duration_s
-    if hasattr(policy, "max_red_duration_s"):
-        policy_timing["max_red_duration_s"] = policy.max_red_duration_s
-    decoder_config = getattr(policy, "decoder_config", None)
-    if decoder_config:
-        evaluation_config.setdefault("movement_controller", {}).update(
-            decoder_config
-        )
-    pedestrian_decoder_config = getattr(
-        policy,
-        "pedestrian_decoder_config",
-        None,
-    )
-    if pedestrian_decoder_config:
-        evaluation_config.setdefault("pedestrian_signals", {}).update(
-            pedestrian_decoder_config
-        )
+def _apply_traffic_profile(evaluation_config, traffic_profile):
+    """Apply one demand profile to an isolated evaluation configuration."""
     profile = traffic_profile or {"name": "configured"}
     simulation_profile = evaluation_config.setdefault("simulation", {})
     if "arrival_rates_per_s" in profile:
@@ -379,17 +373,18 @@ def evaluate_six_phase_policy(
     ):
         if key in profile:
             simulation_profile[key] = profile[key]
-    effective_timestep_s = _effective_timestep(
-        evaluation_config, timestep_s, speed_factor
-    )
-    simulation_options = {"random_seed": random_seed}
-    if hasattr(policy, "predict_movement_scores"):
-        simulation_options["movement_score_provider"] = (
-            policy.predict_movement_scores
-        )
-    else:
-        simulation_options["phase_selector"] = policy.select_phase
-    simulation = Simulation(evaluation_config, **simulation_options)
+    return profile
+
+
+def _evaluate_controller_simulation(
+    evaluation_config,
+    simulation,
+    duration_s,
+    effective_timestep_s,
+    random_seed,
+    profile,
+):
+    """Run one controller with the shared gridlock and fitness protocol."""
     gridlock_config = evaluation_config.get("six_phase_fitness", {})
     gridlock_min_vehicles = max(
         1,
@@ -453,8 +448,132 @@ def evaluate_six_phase_policy(
         "random_seed": random_seed,
         "traffic_profile": profile.get("name", "unnamed"),
         "terminated_early": gridlock_detected,
-        "termination_reason": "intersection_gridlock" if gridlock_detected else None,
+        "termination_reason": (
+            "intersection_gridlock" if gridlock_detected else None
+        ),
     }
+
+
+def evaluate_six_phase_policy(
+    config,
+    policy,
+    duration_s=300.0,
+    timestep_s=1 / 30,
+    random_seed=1,
+    speed_factor=None,
+    traffic_profile=None,
+):
+    """Evaluate a policy that selects paired or individual approach phases."""
+    if duration_s <= 0 or timestep_s <= 0:
+        raise ValueError("duration_s and timestep_s must be positive")
+
+    evaluation_config = deepcopy(config)
+    policy_timing = evaluation_config.setdefault("traffic_lights", {})
+    if hasattr(policy, "minimum_duration_s"):
+        policy_timing["min_green_duration_s"] = policy.minimum_duration_s
+    if hasattr(policy, "maximum_duration_s"):
+        policy_timing["max_green_duration_s"] = policy.maximum_duration_s
+    if hasattr(policy, "max_red_duration_s"):
+        policy_timing["max_red_duration_s"] = policy.max_red_duration_s
+    decoder_config = getattr(policy, "decoder_config", None)
+    if decoder_config:
+        evaluation_config.setdefault("movement_controller", {}).update(
+            decoder_config
+        )
+    pedestrian_decoder_config = getattr(
+        policy,
+        "pedestrian_decoder_config",
+        None,
+    )
+    if pedestrian_decoder_config:
+        evaluation_config.setdefault("pedestrian_signals", {}).update(
+            pedestrian_decoder_config
+        )
+    profile = _apply_traffic_profile(evaluation_config, traffic_profile)
+    effective_timestep_s = _effective_timestep(
+        evaluation_config, timestep_s, speed_factor
+    )
+    simulation_options = {"random_seed": random_seed}
+    if hasattr(policy, "predict_movement_scores"):
+        simulation_options["movement_score_provider"] = (
+            policy.predict_movement_scores
+        )
+    else:
+        simulation_options["phase_selector"] = policy.select_phase
+    simulation = Simulation(evaluation_config, **simulation_options)
+    return _evaluate_controller_simulation(
+        evaluation_config,
+        simulation,
+        duration_s,
+        effective_timestep_s,
+        random_seed,
+        profile,
+    )
+
+
+def evaluate_fixed_time_policy(
+    config,
+    fixed_time_plan,
+    duration_s=300.0,
+    timestep_s=1 / 30,
+    random_seed=1,
+    speed_factor=None,
+    traffic_profile=None,
+):
+    """Evaluate a pre-timed movement plan with the movement-policy protocol.
+
+    The fixed controller receives no observations or neural callbacks.  It is
+    therefore a deterministic controller baseline while vehicle arrivals and
+    routes remain controlled by ``random_seed`` and ``traffic_profile``.
+    """
+    if fixed_time_plan is None:
+        raise TypeError("fixed_time_plan is required")
+    if duration_s <= 0 or timestep_s <= 0:
+        raise ValueError("duration_s and timestep_s must be positive")
+
+    evaluation_config = deepcopy(config)
+    control_scope = getattr(fixed_time_plan, "control_scope", None)
+    if control_scope is not None:
+        pedestrians_enabled = bool(
+            evaluation_config.get("road_users", {}).get(
+                "pedestrians_enabled",
+                True,
+            )
+        )
+        scope_mismatch = (
+            control_scope == "vehicles_only" and pedestrians_enabled
+        ) or (
+            control_scope == "vehicles_and_pedestrians"
+            and not pedestrians_enabled
+        )
+        if scope_mismatch:
+            # Keep the baseline under the same road-user scope as the plan it
+            # represents, mirroring movement-policy evaluation.
+            from config import apply_movement_control_scope
+
+            apply_movement_control_scope(evaluation_config, control_scope)
+
+    profile = _apply_traffic_profile(evaluation_config, traffic_profile)
+    effective_timestep_s = _effective_timestep(
+        evaluation_config,
+        timestep_s,
+        speed_factor,
+    )
+    simulation = Simulation(
+        evaluation_config,
+        random_seed=random_seed,
+        fixed_time_plan=fixed_time_plan,
+    )
+    result = _evaluate_controller_simulation(
+        evaluation_config,
+        simulation,
+        duration_s,
+        effective_timestep_s,
+        random_seed,
+        profile,
+    )
+    result["fixed_time_plan"] = getattr(fixed_time_plan, "name", None)
+    return result
 
 
 def calculate_six_phase_fitness(metrics, fitness_config=None, six_phase_config=None):
@@ -635,11 +754,148 @@ def evaluate_six_phase_policy_across_seeds(
     }
 
 
+def evaluate_fixed_time_policy_across_seeds(
+    config,
+    fixed_time_plan,
+    seeds=(1, 2, 3),
+    duration_s=300.0,
+    timestep_s=1 / 30,
+    speed_factor=None,
+    traffic_profiles=None,
+    scenario_pairs=None,
+    abort_remaining_seeds_on_gridlock=None,
+):
+    """Evaluate a fixed plan over the same profile/seed scenario matrix.
+
+    ``abort_remaining_seeds_on_gridlock`` overrides the matching fitness
+    setting.  Comparison tools should set it to ``False`` so every controller
+    is summarized over the full requested holdout matrix.
+    """
+    if fixed_time_plan is None:
+        raise TypeError("fixed_time_plan is required")
+    if scenario_pairs is None:
+        seeds = tuple(seeds)
+        if not seeds:
+            raise ValueError("at least one random seed is required")
+        if traffic_profiles is None:
+            traffic_profiles = config.get("six_phase_training", {}).get(
+                "traffic_profiles",
+                (),
+            )
+        traffic_profiles = tuple(traffic_profiles) or ({"name": "configured"},)
+        requested_pairs = tuple(
+            (profile, seed)
+            for profile in traffic_profiles
+            for seed in seeds
+        )
+        traffic_profile_names = tuple(
+            profile.get("name", "unnamed") for profile in traffic_profiles
+        )
+    else:
+        try:
+            requested_pairs = tuple(scenario_pairs)
+        except TypeError as error:
+            raise ValueError(
+                "scenario_pairs must be an iterable of (profile, seed) pairs"
+            ) from error
+        if not requested_pairs:
+            raise ValueError("at least one scenario pair is required")
+
+        normalized_pairs = []
+        for index, pair in enumerate(requested_pairs):
+            try:
+                profile, seed = pair
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    f"scenario pair {index} must contain exactly (profile, seed)"
+                ) from error
+            if not isinstance(profile, Mapping):
+                raise ValueError(f"scenario pair {index} profile must be a mapping")
+            normalized_pairs.append((profile, seed))
+        requested_pairs = tuple(normalized_pairs)
+        seeds = tuple(seed for _, seed in requested_pairs)
+        traffic_profile_names = tuple(
+            profile.get("name", "unnamed") for profile, _ in requested_pairs
+        )
+
+    requested_scenarios = tuple(
+        (profile.get("name", "unnamed"), seed)
+        for profile, seed in requested_pairs
+    )
+    if abort_remaining_seeds_on_gridlock is None:
+        abort_remaining_seeds_on_gridlock = bool(
+            config.get("six_phase_fitness", {}).get(
+                "abort_remaining_seeds_on_gridlock",
+                True,
+            )
+        )
+    else:
+        abort_remaining_seeds_on_gridlock = bool(
+            abort_remaining_seeds_on_gridlock
+        )
+    evaluations = []
+    fitness_samples = []
+    skipped_scenarios = ()
+    candidate_rejected = False
+    for scenario_index, (profile, seed) in enumerate(requested_pairs):
+        evaluation = evaluate_fixed_time_policy(
+            config,
+            fixed_time_plan,
+            duration_s=duration_s,
+            timestep_s=timestep_s,
+            random_seed=seed,
+            speed_factor=speed_factor,
+            traffic_profile=profile,
+        )
+        evaluations.append(evaluation)
+        fitness_samples.append(evaluation["fitness"])
+        if evaluation["terminated_early"]:
+            candidate_rejected = True
+        if (
+            abort_remaining_seeds_on_gridlock
+            and evaluation["terminated_early"]
+        ):
+            skipped_scenarios = requested_scenarios[scenario_index + 1 :]
+            fitness_samples.extend(
+                evaluation["fitness"] for _ in skipped_scenarios
+            )
+            break
+
+    six_phase_metric_names = MEAN_METRIC_NAMES + (
+        "gridlock_detected",
+        "gridlock_remaining_time_s",
+        "max_intersection_stuck_vehicles",
+        "evaluation_elapsed_s",
+    )
+    return {
+        "mean_fitness": fmean(fitness_samples),
+        "mean_metrics": _average_metrics(evaluations, six_phase_metric_names),
+        "fixed_time_plan": getattr(fixed_time_plan, "name", None),
+        "seeds": seeds,
+        "evaluated_seeds": tuple(
+            result["random_seed"] for result in evaluations
+        ),
+        "traffic_profiles": traffic_profile_names,
+        "requested_scenarios": requested_scenarios,
+        "evaluated_scenarios": tuple(
+            (result["traffic_profile"], result["random_seed"])
+            for result in evaluations
+        ),
+        "skipped_scenarios": skipped_scenarios,
+        "requested_scenario_count": len(requested_scenarios),
+        "evaluated_scenario_count": len(evaluations),
+        "skipped_scenario_count": len(skipped_scenarios),
+        "candidate_rejected": candidate_rejected,
+        "evaluations": evaluations,
+    }
+
+
 def evaluate_movement_policy(*args, **kwargs):
     """Evaluate the independent-score movement policy with the same metrics."""
     policy = args[1] if len(args) > 1 else kwargs.get("policy")
     if policy is None or not hasattr(policy, "predict_movement_scores"):
         raise TypeError("policy must provide predict_movement_scores")
+    args, kwargs = _apply_policy_control_scope(args, kwargs, policy)
     return evaluate_six_phase_policy(*args, **kwargs)
 
 
@@ -648,4 +904,42 @@ def evaluate_movement_policy_across_seeds(*args, **kwargs):
     policy = args[1] if len(args) > 1 else kwargs.get("policy")
     if policy is None or not hasattr(policy, "predict_movement_scores"):
         raise TypeError("policy must provide predict_movement_scores")
+    args, kwargs = _apply_policy_control_scope(args, kwargs, policy)
     return evaluate_six_phase_policy_across_seeds(*args, **kwargs)
+
+
+def _apply_policy_control_scope(args, kwargs, policy):
+    """Evaluate a movement model under the road-user scope it was trained for."""
+    control_scope = getattr(policy, "control_scope", None)
+    if control_scope is None:
+        return args, kwargs
+    if args:
+        config = args[0]
+    else:
+        config = kwargs.get("config")
+    if config is None:
+        return args, kwargs
+
+    pedestrians_enabled = bool(
+        config.get("road_users", {}).get("pedestrians_enabled", True)
+    )
+    if control_scope == "vehicles_and_pedestrians" and pedestrians_enabled:
+        return args, kwargs
+    if (
+        control_scope == "vehicles_only"
+        and not pedestrians_enabled
+    ):
+        return args, kwargs
+
+    # Import lazily so the renderer-free evaluation module remains usable as
+    # part of the simulation package without introducing an import cycle.
+    from config import apply_movement_control_scope
+
+    scoped_config = deepcopy(config)
+    apply_movement_control_scope(scoped_config, control_scope)
+    if args:
+        args = (scoped_config, *args[1:])
+    else:
+        kwargs = dict(kwargs)
+        kwargs["config"] = scoped_config
+    return args, kwargs

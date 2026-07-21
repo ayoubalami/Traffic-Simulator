@@ -9,6 +9,9 @@ class Renderer:
 
     def __init__(self, config):
         self.config = config
+        self.pedestrians_enabled = bool(
+            config.get("road_users", {}).get("pedestrians_enabled", True)
+        )
         self._initialize_density_control()
         pygame.init()
         w = config["window"]["width"]
@@ -126,9 +129,11 @@ class Renderer:
         self.draw_lane_arrows()
         self.draw_vehicles(render_data["vehicles"])
         self.draw_vehicle_braking_debug(render_data["vehicles"])
-        self.draw_pedestrians(render_data.get("pedestrians", []))
+        if self.pedestrians_enabled:
+            self.draw_pedestrians(render_data.get("pedestrians", []))
         self.draw_traffic_lights(render_data["lights"])
-        self.draw_pedestrian_lights(render_data["lights"])
+        if self.pedestrians_enabled:
+            self.draw_pedestrian_lights(render_data["lights"])
         self.draw_metrics(render_data["metrics"])
         self.draw_phase_probabilities(
             render_data.get("phase_probabilities"),
@@ -539,7 +544,7 @@ class Renderer:
         self.screen.blit(help_2, (panel_x + 10, panel_y + 90))
 
     def draw_movement_scores(self, scores, decision_debug=None):
-        """Draw vehicle and pedestrian scores plus the safely decoded set."""
+        """Draw available policy scores plus the safely decoded set."""
         if not scores:
             return
 
@@ -607,7 +612,7 @@ class Renderer:
             (
                 "Vehicle + pedestrian outputs"
                 if pedestrian_aware
-                else "Movement outputs (legacy)"
+                else "Vehicle movement outputs"
             ),
             True,
             (255, 255, 255),
@@ -674,6 +679,8 @@ class Renderer:
             (
                 f"Threshold V:{threshold:.2f} P:{pedestrian_threshold:.2f} "
                 f"State:{phase_state}"
+                if pedestrian_aware
+                else f"Threshold:{threshold:.2f} State:{phase_state}"
             ),
         )
         for index, footer_text in enumerate(footer_lines):

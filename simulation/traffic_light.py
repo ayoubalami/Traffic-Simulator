@@ -9,6 +9,9 @@ class TrafficLightController:
 
     def __init__(self, config):
         self.config = config
+        self.pedestrians_enabled = bool(
+            config.get("road_users", {}).get("pedestrians_enabled", True)
+        )
         timing = config.get("traffic_lights", {})
         self.yellow_duration = max(0.1, float(timing.get("yellow_duration_s", 2.0)))
         self.all_red_clearance_duration = max(
@@ -145,6 +148,8 @@ class TrafficLightController:
         pedestrian cannot enter immediately before the next traffic phase.
         """
         if crossing not in self.DIRECTIONS:
+            return "red"
+        if not self.pedestrians_enabled:
             return "red"
         if not self.pedestrian_signals_enabled:
             return "green" if self.get_state(crossing) == "red" else "red"
@@ -870,6 +875,26 @@ class MovementTrafficLightController(SixPhaseTrafficLightController):
             0.0,
             float(controller_config.get("switch_hysteresis", 0.15)),
         )
+        self.emergency_min_green_duration = max(
+            0.0,
+            float(
+                controller_config.get(
+                    "emergency_min_green_duration_s",
+                    self.min_green_duration,
+                )
+            ),
+        )
+        self.empty_green_gap_out_duration = max(
+            0.0,
+            float(
+                controller_config.get(
+                    "empty_green_gap_out_s",
+                    2.0,
+                )
+            ),
+        )
+        self.empty_green_elapsed = 0.0
+        self.empty_green_gap_out_count = 0
         self.network_controls_right_turns = bool(
             controller_config.get("network_controls_right_turns", True)
         )
@@ -908,6 +933,18 @@ class MovementTrafficLightController(SixPhaseTrafficLightController):
         }
         self.last_raw_requested_movements = frozenset()
         self.last_demanded_movements = frozenset()
+        # Right-turn outputs normally remain under neural control.  When the
+        # active main phase serves no traffic at all, however, a low neural
+        # score must not strand the only waiting movement indefinitely.  The
+        # decoder records those demand-driven fallback requests separately so
+        # debug output can continue to distinguish them from raw network
+        # requests.
+        self.last_demand_requested_right_movements = frozenset()
+        self.last_emergency_demanded_movements = frozenset()
+        self.last_served_emergency_movements = frozenset()
+        self.emergency_service_elapsed = 0.0
+        self._emergency_service_active = False
+        self.emergency_preemption_count = 0
         self.last_decoded_main_movements = self.active_movements
         self.last_decoded_movements = self.active_movements
         self.last_controller_decision = self.active_phase
@@ -1125,7 +1162,8 @@ class MovementTrafficLightController(SixPhaseTrafficLightController):
 
     def _enable_pedestrian_policy(self):
         if (
-            self._pedestrian_policy_enabled
+            not self.pedestrians_enabled
+            or self._pedestrian_policy_enabled
             or not self.pedestrian_signals_enabled
         ):
             return
@@ -1205,6 +1243,271 @@ class MovementTrafficLightController(SixPhaseTrafficLightController):
                 int(queued_right.get(direction, 0)),
             )
         return demand
+
+    def _observed_movement_counts(self, observation, name, fallback):
+        """Return an exact movement map without confusing all-zero with absent."""
+        counts = observation.get(name)
+        if isinstance(counts, dict) and any(
+            movement in counts for movement in self.MOVEMENTS
+        ):
+            return {
+                movement: max(0, int(counts.get(movement, 0)))
+                for movement in self.MOVEMENTS
+            }
+        return fallback()
+
+    def _near_stop_movement_demand(self, observation):
+        """Demand able to use a green soon enough to reset passage timing."""
+        return self._observed_movement_counts(
+            observation,
+            "near_stop_movement_counts",
+            lambda: self._movement_demand(observation),
+        )
+
+    def _queued_movement_demand(self, observation):
+        """Stopped demand by movement, with a legacy-observation fallback."""
+        def fallback():
+            queues = observation.get("queue_lengths", {})
+            queued_left = observation.get("queued_left_turn_counts", {})
+            queued_right = observation.get("queued_right_turn_counts", {})
+            result = {}
+            for direction in self.DIRECTIONS:
+                left = max(0, int(queued_left.get(direction, 0)))
+                right = max(0, int(queued_right.get(direction, 0)))
+                result[f"{direction}_left"] = left
+                result[f"{direction}_right"] = right
+                result[f"{direction}_through"] = max(
+                    0,
+                    int(queues.get(direction, 0)) - left - right,
+                )
+            return result
+
+        return self._observed_movement_counts(
+            observation,
+            "queued_movement_counts",
+            fallback,
+        )
+
+    def _empty_green_has_competing_queue(self, observation):
+        """Whether a real waiting movement cannot use the current greens."""
+        active = self.get_active_policy_movements()
+        near_stop = self._near_stop_movement_demand(observation)
+        if any(near_stop.get(movement, 0) > 0 for movement in active):
+            return False
+        queued = self._queued_movement_demand(observation)
+        return any(
+            count > 0 and movement not in active
+            for movement, count in queued.items()
+        )
+
+    def _has_explicit_emergency_movement_counts(self, observation):
+        """Return whether the observation identifies emergency movements.
+
+        The simulator exposes this precise mapping. Per-approach
+        ``emergency_counts`` remains a backward-compatible fallback for older
+        observation providers that cannot identify an intended turn.
+        """
+        counts = observation.get("emergency_movement_counts")
+        return bool(
+            isinstance(counts, dict)
+            and any(movement in counts for movement in self.MOVEMENTS)
+        )
+
+    def _emergency_movement_demand(self, observation, demand=None):
+        """Project emergency demand onto movement names.
+
+        If movement-specific counts are unavailable, every demanded movement
+        on an emergency approach is marked. Candidate scoring then counts that
+        emergency only once per approach, preventing an approach with several
+        ordinary turn classes from receiving artificial extra priority.
+        """
+        demand = demand if demand is not None else self._movement_demand(observation)
+        if self._has_explicit_emergency_movement_counts(observation):
+            counts = observation.get("emergency_movement_counts", {})
+            return {
+                movement: max(0, int(counts.get(movement, 0)))
+                for movement in self.MOVEMENTS
+                if demand.get(movement, 0) > 0
+                and self.config["roads"][
+                    self.movement_direction(movement)
+                ]["enabled"]
+                and max(0, int(counts.get(movement, 0))) > 0
+            }
+
+        approach_counts = observation.get("emergency_counts", {})
+        emergency_demand = {}
+        for movement in self.MOVEMENTS:
+            direction = self.movement_direction(movement)
+            count = max(0, int(approach_counts.get(direction, 0)))
+            if (
+                count > 0
+                and demand.get(movement, 0) > 0
+                and self.config["roads"][direction]["enabled"]
+            ):
+                emergency_demand[movement] = count
+        return emergency_demand
+
+    def _candidate_emergency_priority(
+        self,
+        movements,
+        served_right_directions,
+        emergency_demand,
+        demand,
+        observation,
+    ):
+        """Return a lexicographic, conflict-safe emergency priority tuple.
+
+        Waiting time is compared before volume so two conflicting emergency
+        approaches are served deterministically and an older request cannot be
+        hidden by the neural score. Compatible emergencies remain eligible to
+        run together through the normal conflict-free candidate generation.
+        """
+        served = frozenset(movements).union(
+            f"{direction}_right" for direction in served_right_directions
+        )
+        explicitly_movement_specific = (
+            self._has_explicit_emergency_movement_counts(observation)
+        )
+        served_units = []
+        if explicitly_movement_specific:
+            for movement in served:
+                count = emergency_demand.get(movement, 0)
+                if count <= 0:
+                    continue
+                served_units.append(
+                    (
+                        count,
+                        self.movement_red_elapsed.get(movement, 0.0),
+                        demand.get(movement, 0),
+                    )
+                )
+        else:
+            approach_counts = observation.get("emergency_counts", {})
+            for direction in self.DIRECTIONS:
+                served_movements = [
+                    movement
+                    for movement in served
+                    if self.movement_direction(movement) == direction
+                    and emergency_demand.get(movement, 0) > 0
+                ]
+                count = max(0, int(approach_counts.get(direction, 0)))
+                if count <= 0 or not served_movements:
+                    continue
+                served_units.append(
+                    (
+                        count,
+                        max(
+                            self.movement_red_elapsed.get(movement, 0.0)
+                            for movement in served_movements
+                        ),
+                        sum(demand.get(movement, 0) for movement in served_movements),
+                    )
+                )
+
+        emergency_count = sum(count for count, _, _ in served_units)
+        oldest_wait = max((elapsed for _, elapsed, _ in served_units), default=0.0)
+        weighted_wait = sum(
+            count * elapsed for count, elapsed, _ in served_units
+        )
+        flow_demand = sum(flow for _, _, flow in served_units)
+        return (
+            int(emergency_count > 0),
+            oldest_wait,
+            emergency_count,
+            weighted_wait,
+            flow_demand,
+        )
+
+    def _has_unserved_emergency(self, observation, demand=None):
+        """Return whether a demanded emergency approach lacks a safe green."""
+        demand = demand if demand is not None else self._movement_demand(observation)
+        emergency_demand = self._emergency_movement_demand(observation, demand)
+        self.last_emergency_demanded_movements = frozenset(emergency_demand)
+        if not emergency_demand:
+            return False
+
+        active = (
+            self.get_active_policy_movements()
+            if self.phase_state == "green"
+            else frozenset()
+        )
+        if self._has_explicit_emergency_movement_counts(observation):
+            return any(movement not in active for movement in emergency_demand)
+
+        emergency_directions = {
+            self.movement_direction(movement) for movement in emergency_demand
+        }
+        served_directions = {
+            self.movement_direction(movement)
+            for movement in active
+            if movement in emergency_demand
+        }
+        return bool(emergency_directions.difference(served_directions))
+
+    def _served_emergency_movements(self, observation, demand=None):
+        """Return emergency demand currently receiving an effective green.
+
+        Exact movement counts are preferred. Older observation providers only
+        identify the emergency approach, so their result deliberately mirrors
+        the approach-level fallback used by ``_has_unserved_emergency``.
+        """
+        if self.phase_state != "green":
+            return frozenset()
+        demand = demand if demand is not None else self._movement_demand(observation)
+        emergency_demand = self._emergency_movement_demand(observation, demand)
+        if not emergency_demand:
+            return frozenset()
+
+        active = self.get_active_policy_movements()
+        if self._has_explicit_emergency_movement_counts(observation):
+            return frozenset(active.intersection(emergency_demand))
+
+        emergency_directions = {
+            self.movement_direction(movement) for movement in emergency_demand
+        }
+        return frozenset(
+            movement
+            for movement in active
+            if movement in emergency_demand
+            and self.movement_direction(movement) in emergency_directions
+        )
+
+    def _update_emergency_service_lock(self, observation, demand, dt):
+        """Advance the anti-chatter lock for an actively served emergency."""
+        served = self._served_emergency_movements(observation, demand)
+        self.last_served_emergency_movements = served
+        if served:
+            if self._emergency_service_active:
+                self.emergency_service_elapsed += dt
+            else:
+                self._emergency_service_active = True
+                self.emergency_service_elapsed = dt
+        else:
+            self._emergency_service_active = False
+            self.emergency_service_elapsed = 0.0
+        return served
+
+    def _emergency_service_is_locked(self):
+        return bool(
+            self._emergency_service_active
+            and self.emergency_service_elapsed
+            < self.emergency_min_green_duration
+        )
+
+    def _candidate_preserves_served_emergency(self, movements):
+        """Whether a candidate keeps every emergency protected by the lock."""
+        movements = frozenset(movements)
+        encoded = self.encode_movements(movements)
+        for movement in self.last_served_emergency_movements:
+            if self.movement_kind(movement) == "right":
+                if not self.right_turn_is_compatible_with_phase(
+                    self.movement_direction(movement),
+                    encoded,
+                ):
+                    return False
+            elif movement not in movements:
+                return False
+        return True
 
     def _pedestrian_demand(self, observation):
         waiting = observation.get("waiting_pedestrian_counts", {})
@@ -1517,7 +1820,14 @@ class MovementTrafficLightController(SixPhaseTrafficLightController):
             maximal.append(main_movements)
         return maximal
 
-    def _right_turns_served_by(self, movements, demand, scores):
+    def _right_turns_served_by(
+        self,
+        movements,
+        demand,
+        scores,
+        emergency_demand=None,
+    ):
+        emergency_demand = emergency_demand or {}
         return {
             direction
             for direction in self.DIRECTIONS
@@ -1525,12 +1835,19 @@ class MovementTrafficLightController(SixPhaseTrafficLightController):
             and (
                 float(scores.get(f"{direction}_right", 0.0))
                 >= self.output_threshold
+                or f"{direction}_right"
+                in self.last_demand_requested_right_movements
+                or emergency_demand.get(f"{direction}_right", 0) > 0
                 or self.right_red_elapsed[direction] >= self.max_red_duration
             )
             and self._right_direction_is_scene_safe(direction, movements)
         }
 
     def _score_candidate(self, movements, scores, demand, observation):
+        emergency_demand = self._emergency_movement_demand(
+            observation,
+            demand,
+        )
         overdue = {
             movement
             for movement, elapsed in self.movement_red_elapsed.items()
@@ -1550,9 +1867,34 @@ class MovementTrafficLightController(SixPhaseTrafficLightController):
             movements,
             demand,
             scores,
+            emergency_demand,
         )
-        # Scores are priorities, not permission penalties. Every term is
-        # non-negative, so adding compatible demand never lowers utility.
+        # Scores shape, rather than replace, traffic demand.  Weighting every
+        # served vehicle by ``1 + score`` prevents a single high-score request
+        # from starving a much larger queue while preserving the network as a
+        # useful tie-breaker between similarly loaded movements.
+        pressure = sum(
+            max(0, demand.get(movement, 0))
+            * (
+                1.0
+                + max(0.0, float(scores.get(movement, 0.0)))
+            )
+            for movement in movements
+            if demand.get(movement, 0) > 0
+        )
+        pressure += sum(
+            max(0, demand.get(f"{direction}_right", 0))
+            * (
+                1.0
+                + max(
+                    0.0,
+                    float(scores.get(f"{direction}_right", 0.0)),
+                )
+            )
+            for direction in served_right
+        )
+        # Raw utility follows pressure in the lexicographic key.  It therefore
+        # resolves pressure ties without being able to overrule queue size.
         utility = sum(
             max(0.0, float(scores.get(movement, 0.0)))
             for movement in movements
@@ -1570,7 +1912,14 @@ class MovementTrafficLightController(SixPhaseTrafficLightController):
             demand.get(f"{direction}_right", 0)
             for direction in served_right
         )
-        return (
+        emergency_priority = self._candidate_emergency_priority(
+            movements,
+            served_right,
+            emergency_demand,
+            demand,
+            observation,
+        )
+        return emergency_priority + (
             len(overdue.intersection(movements))
             + len(overdue_right.intersection(served_right)),
             sum(
@@ -1581,6 +1930,7 @@ class MovementTrafficLightController(SixPhaseTrafficLightController):
                 self.right_red_elapsed[direction]
                 for direction in overdue_right.intersection(served_right)
             ),
+            pressure,
             utility,
             demand_served,
             len(movements),
@@ -1588,6 +1938,11 @@ class MovementTrafficLightController(SixPhaseTrafficLightController):
 
     def decode_scores(self, scores, observation, force_change=False):
         demand = self._movement_demand(observation)
+        emergency_demand = self._emergency_movement_demand(
+            observation,
+            demand,
+        )
+        self.last_emergency_demanded_movements = frozenset(emergency_demand)
         all_demanded = frozenset(
             movement
             for movement, count in demand.items()
@@ -1601,11 +1956,29 @@ class MovementTrafficLightController(SixPhaseTrafficLightController):
             for movement in all_demanded
             if float(scores.get(movement, 0.0)) >= self.output_threshold
         )
+        near_stop_demand = self._near_stop_movement_demand(observation)
+        active_main_serves_demand = bool(
+            self.phase_state == "green"
+            and any(
+                movement in self.active_movements
+                and near_stop_demand.get(movement, 0) > 0
+                for movement in self.MAIN_MOVEMENTS
+            )
+        )
+        self.last_demand_requested_right_movements = frozenset(
+            movement
+            for movement in self.RIGHT_MOVEMENTS
+            if demand.get(movement, 0) > 0
+            and not active_main_serves_demand
+        )
         requested_right_directions = {
             self.movement_direction(movement)
             for movement in self.RIGHT_MOVEMENTS
             if (
                 movement in self.last_raw_requested_movements
+                or movement
+                in self.last_demand_requested_right_movements
+                or emergency_demand.get(movement, 0) > 0
                 or (
                     demand.get(movement, 0) > 0
                     and self.right_red_elapsed[
@@ -1665,11 +2038,22 @@ class MovementTrafficLightController(SixPhaseTrafficLightController):
             movement not in self.active_movements for movement in demanded
         )
         selectable = candidates
-        if force_change and competing_demand:
+        if (
+            force_change
+            and competing_demand
+            and (
+                not emergency_demand
+                or not self._emergency_service_is_locked()
+            )
+        ):
             alternatives = [
                 movements
                 for movements in candidates
-                if movements != self.active_movements
+                if any(
+                    movement not in self.active_movements
+                    for movement in movements
+                    if demand.get(movement, 0) > 0
+                )
             ]
             if alternatives:
                 selectable = alternatives
@@ -1693,25 +2077,40 @@ class MovementTrafficLightController(SixPhaseTrafficLightController):
             and elapsed >= self.max_red_duration
             for direction, elapsed in self.right_red_elapsed.items()
         )
+        unserved_emergency = self._has_unserved_emergency(
+            observation,
+            demand,
+        )
         if (
             not force_change
             and not any_overdue
+            and not unserved_emergency
             and active_can_hold
             and best != self.active_movements
         ):
-            best_utility = self._score_candidate(
+            best_pressure = self._score_candidate(
                 best,
                 scores,
                 demand,
                 observation,
-            )[2]
-            active_utility = self._score_candidate(
+            )[-4]
+            active_score = self._score_candidate(
                 self.active_movements,
                 scores,
                 demand,
                 observation,
-            )[2]
-            if best_utility < active_utility + self.switch_hysteresis:
+            )
+            active_pressure = active_score[-4]
+            active_demand_served = active_score[-2]
+            # Hysteresis is configured on the network's per-movement score
+            # scale. Scale it by active demand so the same small score change
+            # does not become an artificial switch merely because both queues
+            # contain several vehicles.
+            pressure_hysteresis = self.switch_hysteresis * max(
+                1,
+                active_demand_served,
+            )
+            if best_pressure < active_pressure + pressure_hysteresis:
                 best = self.active_movements
 
         self.last_decoded_main_movements = frozenset(best)
@@ -1749,6 +2148,9 @@ class MovementTrafficLightController(SixPhaseTrafficLightController):
             for movement in self.MOVEMENTS
         }
         demand = self._movement_demand(observation)
+        self.last_emergency_demanded_movements = frozenset(
+            self._emergency_movement_demand(observation, demand)
+        )
         self.last_demanded_movements = frozenset(
             movement
             for movement, count in demand.items()
@@ -1857,13 +2259,22 @@ class MovementTrafficLightController(SixPhaseTrafficLightController):
 
         dt = max(0.0, float(dt))
         demand = self._movement_demand(observation)
+        emergency_demand = self._emergency_movement_demand(
+            observation,
+            demand,
+        )
         for direction in self.DIRECTIONS:
             movement = f"{direction}_right"
             demanded = demand.get(movement, 0) > 0
             requested = bool(
                 demanded
-                and self.last_movement_scores.get(movement, 0.0)
-                >= self.output_threshold
+                and (
+                    self.last_movement_scores.get(movement, 0.0)
+                    >= self.output_threshold
+                    or movement
+                    in self.last_demand_requested_right_movements
+                    or emergency_demand.get(movement, 0) > 0
+                )
             )
             if requested:
                 self.right_turn_demand_hold_remaining[direction] = (
@@ -1975,19 +2386,62 @@ class MovementTrafficLightController(SixPhaseTrafficLightController):
             demand.get(movement, 0) > 0
             for movement in self.MAIN_MOVEMENTS
         )
+        initial_right_demand = any(
+            demand.get(movement, 0) > 0
+            for movement in self.RIGHT_MOVEMENTS
+        )
+        emergency_demand = self._emergency_movement_demand(
+            observation,
+            demand,
+        )
+        self._update_emergency_service_lock(observation, demand, dt)
+        empty_green_condition = bool(
+            self.phase_state == "green"
+            and not self.last_served_emergency_movements
+            and self._empty_green_has_competing_queue(observation)
+        )
+        if empty_green_condition:
+            self.empty_green_elapsed += dt
+        else:
+            self.empty_green_elapsed = 0.0
+        initial_emergency_demand = bool(emergency_demand)
+        initial_decision_demand = bool(
+            initial_main_demand
+            or initial_right_demand
+            or initial_emergency_demand
+        )
+        emergency_preemption_due = bool(
+            self.phase_state == "green"
+            and self._has_unserved_emergency(observation, demand)
+            and not self._emergency_service_is_locked()
+        )
+        empty_green_gap_out_due = bool(
+            self.empty_green_gap_out_duration > 0.0
+            and empty_green_condition
+            and self.timer >= self.min_green_duration
+            and self.empty_green_elapsed
+            >= self.empty_green_gap_out_duration
+            and not emergency_preemption_due
+        )
         score_refresh_due = self.timer >= self.next_score_update
         first_demand_refresh_due = bool(
             self._awaiting_initial_movement
             and self.pending_movements is None
-            and initial_main_demand
-            and not self.last_demanded_movements.intersection(
-                self.MAIN_MOVEMENTS
+            and initial_decision_demand
+            and not (
+                self.last_demanded_movements.intersection(self.MAIN_MOVEMENTS)
+                or self.last_emergency_demanded_movements
             )
         )
         if (
             self.phase_state == "green"
             or self._awaiting_initial_movement
-        ) and (score_refresh_due or first_demand_refresh_due):
+        ) and (
+            score_refresh_due
+            or first_demand_refresh_due
+            or emergency_preemption_due
+            or empty_green_gap_out_due
+        ):
             self._refresh_movement_scores(observation)
             if score_refresh_due:
                 self.next_score_update += self.extension_check_interval
@@ -2010,7 +2464,7 @@ class MovementTrafficLightController(SixPhaseTrafficLightController):
         if (
             self._awaiting_initial_movement
             and self.pending_movements is None
-            and initial_main_demand
+            and initial_decision_demand
         ):
             requested = self.decode_scores(
                 self.last_movement_scores,
@@ -2020,7 +2474,11 @@ class MovementTrafficLightController(SixPhaseTrafficLightController):
                 self.last_raw_requested_movements
             )
             self.last_controller_decision = self.encode_movements(requested)
-            if requested:
+            if (
+                requested
+                or initial_right_demand
+                or initial_emergency_demand
+            ):
                 self.pending_movements = frozenset(requested)
                 self.pending_phase = self.encode_movements(
                     self.pending_movements
@@ -2029,8 +2487,15 @@ class MovementTrafficLightController(SixPhaseTrafficLightController):
                 # movement set has been selected, then begin its minimum green.
                 self.timer = 0.0
 
-        if self.phase_state == "green" and self.timer >= self.next_extension_check:
-            force_change = self.timer >= self.max_green_duration
+        if self.phase_state == "green" and (
+            self.timer >= self.next_extension_check
+            or emergency_preemption_due
+            or empty_green_gap_out_due
+        ):
+            force_change = bool(
+                self.timer >= self.max_green_duration
+                or empty_green_gap_out_due
+            )
             requested = self.decode_scores(
                 self.last_movement_scores,
                 observation,
@@ -2041,12 +2506,39 @@ class MovementTrafficLightController(SixPhaseTrafficLightController):
             )
             self.last_controller_decision = self.encode_movements(requested)
             if requested != self.active_movements:
-                if self._can_add_movements_without_clearance(requested):
+                if empty_green_gap_out_due:
+                    self.empty_green_gap_out_count += 1
+                    self.empty_green_elapsed = 0.0
+                if self._emergency_service_is_locked():
+                    # Preserve an actively served emergency. Compatible
+                    # additions may open without interrupting it, while a
+                    # conflicting emergency waits for this bounded lock.
+                    if (
+                        self._candidate_preserves_served_emergency(requested)
+                        and self._can_add_movements_without_clearance(requested)
+                    ):
+                        self._add_compatible_movements(requested)
+                    elif self.timer >= self.next_extension_check:
+                        self.next_extension_check += (
+                            self.extension_check_interval
+                        )
+                elif emergency_preemption_due:
+                    # Emergency priority may bypass minimum green and
+                    # hysteresis, but never the established yellow/all-red
+                    # clearance or the activation safety guards.
+                    self.emergency_preemption_count += 1
+                    self._start_movement_yellow(requested)
+                elif self._can_add_movements_without_clearance(requested):
                     self._add_compatible_movements(requested)
                 else:
                     self._start_movement_yellow(requested)
             else:
-                self.next_extension_check += self.extension_check_interval
+                if empty_green_gap_out_due:
+                    # No safe alternative was available. Debounce before the
+                    # next gap-out attempt instead of decoding every frame.
+                    self.empty_green_elapsed = 0.0
+                if self.timer >= self.next_extension_check:
+                    self.next_extension_check += self.extension_check_interval
         elif self.phase_state == "yellow" and self.timer >= self.yellow_duration:
             self._set_movement_states(self.active_movements, "red")
             self.phase_state = "all_red"

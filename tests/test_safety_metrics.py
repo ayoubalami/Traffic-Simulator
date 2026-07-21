@@ -78,6 +78,85 @@ class SafetyMetricTests(unittest.TestCase):
             1 / 3,
         )
 
+    def test_controller_override_counters_are_reported(self):
+        metrics = Metrics()
+        controller = SimpleNamespace(
+            active_phase="transition",
+            phase_state="yellow",
+            empty_green_gap_out_count=3,
+            emergency_preemption_count=2,
+        )
+
+        metrics.update_control(controller, [], dt=0.1)
+        summary = metrics.get_summary()
+
+        self.assertEqual(summary["empty_green_gap_outs"], 3)
+        self.assertEqual(summary["emergency_preemptions"], 2)
+
+    def test_all_red_metrics_separate_idle_clearance_and_safety_wait(self):
+        metrics = Metrics()
+        stopped = [
+            SimpleNamespace(
+                stopped=True,
+                cleared_intersection=False,
+                is_turning_vehicle=False,
+            )
+            for _ in range(2)
+        ]
+        controller = SimpleNamespace(
+            active_phase="none",
+            phase_state="all_red",
+            timer=0.5,
+            all_red_clearance_duration=1.0,
+            _awaiting_initial_movement=True,
+            pending_movements=None,
+        )
+
+        metrics.advance_time(1.75)
+        metrics.update_control(controller, stopped, dt=0.5)
+        controller._awaiting_initial_movement = False
+        controller.pending_movements = frozenset(("north_through",))
+        metrics.update_control(controller, stopped, dt=0.5)
+        controller.timer = 1.5
+        metrics.update_control(controller, stopped, dt=0.5)
+        controller.phase_state = "yellow"
+        metrics.update_control(controller, stopped, dt=0.25)
+
+        summary = metrics.get_summary()
+        self.assertAlmostEqual(summary["initial_idle_all_red_time"], 0.5)
+        self.assertAlmostEqual(summary["scheduled_all_red_time"], 0.5)
+        self.assertAlmostEqual(summary["safety_blocked_all_red_time"], 0.5)
+        self.assertAlmostEqual(summary["all_red_time"], 1.5)
+        self.assertAlmostEqual(summary["yellow_clearance_time"], 0.25)
+        self.assertAlmostEqual(summary["transition_clearance_time"], 1.25)
+        self.assertAlmostEqual(summary["all_red_stopped_vehicle_time"], 3.0)
+
+    def test_emergency_wait_is_tracked_and_has_its_own_fitness_weight(self):
+        metrics = Metrics({"simulation": {"pixels_per_meter": 1.0}})
+        emergency = self.stopped_vehicle()
+        emergency.is_emergency = True
+        metrics.register_vehicle(
+            id(emergency),
+            "north",
+            is_emergency=True,
+        )
+
+        metrics.update([emergency], 2.0)
+        summary = metrics.get_summary()
+
+        self.assertEqual(summary["total_emergency_vehicles_spawned"], 1)
+        self.assertAlmostEqual(
+            summary["avg_emergency_vehicle_wait_time_all"],
+            2.0,
+        )
+        self.assertAlmostEqual(
+            calculate_fitness(
+                {"avg_emergency_vehicle_wait_time_all": 2.0},
+                {"avg_emergency_vehicle_wait_time_penalty": 5.0},
+            ),
+            -10.0,
+        )
+
     def test_leader_safety_stop_reports_abrupt_deceleration(self):
         vehicle = Vehicle.__new__(Vehicle)
         vehicle.config = {"simulation": {"pixels_per_meter": 10.0}}
