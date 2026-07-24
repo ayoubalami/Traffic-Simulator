@@ -660,6 +660,12 @@ def main():
             "output_names": list(output_names),
             "output_activation": "sigmoid",
         },
+        # Record the observation boundary used during optimization without
+        # forcing deployment to it; this supports full-state/FOV ablations.
+        "observation_model": {
+            "type": "camera_distance_from_stop_line",
+            **dict(runtime_config.get("camera_observation", {})),
+        },
         "decoder": dict(runtime_config.get("movement_controller", {})),
         "pedestrian_decoder": (
             {}

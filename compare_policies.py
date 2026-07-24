@@ -1,4 +1,4 @@
-"""Compare fixed, categorical, and movement policies on identical scenarios."""
+"""Compare fixed and neural policies on identical traffic scenarios."""
 
 import argparse
 import json
@@ -57,8 +57,9 @@ def parse_seeds(value):
 def parse_arguments():
     parser = argparse.ArgumentParser(
         description=(
-            "Compare fixed-time, categorical, and movement controllers using "
-            "identical seeds and traffic profiles."
+            "Compare fixed-time, categorical, standard movement, and "
+            "uncertainty-trained movement controllers using identical seeds "
+            "and traffic profiles."
         )
     )
     parser.add_argument(
@@ -74,7 +75,16 @@ def parse_arguments():
     parser.add_argument(
         "--movement-model",
         type=Path,
-        default=Path("models/vehicle_movement_policy_v6.json"),
+        default=Path("models/vehicle_movement_policy_v7.json"),
+    )
+    parser.add_argument(
+        "--uncertain-movement-model",
+        type=Path,
+        default=Path("models/vehicle_movement_policy_v8.json"),
+        help=(
+            "movement policy trained with camera uncertainty; it is evaluated "
+            "under the same runtime camera settings as the standard model"
+        ),
     )
     parser.add_argument("--seeds", type=parse_seeds, default=(1, 2, 3))
     parser.add_argument("--evaluation-duration", type=float, default=300.0)
@@ -99,13 +109,20 @@ def main():
     fixed = load_fixed_time_plan(args.fixed_plan)
     categorical = load_six_phase_policy(args.categorical_model)
     movement = load_movement_policy(args.movement_model)
+    uncertain_movement = load_movement_policy(args.uncertain_movement_model)
     fixed_scope = getattr(fixed, "control_scope", "vehicles_only")
     movement_scope = getattr(movement, "control_scope", None)
-    if movement_scope is not None and movement_scope != fixed_scope:
+    uncertain_scope = getattr(uncertain_movement, "control_scope", None)
+    incompatible_scopes = tuple(
+        scope
+        for scope in (movement_scope, uncertain_scope)
+        if scope is not None and scope != fixed_scope
+    )
+    if incompatible_scopes:
         raise SystemExit(
             "The fixed and movement policies must use the same control scope "
             f"for a comparable experiment (fixed={fixed_scope}, "
-            f"movement={movement_scope})."
+            f"movement={movement_scope}, uncertain={uncertain_scope})."
         )
     apply_movement_control_scope(config, fixed_scope)
     # A failed/gridlocked controller must not shorten its scenario matrix.
@@ -134,20 +151,29 @@ def main():
         movement,
         **options,
     )
+    uncertain_result = evaluate_movement_policy_across_seeds(
+        config,
+        uncertain_movement,
+        **options,
+    )
     metric_width = max(38, max(len(metric) for metric in METRICS))
     print(
         f"{'Metric':{metric_width}} "
         f"{'Fixed':>14} {'Categorical':>14} {'Movement':>14} "
-        f"{'Cat-Fixed':>14} {'Move-Fixed':>14}"
+        f"{'Uncertain':>14} {'Cat-Fixed':>14} {'Move-Fixed':>14} "
+        f"{'Unc-Fixed':>14} {'Unc-Move':>14}"
     )
-    print("-" * (metric_width + 76))
+    print("-" * (metric_width + 121))
     print(
         f"{'fitness':{metric_width}} "
         f"{fixed_result['mean_fitness']:14.2f} "
         f"{categorical_result['mean_fitness']:14.2f} "
         f"{movement_result['mean_fitness']:14.2f} "
+        f"{uncertain_result['mean_fitness']:14.2f} "
         f"{categorical_result['mean_fitness'] - fixed_result['mean_fitness']:14.2f} "
-        f"{movement_result['mean_fitness'] - fixed_result['mean_fitness']:14.2f}"
+        f"{movement_result['mean_fitness'] - fixed_result['mean_fitness']:14.2f} "
+        f"{uncertain_result['mean_fitness'] - fixed_result['mean_fitness']:14.2f} "
+        f"{uncertain_result['mean_fitness'] - movement_result['mean_fitness']:14.2f}"
     )
     for metric in METRICS:
         fixed_value = float(fixed_result["mean_metrics"].get(metric, 0.0))
@@ -155,12 +181,18 @@ def main():
             categorical_result["mean_metrics"].get(metric, 0.0)
         )
         movement_value = float(movement_result["mean_metrics"].get(metric, 0.0))
+        uncertain_value = float(
+            uncertain_result["mean_metrics"].get(metric, 0.0)
+        )
         print(
             f"{metric:{metric_width}} {fixed_value:14.2f} "
             f"{categorical_value:14.2f} "
             f"{movement_value:14.2f} "
+            f"{uncertain_value:14.2f} "
             f"{categorical_value - fixed_value:14.2f} "
-            f"{movement_value - fixed_value:14.2f}"
+            f"{movement_value - fixed_value:14.2f} "
+            f"{uncertain_value - fixed_value:14.2f} "
+            f"{uncertain_value - movement_value:14.2f}"
         )
     if args.json_output is not None:
         args.json_output.parent.mkdir(parents=True, exist_ok=True)
@@ -170,10 +202,19 @@ def main():
                     "fixed": fixed_result,
                     "categorical": categorical_result,
                     "movement": movement_result,
+                    "uncertain_movement": uncertain_result,
                     "seeds": args.seeds,
                     "evaluation_duration_s": args.evaluation_duration,
                     "physics_timestep_s": args.timestep,
                     "speed_factor_compatibility_value": args.speed_factor,
+                    "models": {
+                        "fixed": str(args.fixed_plan),
+                        "categorical": str(args.categorical_model),
+                        "movement": str(args.movement_model),
+                        "uncertain_movement": str(
+                            args.uncertain_movement_model
+                        ),
+                    },
                 },
                 indent=2,
             ),

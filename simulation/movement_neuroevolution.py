@@ -1196,9 +1196,43 @@ class MovementPolicyEvolution(SixPhasePolicyEvolution):
         return restored
 
     def _checkpoint_signature(self):
+        camera = self.config.get("camera_observation", {})
         return {
             "policy_class": f"{self.policy_class.__module__}.{self.policy_class.__name__}",
             "genome_size": self.policy_class.genome_size,
+            "camera_observation": {
+                "enabled": bool(camera.get("enabled", False)),
+                "detection_distance_m": float(
+                    camera.get("detection_distance_m", 0.0)
+                ),
+                "sampling_interval_s": float(
+                    camera.get("sampling_interval_s", 1.0)
+                ),
+                "uncertainty_enabled": bool(
+                    camera.get("uncertainty_enabled", False)
+                ),
+                "near_detection_probability": float(
+                    camera.get("near_detection_probability", 1.0)
+                ),
+                "far_detection_probability": float(
+                    camera.get("far_detection_probability", 1.0)
+                ),
+                "near_position_std_m": float(
+                    camera.get("near_position_std_m", 0.0)
+                ),
+                "far_position_std_m": float(
+                    camera.get("far_position_std_m", 0.0)
+                ),
+                "near_speed_std_mps": float(
+                    camera.get("near_speed_std_mps", 0.0)
+                ),
+                "far_speed_std_mps": float(
+                    camera.get("far_speed_std_mps", 0.0)
+                ),
+                "stopped_speed_threshold_mps": float(
+                    camera.get("stopped_speed_threshold_mps", 0.5)
+                ),
+            },
             "population_size": self.population_size,
             "duration_bounds_s": list(self.duration_bounds_s),
             "max_red_duration_s": self.max_red_duration_s,

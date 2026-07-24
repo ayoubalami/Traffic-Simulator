@@ -181,7 +181,9 @@ def main():
     )
     renderer = Renderer(runtime_config)
     policy.predict_movement_scores(
-        simulation.get_signal_observation(simulation.light_controller.active_phase)
+        simulation.get_controller_signal_observation(
+            simulation.light_controller.active_phase
+        )
     )
     while renderer.is_running():
         dt = renderer.clock.tick(60) / 1000.0 * time_scale

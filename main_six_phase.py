@@ -66,7 +66,9 @@ def main():
     simulation = Simulation(runtime_config, phase_selector=policy.select_phase)
     renderer = Renderer(runtime_config)
     policy.predict_phase_probabilities(
-        simulation.get_signal_observation(simulation.light_controller.active_phase)
+        simulation.get_controller_signal_observation(
+            simulation.light_controller.active_phase
+        )
     )
     while renderer.is_running():
         dt = renderer.clock.tick(60) / 1000.0 * time_scale

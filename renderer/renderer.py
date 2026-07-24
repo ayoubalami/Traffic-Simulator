@@ -6,6 +6,11 @@ from simulation.arrivals import resolve_arrival_rates
 
 class Renderer:
     DENSITY_DIRECTIONS = ("north", "south", "east", "west")
+    PROBABILITY_CONTROLS = (
+        "right_turn_chance",
+        "left_turn_chance",
+        "emergency_vehicle_spawn_chance",
+    )
 
     def __init__(self, config):
         self.config = config
@@ -22,6 +27,8 @@ class Renderer:
         self.running = True
         self.font = pygame.font.SysFont("monospace", 12)
         self.vehicle_debug_font = pygame.font.SysFont("monospace", 16)
+        self.network_output_font = pygame.font.SysFont("monospace", 12)
+        self.network_output_footer_font = pygame.font.SysFont("monospace", 10)
     
     def is_running(self):
         for event in pygame.event.get():
@@ -45,6 +52,12 @@ class Renderer:
             direction: float(rates[direction])
             for direction in self.DENSITY_DIRECTIONS
         }
+        for control in self.PROBABILITY_CONTROLS:
+            simulation_config.setdefault(control, 0.0)
+        self.initial_spawn_probabilities = {
+            control: float(simulation_config[control])
+            for control in self.PROBABILITY_CONTROLS
+        }
         self.selected_density_direction = next(
             (
                 direction
@@ -53,9 +66,10 @@ class Renderer:
             ),
             "north",
         )
+        self.selected_live_control = self.selected_density_direction
 
     def _handle_density_key(self, key):
-        """Handle one key press and update live direction arrival rates."""
+        """Handle one key press and update a live traffic-input setting."""
         if not self.density_control_enabled:
             return False
 
@@ -68,25 +82,64 @@ class Renderer:
             pygame.K_KP3: "east",
             pygame.K_4: "west",
             pygame.K_KP4: "west",
+            pygame.K_5: "right_turn_chance",
+            pygame.K_KP5: "right_turn_chance",
+            pygame.K_6: "left_turn_chance",
+            pygame.K_KP6: "left_turn_chance",
+            pygame.K_7: "emergency_vehicle_spawn_chance",
+            pygame.K_KP7: "emergency_vehicle_spawn_chance",
         }
         if key in selection_keys:
-            self.selected_density_direction = selection_keys[key]
+            selected = selection_keys[key]
+            self.selected_live_control = selected
+            if selected in self.DENSITY_DIRECTIONS:
+                self.selected_density_direction = selected
             return True
 
-        rates = self.config["simulation"]["arrival_rates_per_s"]
+        simulation = self.config["simulation"]
+        rates = simulation["arrival_rates_per_s"]
         settings = self.config.get("interactive_density_control", {})
         step = max(0.0, float(settings.get("step", 0.05)))
+        probability_step = max(
+            0.0,
+            float(settings.get("probability_step", 0.01)),
+        )
         max_rate = max(
             0.0,
             float(settings.get("max_rate_per_s", settings.get("max_weight", 10.0))),
         )
-        direction = self.selected_density_direction
+        selected = self.selected_live_control
 
         increase_keys = {pygame.K_UP, pygame.K_EQUALS, pygame.K_KP_PLUS}
         plus_key = getattr(pygame, "K_PLUS", None)
         if plus_key is not None:
             increase_keys.add(plus_key)
 
+        if key == pygame.K_r:
+            rates.update(self.initial_arrival_rates_per_s)
+            simulation.update(self.initial_spawn_probabilities)
+            return True
+
+        if selected in self.PROBABILITY_CONTROLS:
+            value = float(simulation[selected])
+            if key in increase_keys:
+                simulation[selected] = round(
+                    min(1.0, value + probability_step),
+                    6,
+                )
+                return True
+            if key in {pygame.K_DOWN, pygame.K_MINUS, pygame.K_KP_MINUS}:
+                simulation[selected] = round(
+                    max(0.0, value - probability_step),
+                    6,
+                )
+                return True
+            if key in {pygame.K_0, pygame.K_KP0}:
+                simulation[selected] = 0.0
+                return True
+            return False
+
+        direction = self.selected_density_direction
         if key in increase_keys:
             rates[direction] = round(
                 min(max_rate, float(rates[direction]) + step),
@@ -101,9 +154,6 @@ class Renderer:
             return True
         if key in {pygame.K_0, pygame.K_KP0}:
             rates[direction] = 0.0
-            return True
-        if key == pygame.K_r:
-            rates.update(self.initial_arrival_rates_per_s)
             return True
         return False
 
@@ -123,9 +173,11 @@ class Renderer:
         self.screen.fill(colors["background"])
         
         self.draw_roads()
+        self.draw_camera_detection_rois()
         self.draw_lane_markings()
         self.draw_crosswalks()
         self.draw_stop_lines()
+        self.draw_camera_detection_boundaries()
         self.draw_lane_arrows()
         self.draw_vehicles(render_data["vehicles"])
         self.draw_vehicle_braking_debug(render_data["vehicles"])
@@ -149,6 +201,164 @@ class Renderer:
         self.draw_distance_scale()
         
         pygame.display.flip()
+
+    def _camera_detection_boundaries(self):
+        """Return stop-line-relative ROI boundary segments for enabled roads."""
+        camera = self.config.get("camera_observation", {})
+        if not (
+            camera.get("enabled", False)
+            and camera.get("show_detection_boundary", True)
+        ):
+            return {}
+        detection_px = max(
+            0.0,
+            float(camera.get("detection_distance_m", 0.0)),
+        ) * max(
+            1e-9,
+            float(self.config["simulation"]["pixels_per_meter"]),
+        )
+        w = self.config["window"]["width"]
+        h = self.config["window"]["height"]
+        cx, cy = w // 2, h // 2
+        lane_width = self.config["lane_width"]
+        roads = self.config["roads"]
+        ix_half_width, ix_half_height = self._get_intersection_half_dims()
+        stop_offset = (
+            self.config["crosswalk_intersection_offset"]
+            + self.config["crosswalk_width"]
+            + self.config["crosswalk_stop_line_offset"]
+        )
+        boundaries = {}
+        if roads["north"]["enabled"]:
+            road = roads["north"]
+            width = (
+                (road["incoming"] + road["outgoing"]) * lane_width
+                + self._divider_width("north")
+            )
+            left = cx - width / 2
+            y = cy - ix_half_height - stop_offset - detection_px
+            boundaries["north"] = (
+                (left, y),
+                (left + road["incoming"] * lane_width, y),
+            )
+        if roads["south"]["enabled"]:
+            road = roads["south"]
+            width = (
+                (road["incoming"] + road["outgoing"]) * lane_width
+                + self._divider_width("south")
+            )
+            left = cx - width / 2
+            start = (
+                left
+                + road["outgoing"] * lane_width
+                + self._divider_width("south")
+            )
+            y = cy + ix_half_height + stop_offset + detection_px
+            boundaries["south"] = (
+                (start, y),
+                (start + road["incoming"] * lane_width, y),
+            )
+        if roads["west"]["enabled"]:
+            road = roads["west"]
+            width = (
+                (road["incoming"] + road["outgoing"]) * lane_width
+                + self._divider_width("west")
+            )
+            top = cy - width / 2
+            start = (
+                top
+                + road["outgoing"] * lane_width
+                + self._divider_width("west")
+            )
+            x = cx - ix_half_width - stop_offset - detection_px
+            boundaries["west"] = (
+                (x, start),
+                (x, start + road["incoming"] * lane_width),
+            )
+        if roads["east"]["enabled"]:
+            road = roads["east"]
+            width = (
+                (road["incoming"] + road["outgoing"]) * lane_width
+                + self._divider_width("east")
+            )
+            top = cy - width / 2
+            x = cx + ix_half_width + stop_offset + detection_px
+            boundaries["east"] = (
+                (x, top),
+                (x, top + road["incoming"] * lane_width),
+            )
+        return boundaries
+
+    def _camera_detection_rois(self):
+        """Return polygons covering camera-visible incoming road sections."""
+        boundaries = self._camera_detection_boundaries()
+        if not boundaries:
+            return {}
+
+        detection_px = max(
+            0.0,
+            float(
+                self.config.get("camera_observation", {}).get(
+                    "detection_distance_m",
+                    0.0,
+                )
+            ),
+        ) * max(
+            1e-9,
+            float(self.config["simulation"]["pixels_per_meter"]),
+        )
+        inward_offsets = {
+            "north": (0.0, detection_px),
+            "south": (0.0, -detection_px),
+            "west": (detection_px, 0.0),
+            "east": (-detection_px, 0.0),
+        }
+        rois = {}
+        for direction, (start, end) in boundaries.items():
+            dx, dy = inward_offsets[direction]
+            rois[direction] = (
+                start,
+                end,
+                (end[0] + dx, end[1] + dy),
+                (start[0] + dx, start[1] + dy),
+            )
+        return rois
+
+    def draw_camera_detection_rois(self):
+        """Shade the portions of incoming lanes observable by the camera."""
+        rois = self._camera_detection_rois()
+        if not rois:
+            return
+
+        camera = self.config.get("camera_observation", {})
+        color = tuple(camera.get("roi_color", (128, 128, 128)))[:3]
+        alpha = max(0, min(255, int(camera.get("roi_alpha", 70))))
+        overlay = pygame.Surface(self.screen.get_size(), pygame.SRCALPHA)
+        for points in rois.values():
+            pygame.draw.polygon(overlay, (*color, alpha), points)
+        self.screen.blit(overlay, (0, 0))
+
+    def draw_camera_detection_boundaries(self):
+        """Draw the camera-observable upstream boundary on each approach."""
+        camera = self.config.get("camera_observation", {})
+        color = tuple(camera.get("boundary_color", (40, 220, 255)))
+        for direction, (start, end) in self._camera_detection_boundaries().items():
+            self._draw_dashed_line(
+                color,
+                start,
+                end,
+                dash_length=7,
+                gap_length=4,
+                width=2,
+            )
+            label = self.font.render(
+                f"CAM {direction[0].upper()}",
+                True,
+                color,
+            )
+            x = min(start[0], end[0]) + 2
+            y = min(start[1], end[1]) + 2
+            self.screen.blit(label, (x, y))
     
     def draw_vehicles(self, vehicles):
         colors = self.config["colors"]
@@ -371,8 +581,8 @@ class Renderer:
             ("east_left", "East left"),
             ("west_left", "West left"),
         )
-        panel_width = 300
-        panel_height = 370
+        panel_width = 270
+        panel_height = 300
         panel_x = self.config["window"]["width"] - panel_width - 14
         panel_y = 14
         panel = pygame.Surface((panel_width, panel_height), pygame.SRCALPHA)
@@ -404,10 +614,10 @@ class Renderer:
         pending_phase = decision_debug.get("pending_phase")
         phase_state = decision_debug.get("phase_state") or "-"
 
-        label_font = self.vehicle_debug_font
-        bar_x = panel_x + 112
-        bar_width = 120
-        row_y = panel_y + 42
+        label_font = self.network_output_font
+        bar_x = panel_x + 105
+        bar_width = 90
+        row_y = panel_y + 38
         for phase, label in labels:
             probability = max(0.0, min(1.0, float(probabilities.get(phase, 0.0))))
             is_available = phase in available
@@ -428,7 +638,7 @@ class Renderer:
             pygame.draw.rect(
                 self.screen,
                 (50, 55, 65),
-                (bar_x, row_y + 2, bar_width, 12),
+                (bar_x, row_y + 2, bar_width, 10),
                 border_radius=2,
             )
             fill_color = (60, 190, 230) if is_selected else (120, 140, 170)
@@ -443,7 +653,7 @@ class Renderer:
                 pygame.draw.rect(
                     self.screen,
                     fill_color,
-                    (bar_x, row_y + 2, fill_width, 12),
+                    (bar_x, row_y + 2, fill_width, 10),
                     border_radius=2,
                 )
             value_surface = label_font.render(
@@ -452,29 +662,29 @@ class Renderer:
                 (240, 240, 240),
             )
             self.screen.blit(value_surface, (bar_x + bar_width + 7, row_y + 1))
-            row_y += 25
+            row_y += 19
 
-        raw_footer = self.font.render(
+        raw_footer = self.network_output_footer_font.render(
             f"Raw best: {raw_best or '-'}  Request: {network_request or '-'}",
             True,
             (190, 200, 215),
         )
-        controller_footer = self.font.render(
+        controller_footer = self.network_output_footer_font.render(
             f"Controller: {controller_decision or '-'}  Pending: {pending_phase or '-'}",
             True,
             (190, 200, 215),
         )
-        active_footer = self.font.render(
+        active_footer = self.network_output_footer_font.render(
             f"Active: {active_phase or '-'}  State: {phase_state}",
             True,
             (190, 200, 215),
         )
-        self.screen.blit(raw_footer, (panel_x + 12, panel_y + panel_height - 61))
+        self.screen.blit(raw_footer, (panel_x + 12, panel_y + panel_height - 52))
         self.screen.blit(
             controller_footer,
-            (panel_x + 12, panel_y + panel_height - 43),
+            (panel_x + 12, panel_y + panel_height - 36),
         )
-        self.screen.blit(active_footer, (panel_x + 12, panel_y + panel_height - 25))
+        self.screen.blit(active_footer, (panel_x + 12, panel_y + panel_height - 20))
 
     def draw_density_controls(self, metrics=None):
         """Show live absolute demand and the off-screen boundary queues."""
@@ -483,8 +693,8 @@ class Renderer:
 
         width = self.config["window"]["width"]
         height = self.config["window"]["height"]
-        panel_width = 350
-        panel_height = 112
+        panel_width = 370
+        panel_height = 130
         panel_x = max(10, width - panel_width - 14)
         panel_y = max(10, height - panel_height - 52)
         panel = pygame.Surface((panel_width, panel_height), pygame.SRCALPHA)
@@ -499,7 +709,7 @@ class Renderer:
         )
 
         title = self.font.render(
-            "Live arrivals (vehicles/s)",
+            "Live traffic inputs (arrivals in vehicles/s)",
             True,
             (255, 255, 255),
         )
@@ -519,7 +729,7 @@ class Renderer:
             row = index // 2
             x = panel_x + 10 + column * 168
             y = panel_y + 31 + row * 18
-            is_selected = direction == self.selected_density_direction
+            is_selected = direction == self.selected_live_control
             is_enabled = roads.get(direction, {}).get("enabled", False)
             color = (90, 225, 255) if is_selected else (225, 225, 225)
             suffix = "" if is_enabled else " (road off)"
@@ -530,8 +740,28 @@ class Renderer:
             )
             self.screen.blit(surface, (x, y))
 
+        simulation = self.config["simulation"]
+        probability_labels = (
+            ("right_turn_chance", "[5 Right]"),
+            ("left_turn_chance", "[6 Left]"),
+            ("emergency_vehicle_spawn_chance", "[7 EV]"),
+        )
+        mix_x = panel_x + 10
+        for control, label in probability_labels:
+            color = (
+                (90, 225, 255)
+                if self.selected_live_control == control
+                else (225, 225, 225)
+            )
+            surface = self.font.render(
+                f"{label} {float(simulation[control]) * 100:.1f}%  ",
+                True,
+                color,
+            )
+            self.screen.blit(surface, (mix_x, panel_y + 70))
+            mix_x += surface.get_width()
         help_1 = self.font.render(
-            "Up/+ increase   Down/- decrease   0 stop",
+            "Up/+ increase   Down/- decrease   0 set zero",
             True,
             (195, 205, 220),
         )
@@ -540,8 +770,8 @@ class Renderer:
             True,
             (195, 205, 220),
         )
-        self.screen.blit(help_1, (panel_x + 10, panel_y + 72))
-        self.screen.blit(help_2, (panel_x + 10, panel_y + 90))
+        self.screen.blit(help_1, (panel_x + 10, panel_y + 88))
+        self.screen.blit(help_2, (panel_x + 10, panel_y + 106))
 
     def draw_movement_scores(self, scores, decision_debug=None):
         """Draw available policy scores plus the safely decoded set."""
@@ -561,10 +791,10 @@ class Renderer:
             ("south_right", "South right"),
             ("east_right", "East right"),
             ("west_right", "West right"),
-            ("north_walk", "North WALK"),
-            ("south_walk", "South WALK"),
-            ("east_walk", "East WALK"),
-            ("west_walk", "West WALK"),
+            # ("north_walk", "North WALK"),
+            # ("south_walk", "South WALK"),
+            # ("east_walk", "East WALK"),
+            # ("west_walk", "West WALK"),
         )
         labels = tuple(
             item for item in all_labels if item[0] in scores
@@ -594,8 +824,8 @@ class Renderer:
             for output in ("north_walk", "south_walk", "east_walk", "west_walk")
         )
 
-        panel_width = 320
-        panel_height = 126 + 25 * len(labels)
+        panel_width = 270
+        panel_height = 102 + 19 * len(labels)
         panel_x = self.config["window"]["width"] - panel_width - 14
         panel_y = 14
         panel = pygame.Surface((panel_width, panel_height), pygame.SRCALPHA)
@@ -619,9 +849,9 @@ class Renderer:
         )
         self.screen.blit(title, (panel_x + 12, panel_y + 10))
 
-        bar_x = panel_x + 126
-        bar_width = 120
-        row_y = panel_y + 42
+        bar_x = panel_x + 108
+        bar_width = 90
+        row_y = panel_y + 38
         for movement, label in labels:
             score = min(1.0, max(0.0, float(scores.get(movement, 0.0))))
             color = (225, 225, 225) if movement in demanded else (105, 110, 120)
@@ -632,13 +862,13 @@ class Renderer:
             if movement in active:
                 color = (100, 255, 135)
             self.screen.blit(
-                self.vehicle_debug_font.render(label, True, color),
+                self.network_output_font.render(label, True, color),
                 (panel_x + 12, row_y + 1),
             )
             pygame.draw.rect(
                 self.screen,
                 (50, 55, 65),
-                (bar_x, row_y + 2, bar_width, 12),
+                (bar_x, row_y + 2, bar_width, 10),
                 border_radius=2,
             )
             fill_color = color if movement in demanded else (65, 68, 75)
@@ -647,7 +877,7 @@ class Renderer:
                 pygame.draw.rect(
                     self.screen,
                     fill_color,
-                    (bar_x, row_y + 2, fill_width, 12),
+                    (bar_x, row_y + 2, fill_width, 10),
                     border_radius=2,
                 )
             row_threshold = (
@@ -660,18 +890,18 @@ class Renderer:
                 self.screen,
                 (235, 235, 235),
                 (threshold_x, row_y),
-                (threshold_x, row_y + 16),
+                (threshold_x, row_y + 14),
                 1,
             )
             self.screen.blit(
-                self.vehicle_debug_font.render(
+                self.network_output_font.render(
                     f"{score * 100:5.1f}%",
                     True,
                     (240, 240, 240),
                 ),
                 (bar_x + bar_width + 7, row_y + 1),
             )
-            row_y += 25
+            row_y += 19
 
         footer_lines = (
             f"Raw: {len(raw_requested)}  Safe set: {len(decoded)}",
@@ -685,8 +915,12 @@ class Renderer:
         )
         for index, footer_text in enumerate(footer_lines):
             self.screen.blit(
-                self.font.render(footer_text, True, (190, 200, 215)),
-                (panel_x + 12, panel_y + panel_height - 61 + index * 18),
+                self.network_output_footer_font.render(
+                    footer_text,
+                    True,
+                    (190, 200, 215),
+                ),
+                (panel_x + 12, panel_y + panel_height - 49 + index * 15),
             )
 
     def draw_distance_scale(self):

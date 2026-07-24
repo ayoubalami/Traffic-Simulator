@@ -46,7 +46,7 @@ class FixedTimeToolingTests(unittest.TestCase):
 
         self.assertEqual(args.plan, main_fixed_time.PLAN_PATH)
 
-    def test_compare_defaults_include_fixed_and_existing_vehicle_model(self):
+    def test_compare_defaults_include_fixed_and_both_vehicle_models(self):
         with patch.object(sys, "argv", ["compare_policies.py"]):
             args = compare_policies.parse_arguments()
 
@@ -56,10 +56,14 @@ class FixedTimeToolingTests(unittest.TestCase):
         )
         self.assertEqual(
             args.movement_model,
-            Path("models/vehicle_movement_policy_v6.json"),
+            Path("models/vehicle_movement_policy_v7.json"),
+        )
+        self.assertEqual(
+            args.uncertain_movement_model,
+            Path("models/vehicle_movement_policy_v8.json"),
         )
 
-    def test_comparison_runs_all_three_on_full_scenario_matrix_and_saves_json(self):
+    def test_comparison_runs_all_four_on_full_scenario_matrix_and_saves_json(self):
         config = {
             "road_users": {"pedestrians_enabled": False},
             "six_phase_fitness": {
@@ -68,6 +72,7 @@ class FixedTimeToolingTests(unittest.TestCase):
         }
         fixed = SimpleNamespace(control_scope="vehicles_only")
         movement = SimpleNamespace(control_scope="vehicles_only")
+        uncertain_movement = SimpleNamespace(control_scope="vehicles_only")
         categorical = object()
         result = {
             "mean_fitness": 1.0,
@@ -82,6 +87,7 @@ class FixedTimeToolingTests(unittest.TestCase):
                 fixed_plan=DEFAULT_PLAN,
                 categorical_model=Path("categorical.json"),
                 movement_model=Path("movement.json"),
+                uncertain_movement_model=Path("uncertain.json"),
                 seeds=(1, 2),
                 evaluation_duration=10.0,
                 speed_factor=1.0,
@@ -96,7 +102,11 @@ class FixedTimeToolingTests(unittest.TestCase):
                 patch.object(compare_policies, "build_runtime_config", return_value=config),
                 patch.object(compare_policies, "load_fixed_time_plan", return_value=fixed),
                 patch.object(compare_policies, "load_six_phase_policy", return_value=categorical),
-                patch.object(compare_policies, "load_movement_policy", return_value=movement),
+                patch.object(
+                    compare_policies,
+                    "load_movement_policy",
+                    side_effect=(movement, uncertain_movement),
+                ),
                 patch.object(
                     compare_policies,
                     "evaluate_fixed_time_policy_across_seeds",
@@ -120,18 +130,22 @@ class FixedTimeToolingTests(unittest.TestCase):
                 config["six_phase_fitness"]
                 ["abort_remaining_seeds_on_gridlock"]
             )
-            for evaluator in (
-                fixed_evaluator,
-                categorical_evaluator,
-                movement_evaluator,
-            ):
+            for evaluator in (fixed_evaluator, categorical_evaluator):
                 evaluator.assert_called_once()
                 self.assertIs(evaluator.call_args.args[0], config)
+            self.assertEqual(movement_evaluator.call_count, 2)
+            for call in movement_evaluator.call_args_list:
+                self.assertIs(call.args[0], config)
 
             payload = json.loads(output_path.read_text(encoding="utf-8"))
             self.assertIn("fixed", payload)
             self.assertIn("categorical", payload)
             self.assertIn("movement", payload)
+            self.assertIn("uncertain_movement", payload)
+            self.assertEqual(
+                payload["models"]["uncertain_movement"],
+                "uncertain.json",
+            )
 
 
 if __name__ == "__main__":

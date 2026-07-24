@@ -3,8 +3,8 @@ from copy import deepcopy
 
 CONFIG = {
     "window": {
-        "width": 1000,
-        "height": 800,
+        "width": 1200,
+        "height": 950,
         "title": "Traffic Simulator"
     },
     "colors": {
@@ -52,6 +52,33 @@ CONFIG = {
         "enabled": True,
         "step": 0.05,
         "max_rate_per_s": 3.0,
+        # Amount added to turn/emergency probabilities per key press (0.01 = 1%).
+        "probability_step": 0.01,
+    },
+    "camera_observation": {
+        # First-paper observation model: the adaptive controller only receives
+        # vehicles detectable this far upstream from each physical stop line.
+        # The simulator and fitness metrics retain complete ground truth.
+        "enabled": True,
+        "detection_distance_m": 50.0,
+        # Parametric sensor uncertainty. Measurements are sampled once per
+        # camera frame and held stable, rather than flickering every physics
+        # update. Errors grow quadratically toward the far edge of the ROI.
+        "sampling_interval_s": 1.0,
+        "uncertainty_enabled": False,
+        "near_detection_probability": 0.99,
+        "far_detection_probability": 0.75,
+        "near_position_std_m": 0.15,
+        "far_position_std_m": 2.00,
+        "near_speed_std_mps": 0.20,
+        "far_speed_std_mps": 2.50,
+        "stopped_speed_threshold_mps": 0.50,
+        # Make the information boundary explicit in interactive figures.
+        "show_detection_boundary": True,
+        # Shade the road area visible to the camera without hiding markings.
+        "roi_color": (228, 128, 128),
+        "roi_alpha": 70,
+        "boundary_color": (185, 185, 185),
     },
     "road_users": {
         # First paper configuration: optimize only vehicle signal movements.
@@ -256,20 +283,19 @@ CONFIG = {
         # defaults preserve the previous total demand of about 2 vehicles/s.
         "arrival_rates_per_s": {
             "north": 0.356,
-            "south": 1.068,
+            "south": 0.468,
             "east": 0.356,
             "west": 0.221,
         },
+        # Turn choice and emergency-vehicle probabilities for new arrivals.
+        "right_turn_chance": 0.325,
+        "left_turn_chance": 0.235,
+        "emergency_vehicle_spawn_chance": 0.04,
         # Arrivals wait outside the rendered road when insertion is unsafe.
         # This cap prevents an unbounded queue during severe congestion.
         "max_pending_arrivals_per_direction": 100,
-        "right_turn_chance" : .3250,
-        "left_turn_chance"  : .2350,
         # Probability that a turning vehicle uses its indicator.
-        "turn_signal_use_chance": 0.50,
-        # A small chance per spawn keeps emergency vehicles occasional while
-        # making the feature visible during a normal simulation run.
-        "emergency_vehicle_spawn_chance": 0.04
+        "turn_signal_use_chance": 0.80,
     },
     "vehicle_defaults": {
         "max_speed_kmh": 50,
@@ -324,7 +350,7 @@ CONFIG = {
         "lane_change_cooldown_s": 15.0,
         "lane_change_min_distance_to_stop_m": 20.0,
         "lane_change_trigger_speed_ratio": 0.6,
-        "lane_change_random_rate_per_s": 1000,
+        "lane_change_random_rate_per_s": 100000,
         "lane_change_max_angle_deg": 20.0,
         "lane_change_min_speed_mps": 4.0,
 

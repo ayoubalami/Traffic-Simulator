@@ -91,9 +91,17 @@ class Simulation:
             pedestrian_defaults["spawn_interval_max"],
         )
         self.metrics = Metrics(config)
+        # Camera noise must not perturb arrivals, vehicle types, or routes.
+        # A separate seeded stream also makes policy comparisons reproducible.
+        camera_seed = None if random_seed is None else f"camera:{random_seed!r}"
+        self.camera_random = random.Random(camera_seed)
+        self._camera_measurement_frame = None
+        self._camera_measurements = {}
         if duration_selector is not None:
             self.light_controller.set_duration_selector(
-                lambda direction: duration_selector(self.get_signal_observation(direction))
+                lambda direction: duration_selector(
+                    self.get_controller_signal_observation(direction)
+                )
             )
         if extension_decider is not None:
             self.light_controller.set_extension_decider(
@@ -102,12 +110,12 @@ class Simulation:
         if phase_selector is not None:
             self.light_controller.set_phase_selector(
                 lambda active_phase, available_phases: phase_selector(
-                    self.get_signal_observation(active_phase),
+                    self.get_controller_signal_observation(active_phase),
                     available_phases,
                 )
             )
             self.light_controller.set_phase_observation_provider(
-                lambda: self.get_signal_observation(
+                lambda: self.get_controller_signal_observation(
                     self.light_controller.active_phase
                 )
             )
@@ -116,8 +124,13 @@ class Simulation:
                 lambda observation: movement_score_provider(observation)
             )
         if movement_score_provider is not None or fixed_time_plan is not None:
+            observation_provider = (
+                self.get_controller_signal_observation
+                if movement_score_provider is not None
+                else self.get_signal_observation
+            )
             self.light_controller.set_phase_observation_provider(
-                lambda: self.get_signal_observation(
+                lambda: observation_provider(
                     self.light_controller.active_phase
                 )
             )
@@ -305,8 +318,159 @@ class Simulation:
                 return True
         return False
 
-    def get_signal_observation(self, active_phase):
-        """Return the queue state available to an adaptive signal controller."""
+    def get_controller_signal_observation(self, active_phase):
+        """Return the camera-limited state exposed to an adaptive policy."""
+        return self.get_signal_observation(active_phase, camera_limited=True)
+
+    def _camera_frame_index(self):
+        camera = self.config.get("camera_observation", {})
+        interval = max(
+            1e-6,
+            float(camera.get("sampling_interval_s", 1.0)),
+        )
+        return int(math.floor((self.metrics.simulation_time + 1e-9) / interval))
+
+    @staticmethod
+    def _camera_interpolate(near_value, far_value, distance_ratio):
+        ratio_squared = min(1.0, max(0.0, float(distance_ratio))) ** 2
+        return float(near_value) + ratio_squared * (
+            float(far_value) - float(near_value)
+        )
+
+    def _camera_vehicle_measurement(self, vehicle):
+        """Return one held noisy camera measurement, or ``None`` if undetected."""
+        camera = self.config.get("camera_observation", {})
+        try:
+            distance_from_intersection = float(vehicle.distance_from_stop)
+        except (AttributeError, TypeError, ValueError):
+            # Lightweight detector/test objects without geometry remain
+            # exactly observable. Real simulation vehicles expose the distance.
+            return {
+                "distance_from_stop": float("inf"),
+                "current_speed": max(
+                    0.0,
+                    float(getattr(vehicle, "current_speed", 0.0)),
+                ),
+                "stopped": bool(getattr(vehicle, "stopped", False)),
+            }
+        pixels_per_meter = max(
+            1e-9,
+            float(self.config["simulation"]["pixels_per_meter"]),
+        )
+        detection_distance = max(
+            0.0,
+            float(camera.get("detection_distance_m", 0.0)),
+        ) * pixels_per_meter
+        # Vehicle.distance_from_stop is measured from the intersection edge,
+        # while the paper-facing ROI is measured upstream from the painted stop
+        # line before the crosswalk.
+        stop_line_offset = float(
+            self.config.get("crosswalk_intersection_offset", 0.0)
+            + self.config.get("crosswalk_width", 0.0)
+            + self.config.get("crosswalk_stop_line_offset", 0.0)
+        )
+        exact_measurement = {
+            "distance_from_stop": distance_from_intersection,
+            "current_speed": max(
+                0.0,
+                float(getattr(vehicle, "current_speed", 0.0)),
+            ),
+            "stopped": bool(getattr(vehicle, "stopped", False)),
+        }
+        if not bool(camera.get("enabled", False)):
+            return exact_measurement
+
+        frame_index = self._camera_frame_index()
+        if frame_index != self._camera_measurement_frame:
+            self._camera_measurement_frame = frame_index
+            self._camera_measurements = {}
+        vehicle_key = id(vehicle)
+        if vehicle_key in self._camera_measurements:
+            return self._camera_measurements[vehicle_key]
+
+        true_upstream_distance = distance_from_intersection - stop_line_offset
+        if true_upstream_distance > detection_distance:
+            self._camera_measurements[vehicle_key] = None
+            return None
+
+        if not bool(camera.get("uncertainty_enabled", False)):
+            self._camera_measurements[vehicle_key] = exact_measurement
+            return exact_measurement
+
+        distance_ratio = min(
+            1.0,
+            max(0.0, true_upstream_distance) / max(1e-9, detection_distance),
+        )
+        detection_probability = min(
+            1.0,
+            max(
+                0.0,
+                self._camera_interpolate(
+                    camera.get("near_detection_probability", 1.0),
+                    camera.get("far_detection_probability", 1.0),
+                    distance_ratio,
+                ),
+            ),
+        )
+        if (
+            detection_probability < 1.0
+            and self.camera_random.random() > detection_probability
+        ):
+            self._camera_measurements[vehicle_key] = None
+            return None
+
+        position_std_px = max(
+            0.0,
+            self._camera_interpolate(
+                camera.get("near_position_std_m", 0.0),
+                camera.get("far_position_std_m", 0.0),
+                distance_ratio,
+            ),
+        ) * pixels_per_meter
+        estimated_distance = distance_from_intersection
+        if position_std_px > 0.0:
+            estimated_distance += self.camera_random.gauss(0.0, position_std_px)
+        # The camera cannot report an object whose estimated location falls
+        # beyond its image boundary.
+        if estimated_distance > stop_line_offset + detection_distance:
+            self._camera_measurements[vehicle_key] = None
+            return None
+
+        speed_std_px_s = max(
+            0.0,
+            self._camera_interpolate(
+                camera.get("near_speed_std_mps", 0.0),
+                camera.get("far_speed_std_mps", 0.0),
+                distance_ratio,
+            ),
+        ) * pixels_per_meter
+        estimated_speed = exact_measurement["current_speed"]
+        if speed_std_px_s > 0.0:
+            estimated_speed += self.camera_random.gauss(0.0, speed_std_px_s)
+        estimated_speed = max(0.0, estimated_speed)
+        stopped_threshold = max(
+            0.0,
+            float(camera.get("stopped_speed_threshold_mps", 0.5)),
+        ) * pixels_per_meter
+        measurement = {
+            "distance_from_stop": estimated_distance,
+            "current_speed": estimated_speed,
+            "stopped": estimated_speed <= stopped_threshold,
+        }
+        self._camera_measurements[vehicle_key] = measurement
+        return measurement
+
+    def _vehicle_is_camera_observable(self, vehicle):
+        """Whether the current held camera frame detects a vehicle."""
+        return self._camera_vehicle_measurement(vehicle) is not None
+
+    def get_signal_observation(self, active_phase, camera_limited=False):
+        """Return signal state, optionally limited to the configured camera ROI.
+
+        The default is complete simulator ground truth for metrics, diagnostics,
+        and safety. Adaptive policy callbacks use
+        :meth:`get_controller_signal_observation` instead.
+        """
         queue_lengths = {direction: 0 for direction in ("north", "south", "east", "west")}
         vehicle_counts = {direction: 0 for direction in ("north", "south", "east", "west")}
         emergency_counts = {direction: 0 for direction in ("north", "south", "east", "west")}
@@ -356,7 +520,31 @@ class Simulation:
             )
         )
         for vehicle in self.vehicles:
-            if not vehicle.cleared_intersection:
+            camera_measurement = (
+                self._camera_vehicle_measurement(vehicle)
+                if camera_limited
+                else None
+            )
+            controller_visible = bool(
+                not camera_limited
+                or camera_measurement is not None
+            )
+            observed_speed = (
+                camera_measurement["current_speed"]
+                if camera_measurement is not None
+                else max(0.0, float(getattr(vehicle, "current_speed", 0.0)))
+            )
+            observed_stopped = (
+                camera_measurement["stopped"]
+                if camera_measurement is not None
+                else bool(getattr(vehicle, "stopped", False))
+            )
+            observed_distance_from_stop = (
+                camera_measurement["distance_from_stop"]
+                if camera_measurement is not None
+                else float(getattr(vehicle, "distance_from_stop", float("inf")))
+            )
+            if not vehicle.cleared_intersection and controller_visible:
                 turn_side = getattr(vehicle, "turn_side", None)
                 is_pending_turn = bool(
                     turn_side in ("left", "right")
@@ -376,22 +564,18 @@ class Simulation:
                 free_flow_speed = max(1e-9, float(vehicle.speed))
                 speed_ratio_sums[vehicle.road_direction] += min(
                     1.0,
-                    max(0.0, float(vehicle.current_speed) / free_flow_speed),
+                    max(0.0, observed_speed / free_flow_speed),
                 )
                 if (
-                    vehicle.stopped
+                    observed_stopped
                     and vehicle_movement in queued_movement_counts
                 ):
                     queued_movement_counts[vehicle_movement] += 1
-                try:
-                    distance_from_stop = float(vehicle.distance_from_stop)
-                except (AttributeError, TypeError, ValueError):
-                    distance_from_stop = float("inf")
                 is_near_stop = bool(
-                    vehicle.stopped
+                    observed_stopped
                     or getattr(vehicle, "turning", False)
                     or getattr(vehicle, "committed_to_cross", False)
-                    or distance_from_stop <= near_stop_distance
+                    or observed_distance_from_stop <= near_stop_distance
                 )
                 if (
                     is_near_stop
@@ -402,24 +586,29 @@ class Simulation:
                     emergency_counts[vehicle.road_direction] += 1
                     if vehicle_movement in emergency_movement_counts:
                         emergency_movement_counts[vehicle_movement] += 1
-            if vehicle.stopped and not vehicle.cleared_intersection:
+            if (
+                controller_visible
+                and observed_stopped
+                and not vehicle.cleared_intersection
+            ):
                 queue_lengths[vehicle.road_direction] += 1
-            if vehicle.turning:
+            if controller_visible and vehicle.turning:
                 turning_counts[vehicle.road_direction] += 1
-                if vehicle.stopped or vehicle.current_speed <= 0.01:
+                if observed_stopped or observed_speed <= 0.01:
                     stuck_turning_counts[vehicle.road_direction] += 1
             is_approaching_turn = bool(
-                getattr(vehicle, "is_turning_vehicle", False)
+                controller_visible
+                and getattr(vehicle, "is_turning_vehicle", False)
                 and not getattr(vehicle, "has_turned", False)
                 and not vehicle.cleared_intersection
             )
             if is_approaching_turn and vehicle.turn_side == "left":
                 approaching_left_turn_counts[vehicle.road_direction] += 1
-                if vehicle.stopped:
+                if observed_stopped:
                     queued_left_turn_counts[vehicle.road_direction] += 1
             elif is_approaching_turn and vehicle.turn_side == "right":
                 approaching_right_turn_counts[vehicle.road_direction] += 1
-                if vehicle.stopped:
+                if observed_stopped:
                     queued_right_turn_counts[vehicle.road_direction] += 1
         for pedestrian in self.pedestrians:
             if pedestrian.waiting:
@@ -545,6 +734,13 @@ class Simulation:
                 )
             ),
             "green_elapsed_s": self.light_controller.timer,
+            "camera_observation_enabled": bool(
+                camera_limited
+                and self.config.get("camera_observation", {}).get(
+                    "enabled",
+                    False,
+                )
+            ),
         }
         self._last_signal_observation = observation
         return observation
@@ -601,7 +797,7 @@ class Simulation:
         return self.get_intersection_vehicle_counts(speed_threshold_mps)[1]
 
     def _should_extend_green(self, active_phase, extension_decider):
-        observation = self.get_signal_observation(active_phase)
+        observation = self.get_controller_signal_observation(active_phase)
         active_directions = self.light_controller.phase_directions(active_phase)
         opposing_directions = self.light_controller.phase_directions(
             self.light_controller._next_phase(),
