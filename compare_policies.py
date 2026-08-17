@@ -1,10 +1,20 @@
 """Compare fixed and neural policies on identical traffic scenarios."""
 
 import argparse
+from copy import deepcopy
 import json
 from pathlib import Path
 
-from config import CONFIG, apply_movement_control_scope, build_runtime_config
+from config import (
+    CONFIG,
+    EXACT_CAMERA_OBSERVATION_MODE,
+    FULL_STATE_OBSERVATION_MODE,
+    UNCERTAIN_CAMERA_OBSERVATION_MODE,
+    apply_camera_observation_mode,
+    apply_movement_control_scope,
+    build_runtime_config,
+    camera_observation_mode,
+)
 from main_movement_policy import load_movement_policy
 from main_six_phase import load_six_phase_policy
 from simulation import (
@@ -86,6 +96,23 @@ def parse_arguments():
             "under the same runtime camera settings as the standard model"
         ),
     )
+    parser.add_argument(
+        "--observation-ablation",
+        action="store_true",
+        help=(
+            "also compare matched full-state, exact-camera, and "
+            "uncertain-camera systems; requires --full-state-movement-model"
+        ),
+    )
+    parser.add_argument(
+        "--full-state-movement-model",
+        type=Path,
+        default=None,
+        help=(
+            "movement policy trained with --observation-mode full-state; "
+            "used only by --observation-ablation"
+        ),
+    )
     parser.add_argument("--seeds", type=parse_seeds, default=(1, 2, 3))
     parser.add_argument("--evaluation-duration", type=float, default=300.0)
     parser.add_argument(
@@ -99,6 +126,75 @@ def parse_arguments():
     return parser.parse_args()
 
 
+def _config_for_observation_mode(config, observation_mode):
+    evaluation_config = deepcopy(config)
+    apply_camera_observation_mode(evaluation_config, observation_mode)
+    return evaluation_config
+
+
+def _policy_training_observation_mode(policy):
+    observation_model = getattr(policy, "observation_model", {})
+    if "enabled" not in observation_model:
+        return None
+    return camera_observation_mode(
+        {"camera_observation": observation_model}
+    )
+
+
+def _validate_policy_observation_mode(policy, expected_mode, label):
+    actual_mode = _policy_training_observation_mode(policy)
+    if actual_mode is None:
+        print(
+            f"Warning: {label} model has no recorded observation_model; "
+            f"cannot verify that it was trained in {expected_mode} mode.",
+            flush=True,
+        )
+        return
+    if actual_mode != expected_mode:
+        raise SystemExit(
+            f"{label} model was trained in {actual_mode} mode, not "
+            f"{expected_mode}; use a matched model for a valid ablation."
+        )
+
+
+def _print_observation_ablation(results):
+    full_state = results["full_state"]
+    exact_camera = results["exact_camera"]
+    uncertain_camera = results["uncertain_camera"]
+    metric_width = max(38, max(len(metric) for metric in METRICS))
+    print("\nObservation-system ablation (matched traffic scenarios)")
+    print(
+        f"{'Metric':{metric_width}} "
+        f"{'Full State':>14} {'Exact ROI':>14} {'Uncertain ROI':>14} "
+        f"{'ROI-Full':>14} {'Unc-Full':>14} {'Unc-ROI':>14}"
+    )
+    print("-" * (metric_width + 91))
+
+    def print_row(metric, full_value, exact_value, uncertain_value):
+        print(
+            f"{metric:{metric_width}} "
+            f"{full_value:14.2f} {exact_value:14.2f} "
+            f"{uncertain_value:14.2f} "
+            f"{exact_value - full_value:14.2f} "
+            f"{uncertain_value - full_value:14.2f} "
+            f"{uncertain_value - exact_value:14.2f}"
+        )
+
+    print_row(
+        "fitness",
+        float(full_state["mean_fitness"]),
+        float(exact_camera["mean_fitness"]),
+        float(uncertain_camera["mean_fitness"]),
+    )
+    for metric in METRICS:
+        print_row(
+            metric,
+            float(full_state["mean_metrics"].get(metric, 0.0)),
+            float(exact_camera["mean_metrics"].get(metric, 0.0)),
+            float(uncertain_camera["mean_metrics"].get(metric, 0.0)),
+        )
+
+
 def main():
     args = parse_arguments()
     if args.timestep <= 0:
@@ -110,19 +206,47 @@ def main():
     categorical = load_six_phase_policy(args.categorical_model)
     movement = load_movement_policy(args.movement_model)
     uncertain_movement = load_movement_policy(args.uncertain_movement_model)
+    full_state_movement = None
+    if args.observation_ablation:
+        if args.full_state_movement_model is None:
+            raise SystemExit(
+                "--observation-ablation requires "
+                "--full-state-movement-model"
+            )
+        full_state_movement = load_movement_policy(
+            args.full_state_movement_model
+        )
     fixed_scope = getattr(fixed, "control_scope", "vehicles_only")
     movement_scope = getattr(movement, "control_scope", None)
     uncertain_scope = getattr(uncertain_movement, "control_scope", None)
+    full_state_scope = getattr(full_state_movement, "control_scope", None)
     incompatible_scopes = tuple(
         scope
-        for scope in (movement_scope, uncertain_scope)
+        for scope in (movement_scope, uncertain_scope, full_state_scope)
         if scope is not None and scope != fixed_scope
     )
     if incompatible_scopes:
         raise SystemExit(
             "The fixed and movement policies must use the same control scope "
             f"for a comparable experiment (fixed={fixed_scope}, "
-            f"movement={movement_scope}, uncertain={uncertain_scope})."
+            f"movement={movement_scope}, uncertain={uncertain_scope}, "
+            f"full_state={full_state_scope})."
+        )
+    if args.observation_ablation:
+        _validate_policy_observation_mode(
+            full_state_movement,
+            FULL_STATE_OBSERVATION_MODE,
+            "Full-state",
+        )
+        _validate_policy_observation_mode(
+            movement,
+            EXACT_CAMERA_OBSERVATION_MODE,
+            "Exact-camera",
+        )
+        _validate_policy_observation_mode(
+            uncertain_movement,
+            UNCERTAIN_CAMERA_OBSERVATION_MODE,
+            "Uncertain-camera",
         )
     apply_movement_control_scope(config, fixed_scope)
     # A failed/gridlocked controller must not shorten its scenario matrix.
@@ -156,7 +280,12 @@ def main():
         uncertain_movement,
         **options,
     )
+    shared_observation_mode = camera_observation_mode(config)
     metric_width = max(38, max(len(metric) for metric in METRICS))
+    print(
+        "Controller comparison "
+        f"(shared runtime observation: {shared_observation_mode})"
+    )
     print(
         f"{'Metric':{metric_width}} "
         f"{'Fixed':>14} {'Categorical':>14} {'Movement':>14} "
@@ -194,6 +323,66 @@ def main():
             f"{uncertain_value - fixed_value:14.2f} "
             f"{uncertain_value - movement_value:14.2f}"
         )
+    observation_ablation = None
+    if args.observation_ablation:
+        full_state_config = _config_for_observation_mode(
+            config,
+            FULL_STATE_OBSERVATION_MODE,
+        )
+        exact_camera_config = _config_for_observation_mode(
+            config,
+            EXACT_CAMERA_OBSERVATION_MODE,
+        )
+        uncertain_camera_config = _config_for_observation_mode(
+            config,
+            UNCERTAIN_CAMERA_OBSERVATION_MODE,
+        )
+        full_state_result = evaluate_movement_policy_across_seeds(
+            full_state_config,
+            full_state_movement,
+            **options,
+        )
+        exact_camera_result = (
+            movement_result
+            if shared_observation_mode == EXACT_CAMERA_OBSERVATION_MODE
+            else evaluate_movement_policy_across_seeds(
+                exact_camera_config,
+                movement,
+                **options,
+            )
+        )
+        uncertain_camera_result = (
+            uncertain_result
+            if shared_observation_mode == UNCERTAIN_CAMERA_OBSERVATION_MODE
+            else evaluate_movement_policy_across_seeds(
+                uncertain_camera_config,
+                uncertain_movement,
+                **options,
+            )
+        )
+        observation_ablation = {
+            "design": "matched_end_to_end_observation_systems",
+            "full_state": full_state_result,
+            "exact_camera": exact_camera_result,
+            "uncertain_camera": uncertain_camera_result,
+            "observation_modes": {
+                "full_state": dict(
+                    full_state_config.get("camera_observation", {})
+                ),
+                "exact_camera": dict(
+                    exact_camera_config.get("camera_observation", {})
+                ),
+                "uncertain_camera": dict(
+                    uncertain_camera_config.get("camera_observation", {})
+                ),
+            },
+            "models": {
+                "full_state": str(args.full_state_movement_model),
+                "exact_camera": str(args.movement_model),
+                "uncertain_camera": str(args.uncertain_movement_model),
+            },
+        }
+        _print_observation_ablation(observation_ablation)
     if args.json_output is not None:
         args.json_output.parent.mkdir(parents=True, exist_ok=True)
         args.json_output.write_text(
@@ -203,16 +392,25 @@ def main():
                     "categorical": categorical_result,
                     "movement": movement_result,
                     "uncertain_movement": uncertain_result,
+                    "observation_ablation": observation_ablation,
                     "seeds": args.seeds,
                     "evaluation_duration_s": args.evaluation_duration,
                     "physics_timestep_s": args.timestep,
                     "speed_factor_compatibility_value": args.speed_factor,
+                    "controller_comparison_observation_mode": (
+                        shared_observation_mode
+                    ),
                     "models": {
                         "fixed": str(args.fixed_plan),
                         "categorical": str(args.categorical_model),
                         "movement": str(args.movement_model),
                         "uncertain_movement": str(
                             args.uncertain_movement_model
+                        ),
+                        "full_state_movement": (
+                            str(args.full_state_movement_model)
+                            if args.full_state_movement_model is not None
+                            else None
                         ),
                     },
                 },

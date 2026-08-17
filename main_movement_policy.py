@@ -128,6 +128,7 @@ def load_movement_policy(path=POLICY_PATH):
         else dict(data.get("pedestrian_decoder", {}))
     )
     policy.control_scope = control_scope
+    policy.observation_model = dict(data.get("observation_model", {}))
     return policy
 
 

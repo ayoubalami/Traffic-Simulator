@@ -1,7 +1,12 @@
 import unittest
 from types import SimpleNamespace
 
-from config import CONFIG, build_runtime_config
+from config import (
+    CONFIG,
+    apply_camera_observation_mode,
+    build_runtime_config,
+    camera_observation_mode,
+)
 from renderer.renderer import Renderer
 from simulation.simulation import Simulation
 
@@ -27,6 +32,27 @@ class CameraObservationTests(unittest.TestCase):
             has_turned=False,
             turn_side=None,
             distance_from_stop=float(distance_from_stop),
+        )
+
+    def test_named_observation_modes_apply_expected_boundary(self):
+        config = build_runtime_config(CONFIG)
+
+        apply_camera_observation_mode(config, "full-state")
+        self.assertEqual(camera_observation_mode(config), "full-state")
+        self.assertFalse(config["camera_observation"]["enabled"])
+
+        apply_camera_observation_mode(config, "exact-camera")
+        self.assertEqual(camera_observation_mode(config), "exact-camera")
+        self.assertTrue(config["camera_observation"]["enabled"])
+        self.assertFalse(
+            config["camera_observation"]["uncertainty_enabled"]
+        )
+
+        apply_camera_observation_mode(config, "uncertain-camera")
+        self.assertEqual(camera_observation_mode(config), "uncertain-camera")
+        self.assertTrue(config["camera_observation"]["enabled"])
+        self.assertTrue(
+            config["camera_observation"]["uncertainty_enabled"]
         )
 
     def test_policy_view_filters_upstream_vehicle_but_ground_truth_keeps_it(self):

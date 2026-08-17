@@ -275,7 +275,7 @@ CONFIG = {
         ],
     },
     "simulation": {
-        "pixels_per_meter": 6,
+        "pixels_per_meter": 8,
         # Interactive display acceleration. Headless optimization deliberately
         # keeps a fixed physics timestep and gets speed from parallel workers.
         "time_scale": 1.0,
@@ -290,7 +290,7 @@ CONFIG = {
         # Turn choice and emergency-vehicle probabilities for new arrivals.
         "right_turn_chance": 0.325,
         "left_turn_chance": 0.235,
-        "emergency_vehicle_spawn_chance": 0.04,
+        "emergency_vehicle_spawn_chance": 0.01,
         # Arrivals wait outside the rendered road when insertion is unsafe.
         # This cap prevents an unbounded queue during severe congestion.
         "max_pending_arrivals_per_direction": 100,
@@ -383,10 +383,10 @@ CONFIG = {
     #     "radius": 7
     # },
     "roads": {
-        "north": {"enabled": True, "incoming": 4, "outgoing": 4 ,"inverse": "south"},
-        "south": {"enabled": True, "incoming": 4, "outgoing": 4 ,"inverse": "north"},
-        "east": {"enabled": True, "incoming": 4, "outgoing": 4 ,"inverse": "west"},
-        "west": {"enabled": True, "incoming": 4  , "outgoing": 4 ,"inverse": "east"}
+        "north": {"enabled": True, "incoming": 2, "outgoing": 2 ,"inverse": "south"},
+        "south": {"enabled": True, "incoming": 2, "outgoing": 2 ,"inverse": "north"},
+        "east": {"enabled": True, "incoming": 2, "outgoing": 2 ,"inverse": "west"},
+        "west": {"enabled": True, "incoming": 2  , "outgoing": 2 ,"inverse": "east"}
     }
 }
 
@@ -396,6 +396,16 @@ VEHICLES_AND_PEDESTRIANS_SCOPE = "vehicles_and_pedestrians"
 MOVEMENT_CONTROL_SCOPES = (
     VEHICLES_ONLY_SCOPE,
     VEHICLES_AND_PEDESTRIANS_SCOPE,
+)
+CONFIGURED_OBSERVATION_MODE = "configured"
+FULL_STATE_OBSERVATION_MODE = "full-state"
+EXACT_CAMERA_OBSERVATION_MODE = "exact-camera"
+UNCERTAIN_CAMERA_OBSERVATION_MODE = "uncertain-camera"
+CAMERA_OBSERVATION_MODES = (
+    CONFIGURED_OBSERVATION_MODE,
+    FULL_STATE_OBSERVATION_MODE,
+    EXACT_CAMERA_OBSERVATION_MODE,
+    UNCERTAIN_CAMERA_OBSERVATION_MODE,
 )
 PEDESTRIAN_FITNESS_KEYS = (
     "avg_pedestrian_wait_time_penalty",
@@ -419,6 +429,40 @@ def apply_movement_control_scope(runtime_config, control_scope):
         "pedestrians_enabled"
     ] = pedestrians_enabled
     return runtime_config
+
+
+def apply_camera_observation_mode(runtime_config, observation_mode):
+    """Apply a reproducible controller-observation boundary.
+
+    Ground-truth simulation state and fitness metrics are unaffected.  Only
+    the observation passed to an adaptive controller is changed.
+    """
+    if observation_mode not in CAMERA_OBSERVATION_MODES:
+        raise ValueError(f"unknown camera observation mode: {observation_mode}")
+    if observation_mode == CONFIGURED_OBSERVATION_MODE:
+        return runtime_config
+
+    camera = runtime_config.setdefault("camera_observation", {})
+    if observation_mode == FULL_STATE_OBSERVATION_MODE:
+        camera["enabled"] = False
+        camera["uncertainty_enabled"] = False
+    elif observation_mode == EXACT_CAMERA_OBSERVATION_MODE:
+        camera["enabled"] = True
+        camera["uncertainty_enabled"] = False
+    else:
+        camera["enabled"] = True
+        camera["uncertainty_enabled"] = True
+    return runtime_config
+
+
+def camera_observation_mode(runtime_config):
+    """Return the effective named observation mode for a runtime config."""
+    camera = runtime_config.get("camera_observation", {})
+    if not bool(camera.get("enabled", False)):
+        return FULL_STATE_OBSERVATION_MODE
+    if bool(camera.get("uncertainty_enabled", False)):
+        return UNCERTAIN_CAMERA_OBSERVATION_MODE
+    return EXACT_CAMERA_OBSERVATION_MODE
 
 
 def movement_fitness_weights_for_scope(runtime_config, control_scope):

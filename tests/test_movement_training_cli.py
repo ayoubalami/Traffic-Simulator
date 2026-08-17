@@ -37,6 +37,12 @@ class MovementTrainingCliTests(unittest.TestCase):
         self.assertIsNone(arguments.checkpoint)
         self.assertIsNone(arguments.resume)
         self.assertIsNone(arguments.anchor_scenarios_count)
+        self.assertEqual(arguments.observation_mode, "configured")
+
+    def test_explicit_observation_mode_parses(self):
+        arguments = self.parse("--observation-mode", "full-state")
+
+        self.assertEqual(arguments.observation_mode, "full-state")
 
     def test_es_and_staged_evaluation_options_parse(self):
         arguments = self.parse(

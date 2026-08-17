@@ -9,12 +9,15 @@ from pathlib import Path
 os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 
 from config import (
+    CAMERA_OBSERVATION_MODES,
     CONFIG,
     MOVEMENT_CONTROL_SCOPES,
     VEHICLES_AND_PEDESTRIANS_SCOPE,
     VEHICLES_ONLY_SCOPE,
+    apply_camera_observation_mode,
     apply_movement_control_scope,
     build_runtime_config,
+    camera_observation_mode,
     movement_fitness_weights_for_scope,
 )
 from simulation import (
@@ -68,6 +71,15 @@ def parse_arguments():
         help=(
             "road users controlled by the policy; default follows "
             "road_users.pedestrians_enabled in config.py"
+        ),
+    )
+    parser.add_argument(
+        "--observation-mode",
+        choices=CAMERA_OBSERVATION_MODES,
+        default="configured",
+        help=(
+            "controller input boundary: use config.py, complete simulator "
+            "state, exact camera ROI, or uncertain camera ROI"
         ),
     )
     parser.add_argument("--population", type=int, default=32)
@@ -449,6 +461,8 @@ def main():
         )
 
     runtime_config = build_runtime_config(CONFIG)
+    apply_camera_observation_mode(runtime_config, args.observation_mode)
+    effective_observation_mode = camera_observation_mode(runtime_config)
     configured_scope = (
         VEHICLES_AND_PEDESTRIANS_SCOPE
         if runtime_config.get("road_users", {}).get(
@@ -592,6 +606,7 @@ def main():
         f"({args.population} candidates, {args.generations} generations, "
         f"{len(traffic_profiles)} profiles, seeds={args.seeds}, "
         f"scope={control_scope}, "
+        f"observation={effective_observation_mode}, "
         f"optimizer={args.optimizer}, dt={args.timestep:g}s, "
         f"workers={trainer.workers})..."
     )
@@ -695,6 +710,7 @@ def main():
             "workers": trainer.workers,
             "training_time_s": result["training_time_s"],
             "control_scope": control_scope,
+            "observation_mode": effective_observation_mode,
             "fitness_weights": effective_fitness_weights,
             "six_phase_fitness_weights": (
                 effective_six_phase_fitness_weights
