@@ -129,7 +129,7 @@ class SixPhasePolicyTests(unittest.TestCase):
             parallel["best"]["mean_metrics"],
         )
 
-    def test_policy_has_compact_61_input_schema(self):
+    def test_policy_has_compact_57_input_schema(self):
         policy = SixPhasePolicy(
             [0.0] * SixPhasePolicy.genome_size,
             duration_bounds_s=(1.0, 10.0),
@@ -140,12 +140,6 @@ class SixPhasePolicyTests(unittest.TestCase):
                 "south": 0.50,
                 "east": 0.75,
                 "west": 1.00,
-            },
-            "waiting_pedestrian_counts": {
-                "north": 1,
-                "south": 2,
-                "east": 3,
-                "west": 4,
             },
             "left_red_elapsed_s": {
                 "north": 15.0,
@@ -165,14 +159,13 @@ class SixPhasePolicyTests(unittest.TestCase):
 
         inputs = policy._build_inputs(observation)
 
-        self.assertEqual(SixPhasePolicy.input_size, 61)
-        self.assertEqual(len(INPUT_FEATURE_NAMES), 61)
-        self.assertEqual(SixPhasePolicy.genome_size, 730)
+        self.assertEqual(SixPhasePolicy.input_size, 57)
+        self.assertEqual(len(INPUT_FEATURE_NAMES), 57)
+        self.assertEqual(SixPhasePolicy.genome_size, 690)
         self.assertEqual(inputs[8:12], [0.25, 0.50, 0.75, 1.00])
         self.assertEqual(inputs[36:40], [0.25, 0.50, 0.75, 1.00])
         self.assertEqual(inputs[40:44], [0.1, 0.2, 0.3, 0.4])
-        self.assertEqual(inputs[44:48], [0.1, 0.2, 0.3, 0.4])
-        self.assertEqual(inputs[48:50], [0.5, 0.4])
+        self.assertEqual(inputs[44:46], [0.5, 0.4])
 
     def test_observation_averages_vehicle_speed_ratio_by_approach(self):
         simulation = Simulation(self.config, random_seed=1)
@@ -202,32 +195,6 @@ class SixPhasePolicyTests(unittest.TestCase):
         self.assertAlmostEqual(observation["average_speed_ratios"]["north"], 0.5)
         for direction in ("south", "east", "west"):
             self.assertEqual(observation["average_speed_ratios"][direction], 0.0)
-
-    def test_observation_counts_only_waiting_pedestrians_for_policy(self):
-        simulation = Simulation(self.config, random_seed=1)
-        simulation.pedestrians = [
-            SimpleNamespace(
-                crossing="north",
-                waiting=True,
-                has_reached_divider=False,
-            ),
-            SimpleNamespace(
-                crossing="north",
-                waiting=False,
-                has_reached_divider=False,
-            ),
-            SimpleNamespace(
-                crossing="south",
-                waiting=True,
-                has_reached_divider=True,
-            ),
-        ]
-
-        observation = simulation.get_signal_observation("ns")
-
-        self.assertEqual(observation["waiting_pedestrian_counts"]["north"], 1)
-        self.assertEqual(observation["waiting_pedestrian_counts"]["south"], 1)
-        self.assertEqual(observation["pedestrian_counts"]["north"], 1)
 
     def test_observation_exposes_approaching_turn_demand_before_entry(self):
         simulation = Simulation(self.config, random_seed=1)
@@ -334,10 +301,6 @@ class SixPhasePolicyTests(unittest.TestCase):
         self.assertEqual(controller.get_left_turn_state("north"), "green")
         self.assertEqual(controller.get_vehicle_state(left_vehicle), "green")
         self.assertEqual(controller.get_vehicle_state(through_vehicle), "red")
-        self.assertEqual(
-            controller.phase_conflicting_crossings("north_left"),
-            {"north", "east"},
-        )
 
     def test_multiple_compatible_right_arrows_activate_together(self):
         controller = SixPhaseTrafficLightController(self.config)
@@ -376,10 +339,6 @@ class SixPhasePolicyTests(unittest.TestCase):
         self.assertEqual(controller.get_right_turn_state("east"), "red")
         self.assertEqual(controller.get_vehicle_state(north_right), "green")
         self.assertEqual(controller.get_vehicle_state(south_right), "green")
-        self.assertEqual(
-            controller.get_pedestrian_state("west"),
-            "red",
-        )
 
     def test_right_arrow_debounces_temporary_demand_loss(self):
         timing = self.config["traffic_lights"]
@@ -434,7 +393,7 @@ class SixPhasePolicyTests(unittest.TestCase):
 
         self.assertEqual(available, ("ew",))
 
-    def test_pedestrian_guard_blocks_only_its_right_arrow(self):
+    def test_scene_guard_blocks_only_its_right_arrow(self):
         controller = SixPhaseTrafficLightController(self.config)
         north_right = SimpleNamespace(
             road_direction="north",
@@ -816,9 +775,6 @@ class SixPhasePolicyTests(unittest.TestCase):
                     "avg_travel_time",
                     "max_wait_time",
                     "active_vehicles",
-                    "avg_pedestrian_wait_time",
-                    "avg_active_pedestrian_wait_time",
-                    "max_pedestrian_wait_time",
                     "hard_braking_events",
                     "hard_braking_vehicles",
                     "hard_braking_vehicle_rate",

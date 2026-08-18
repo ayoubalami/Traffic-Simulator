@@ -11,7 +11,6 @@ from config import (
     FULL_STATE_OBSERVATION_MODE,
     UNCERTAIN_CAMERA_OBSERVATION_MODE,
     apply_camera_observation_mode,
-    apply_movement_control_scope,
     build_runtime_config,
     camera_observation_mode,
 )
@@ -37,12 +36,6 @@ METRICS = (
     "emergency_vehicle_completion_rate",
     "avg_emergency_vehicle_wait_time_all",
     "max_emergency_vehicle_wait_time",
-    "avg_pedestrian_wait_time_all",
-    "pedestrian_wait_time_p95",
-    "pedestrian_completion_rate",
-    "wasted_pedestrian_walk_fraction",
-    "vehicle_pedestrian_crosswalk_cooccupancy_fraction",
-    "vehicle_pedestrian_crosswalk_conflict_events",
     "hard_braking_vehicle_rate",
     "avg_excess_braking_intensity_per_vehicle",
     "phase_switches",
@@ -85,12 +78,12 @@ def parse_arguments():
     parser.add_argument(
         "--movement-model",
         type=Path,
-        default=Path("models/vehicle_movement_policy_v7.json"),
+        default=Path("models/vehicle_movement_policy_exact.json"),
     )
     parser.add_argument(
         "--uncertain-movement-model",
         type=Path,
-        default=Path("models/vehicle_movement_policy_v8.json"),
+        default=Path("models/vehicle_movement_policy_uncertain.json"),
         help=(
             "movement policy trained with camera uncertainty; it is evaluated "
             "under the same runtime camera settings as the standard model"
@@ -216,22 +209,6 @@ def main():
         full_state_movement = load_movement_policy(
             args.full_state_movement_model
         )
-    fixed_scope = getattr(fixed, "control_scope", "vehicles_only")
-    movement_scope = getattr(movement, "control_scope", None)
-    uncertain_scope = getattr(uncertain_movement, "control_scope", None)
-    full_state_scope = getattr(full_state_movement, "control_scope", None)
-    incompatible_scopes = tuple(
-        scope
-        for scope in (movement_scope, uncertain_scope, full_state_scope)
-        if scope is not None and scope != fixed_scope
-    )
-    if incompatible_scopes:
-        raise SystemExit(
-            "The fixed and movement policies must use the same control scope "
-            f"for a comparable experiment (fixed={fixed_scope}, "
-            f"movement={movement_scope}, uncertain={uncertain_scope}, "
-            f"full_state={full_state_scope})."
-        )
     if args.observation_ablation:
         _validate_policy_observation_mode(
             full_state_movement,
@@ -248,7 +225,6 @@ def main():
             UNCERTAIN_CAMERA_OBSERVATION_MODE,
             "Uncertain-camera",
         )
-    apply_movement_control_scope(config, fixed_scope)
     # A failed/gridlocked controller must not shorten its scenario matrix.
     # Every method is therefore measured on every requested profile x seed.
     config.setdefault("six_phase_fitness", {})[

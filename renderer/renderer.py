@@ -14,9 +14,6 @@ class Renderer:
 
     def __init__(self, config):
         self.config = config
-        self.pedestrians_enabled = bool(
-            config.get("road_users", {}).get("pedestrians_enabled", True)
-        )
         self._initialize_density_control()
         pygame.init()
         w = config["window"]["width"]
@@ -181,11 +178,7 @@ class Renderer:
         self.draw_lane_arrows()
         self.draw_vehicles(render_data["vehicles"])
         self.draw_vehicle_braking_debug(render_data["vehicles"])
-        if self.pedestrians_enabled:
-            self.draw_pedestrians(render_data.get("pedestrians", []))
         self.draw_traffic_lights(render_data["lights"])
-        if self.pedestrians_enabled:
-            self.draw_pedestrian_lights(render_data["lights"])
         self.draw_metrics(render_data["metrics"])
         self.draw_phase_probabilities(
             render_data.get("phase_probabilities"),
@@ -435,7 +428,7 @@ class Renderer:
                     pygame.draw.polygon(self.screen, signal_outline, signal_points, 1)
 
     def draw_vehicle_braking_debug(self, vehicles):
-        """Draw each vehicle's current physical deceleration in m/s²."""
+        """Draw each vehicle's current physical deceleration in m/sÂ²."""
         debug = self.config.get("debug", {})
         if not debug.get("show_vehicle_braking_rate", False):
             return
@@ -485,69 +478,6 @@ class Renderer:
             pygame.draw.rect(self.screen, (20, 20, 20), background, border_radius=2)
             self.screen.blit(surface, label_rect)
 
-    def draw_pedestrians(self, pedestrians):
-        """Draw each pedestrian as a colored circle with a direction arrow."""
-        for pedestrian in pedestrians:
-            x, y = map(int, pedestrian.position)
-            radius = pedestrian.radius
-            pygame.draw.circle(self.screen, pedestrian.color, (x, y), radius)
-            pygame.draw.circle(self.screen, (25, 25, 25), (x, y), radius, 1)
-
-            if pedestrian.crossing in ("north", "south"):
-                dx, dy = pedestrian.direction * radius, 0
-            else:
-                dx, dy = 0, pedestrian.direction * radius
-
-            tip = (x + dx, y + dy)
-            left = (x - dy // 2, y + dx // 2)
-            right = (x + dy // 2, y - dx // 2)
-            pygame.draw.polygon(self.screen, (255, 255, 255), (tip, left, right))
-
-    def draw_pedestrian_lights(self, light_controller):
-        """Draw one red/green pedestrian signal on the left side of each crossing."""
-        w, h = self.config["window"]["width"], self.config["window"]["height"]
-        cx, cy = w / 2, h / 2
-        lane_width = self.config["lane_width"]
-        roads = self.config["roads"]
-        ix_half_width, ix_half_height = self._get_intersection_half_dims()
-        vehicle_stop_distance = (
-            self.config["crosswalk_intersection_offset"]
-            + self.config["crosswalk_width"]
-            + self.config["crosswalk_stop_line_offset"]
-        )
-
-        def draw_signal(x, y, state, horizontal):
-            width, height = (30, 14) if horizontal else (14, 30)
-            pygame.draw.rect(self.screen, (25, 25, 25), (x, y, width, height), border_radius=2)
-            pygame.draw.rect(self.screen, (80, 80, 80), (x, y, width, height), 1, border_radius=2)
-            if horizontal:
-                red_center, green_center = (x + 8, y + 7), (x + 22, y + 7)
-            else:
-                red_center, green_center = (x + 7, y + 8), (x + 7, y + 22)
-            pygame.draw.circle(self.screen, (255, 0, 0) if state == "red" else (65, 20, 20), red_center, 4)
-            pygame.draw.circle(self.screen, (20, 210, 65) if state == "green" else (15, 55, 25), green_center, 4)
-
-        for crossing in ("north", "south", "west", "east"):
-            if not roads[crossing]["enabled"]:
-                continue
-            state = light_controller.get_pedestrian_state(crossing)
-            road_width = lane_width * (roads[crossing]["incoming"] + roads[crossing]["outgoing"]) + self._divider_width(crossing)
-
-            if crossing in ("north", "south"):
-                stop_y = (cy - ix_half_height - vehicle_stop_distance if crossing == "north"
-                          else cy + ix_half_height + vehicle_stop_distance)
-                box_y = stop_y - 4 if crossing == "north" else stop_y
-                box_x = (cx + road_width / 2 if crossing == "north"
-                         else cx - road_width / 2 - 30)
-                draw_signal(box_x, box_y, state, horizontal=True)
-            else:
-                stop_x = (cx - ix_half_width - vehicle_stop_distance if crossing == "west"
-                          else cx + ix_half_width + vehicle_stop_distance)
-                box_x = stop_x - 4 if crossing == "west" else stop_x
-                box_y = (cy - road_width / 2 - 30 if crossing == "west"
-                         else cy + road_width / 2)
-                draw_signal(box_x, box_y, state, horizontal=False)
-        
     def draw_metrics(self, metrics):
         if not self.config.get("debug", {}).get("show_metrics", True):
             return
@@ -791,10 +721,6 @@ class Renderer:
             ("south_right", "South right"),
             ("east_right", "East right"),
             ("west_right", "West right"),
-            # ("north_walk", "North WALK"),
-            # ("south_walk", "South WALK"),
-            # ("east_walk", "East WALK"),
-            # ("west_walk", "West WALK"),
         )
         labels = tuple(
             item for item in all_labels if item[0] in scores
@@ -804,26 +730,12 @@ class Renderer:
             1.0,
             max(0.0, float(decision_debug.get("threshold", 0.5))),
         )
-        pedestrian_threshold = min(
-            1.0,
-            max(
-                0.0,
-                float(
-                    decision_debug.get("pedestrian_threshold", threshold)
-                ),
-            ),
-        )
         demanded = set(decision_debug.get("demanded") or ())
         raw_requested = set(decision_debug.get("raw_requested") or ())
         decoded = set(decision_debug.get("decoded") or ())
         active = set(decision_debug.get("active") or ())
         pending = set(decision_debug.get("pending") or ())
         phase_state = decision_debug.get("phase_state") or "-"
-        pedestrian_aware = any(
-            output in scores
-            for output in ("north_walk", "south_walk", "east_walk", "west_walk")
-        )
-
         panel_width = 270
         panel_height = 102 + 19 * len(labels)
         panel_x = self.config["window"]["width"] - panel_width - 14
@@ -839,11 +751,7 @@ class Renderer:
             border_radius=4,
         )
         title = self.font.render(
-            (
-                "Vehicle + pedestrian outputs"
-                if pedestrian_aware
-                else "Vehicle movement outputs"
-            ),
+            "Vehicle movement outputs",
             True,
             (255, 255, 255),
         )
@@ -880,12 +788,7 @@ class Renderer:
                     (bar_x, row_y + 2, fill_width, 10),
                     border_radius=2,
                 )
-            row_threshold = (
-                pedestrian_threshold
-                if movement.endswith("_walk")
-                else threshold
-            )
-            threshold_x = bar_x + round(bar_width * row_threshold)
+            threshold_x = bar_x + round(bar_width * threshold)
             pygame.draw.line(
                 self.screen,
                 (235, 235, 235),
@@ -906,12 +809,7 @@ class Renderer:
         footer_lines = (
             f"Raw: {len(raw_requested)}  Safe set: {len(decoded)}",
             f"Active: {len(active)}  Pending: {len(pending)}",
-            (
-                f"Threshold V:{threshold:.2f} P:{pedestrian_threshold:.2f} "
-                f"State:{phase_state}"
-                if pedestrian_aware
-                else f"Threshold:{threshold:.2f} State:{phase_state}"
-            ),
+            f"Threshold:{threshold:.2f} State:{phase_state}",
         )
         for index, footer_text in enumerate(footer_lines):
             self.screen.blit(
@@ -977,9 +875,7 @@ class Renderer:
         margin = max(2, round(lane_width * self.config.get("road_side_margin_ratio", 0.25)))
         margin_color = colors.get("road_margin", colors["road"])
 
-        # -----------------------------
         # NORTH
-        # -----------------------------
 
         if roads["north"]["enabled"]:
 
@@ -1010,9 +906,7 @@ class Renderer:
             pygame.draw.line(self.screen, colors["white"], (road_left, 0), (road_left, cy - ix_half_height), 2)
             pygame.draw.line(self.screen, colors["white"], (road_right, 0), (road_right, cy - ix_half_height), 2)
 
-        # -----------------------------
         # SOUTH
-        # -----------------------------
 
         if roads["south"]["enabled"]:
 
@@ -1041,9 +935,7 @@ class Renderer:
             pygame.draw.line(self.screen, colors["white"], (road_left, cy + ix_half_height), (road_left, h), 2)
             pygame.draw.line(self.screen, colors["white"], (road_right, cy + ix_half_height), (road_right, h), 2)
 
-        # -----------------------------
         # WEST
-        # -----------------------------
 
         if roads["west"]["enabled"]:
 
@@ -1072,9 +964,7 @@ class Renderer:
             pygame.draw.line(self.screen, colors["white"], (0, road_top), (cx - ix_half_width, road_top), 2)
             pygame.draw.line(self.screen, colors["white"], (0, road_bottom), (cx - ix_half_width, road_bottom), 2)
 
-        # -----------------------------
         # EAST
-        # -----------------------------
 
         if roads["east"]["enabled"]:
 
@@ -1119,9 +1009,7 @@ class Renderer:
 
         ix_half_width, ix_half_height = self._get_intersection_half_dims()
 
-        # --------------------------------------------------
         # NORTH
-        # --------------------------------------------------
 
         if roads["north"]["enabled"]:
 
@@ -1135,9 +1023,7 @@ class Renderer:
                 from_top=True
             )
 
-        # --------------------------------------------------
         # SOUTH
-        # --------------------------------------------------
 
         if roads["south"]["enabled"]:
 
@@ -1151,9 +1037,7 @@ class Renderer:
                 from_top=False
             )
 
-        # --------------------------------------------------
         # WEST
-        # --------------------------------------------------
 
         if roads["west"]["enabled"]:
 
@@ -1167,9 +1051,7 @@ class Renderer:
                 from_left=True
             )
 
-        # --------------------------------------------------
         # EAST
-        # --------------------------------------------------
 
         if roads["east"]["enabled"]:
 
@@ -1485,16 +1367,16 @@ class Renderer:
                         angle,
                     )
 
-        # North: move down, arrow points down (90°), above stop line
+        # North: move down, arrow points down (90Â°), above stop line
         draw_road_arrows("north", roads["north"], cy - ix_half_height, -120, 0, 90)
 
-        # South: move up, arrow points up (-90°), below stop line
+        # South: move up, arrow points up (-90Â°), below stop line
         draw_road_arrows("south", roads["south"], cy + ix_half_height, 120, roads["south"]["outgoing"], -90)
 
-        # West: move right, arrow points right (0°), left of stop line
+        # West: move right, arrow points right (0Â°), left of stop line
         draw_road_arrows("west", roads["west"], cx - ix_half_width, -120, roads["west"]["outgoing"], 0)
 
-        # East: move left, arrow points left (180°), right of stop line
+        # East: move left, arrow points left (180Â°), right of stop line
         draw_road_arrows("east", roads["east"], cx + ix_half_width, 120, 0, 180)
 
     

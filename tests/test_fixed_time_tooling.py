@@ -21,7 +21,6 @@ class FixedTimeToolingTests(unittest.TestCase):
     def test_default_plan_is_safe_conventional_six_stage_baseline(self):
         plan = load_fixed_time_plan(DEFAULT_PLAN)
 
-        self.assertEqual(plan.control_scope, "vehicles_only")
         self.assertEqual(len(plan.stages), 6)
         self.assertAlmostEqual(
             sum(stage.duration_s for stage in plan.stages),
@@ -56,25 +55,24 @@ class FixedTimeToolingTests(unittest.TestCase):
         )
         self.assertEqual(
             args.movement_model,
-            Path("models/vehicle_movement_policy_v7.json"),
+            Path("models/vehicle_movement_policy_exact.json"),
         )
         self.assertEqual(
             args.uncertain_movement_model,
-            Path("models/vehicle_movement_policy_v8.json"),
+            Path("models/vehicle_movement_policy_uncertain.json"),
         )
         self.assertFalse(args.observation_ablation)
         self.assertIsNone(args.full_state_movement_model)
 
     def test_comparison_runs_all_four_on_full_scenario_matrix_and_saves_json(self):
         config = {
-            "road_users": {"pedestrians_enabled": False},
             "six_phase_fitness": {
                 "abort_remaining_seeds_on_gridlock": True,
             },
         }
-        fixed = SimpleNamespace(control_scope="vehicles_only")
-        movement = SimpleNamespace(control_scope="vehicles_only")
-        uncertain_movement = SimpleNamespace(control_scope="vehicles_only")
+        fixed = SimpleNamespace()
+        movement = SimpleNamespace()
+        uncertain_movement = SimpleNamespace()
         categorical = object()
         result = {
             "mean_fitness": 1.0,
@@ -154,7 +152,6 @@ class FixedTimeToolingTests(unittest.TestCase):
 
     def test_observation_ablation_uses_three_explicit_runtime_modes(self):
         config = {
-            "road_users": {"pedestrians_enabled": False},
             "camera_observation": {
                 "enabled": True,
                 "uncertainty_enabled": False,
@@ -164,24 +161,21 @@ class FixedTimeToolingTests(unittest.TestCase):
                 "abort_remaining_seeds_on_gridlock": True,
             },
         }
-        fixed = SimpleNamespace(control_scope="vehicles_only")
+        fixed = SimpleNamespace()
         categorical = object()
         exact = SimpleNamespace(
-            control_scope="vehicles_only",
             observation_model={
                 "enabled": True,
                 "uncertainty_enabled": False,
             },
         )
         uncertain = SimpleNamespace(
-            control_scope="vehicles_only",
             observation_model={
                 "enabled": True,
                 "uncertainty_enabled": True,
             },
         )
         full_state = SimpleNamespace(
-            control_scope="vehicles_only",
             observation_model={
                 "enabled": False,
                 "uncertainty_enabled": False,

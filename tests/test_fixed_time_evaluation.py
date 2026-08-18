@@ -45,10 +45,8 @@ class FixedTimeEvaluationTests(unittest.TestCase):
         _GridlockedSimulation.instances.clear()
         self.plan = SimpleNamespace(
             name="equal_split",
-            control_scope="vehicles_only",
         )
         self.config = {
-            "road_users": {"pedestrians_enabled": False},
             "simulation": {
                 "arrival_rates_per_s": {
                     "north": 0.1,

@@ -38,10 +38,6 @@ class Metrics:
             0.0,
             float(metrics_config.get("vehicle_stop_resume_speed_mps", 0.8)),
         )
-        self.pedestrian_wait_sample_limit = max(
-            1,
-            int(metrics_config.get("pedestrian_wait_sample_limit", 4096)),
-        )
         self.simulation_time = 0.0
         self.total_vehicles_spawned = 0
         self.total_vehicles_exited = 0
@@ -99,36 +95,12 @@ class Metrics:
         self.policy_output_saturated_time = 0.0
         self.policy_requested_movement_time = 0.0
         self.policy_rejected_movement_time = 0.0
-        self.policy_requested_pedestrian_time = 0.0
-        self.policy_rejected_pedestrian_time = 0.0
         self.phase_activation_counts = {}
         self.previous_active_phase = None
         self.previous_active_movements = None
-        self.total_pedestrians_spawned = 0
-        self.total_pedestrians_finished = 0
-        self.total_pedestrian_wait_time = 0.0
-        self.max_pedestrian_wait_time = 0.0
-        self.finished_pedestrian_wait_times = []
-        self._pedestrian_wait_sample_cursor = 0
-        self.pedestrian_walk_time = 0.0
-        self.useful_pedestrian_walk_time = 0.0
-        self.wasted_pedestrian_walk_time = 0.0
-        self.vehicle_pedestrian_crosswalk_cooccupancy_events = 0
-        self.vehicle_pedestrian_crosswalk_cooccupancy_time = 0.0
-        self.vehicle_pedestrian_crosswalk_conflict_events = 0
-        self.vehicle_pedestrian_crosswalk_conflict_time = 0.0
-        self._crosswalk_cooccupancy_active = {
-            direction: False
-            for direction in ("north", "south", "east", "west")
-        }
-        self._crosswalk_conflict_active = {
-            direction: False
-            for direction in ("north", "south", "east", "west")
-        }
         self.queue_lengths = self._empty_direction_counts()
         self.max_queue_lengths = self._empty_direction_counts()
         self.vehicles_tracked = {}
-        self.pedestrians_tracked = {}
 
     @staticmethod
     def _empty_direction_counts():
@@ -342,20 +314,7 @@ class Metrics:
     ):
         """Accumulate dense signal-control and intersection-flow metrics."""
         dt = max(0.0, dt)
-        output_scores = {}
-        for attribute in ("last_movement_scores", "last_pedestrian_scores"):
-            if (
-                attribute == "last_pedestrian_scores"
-                and not getattr(
-                    light_controller,
-                    "_pedestrian_policy_enabled",
-                    False,
-                )
-            ):
-                continue
-            scores = getattr(light_controller, attribute, None)
-            if isinstance(scores, dict):
-                output_scores.update(scores)
+        output_scores = getattr(light_controller, "last_movement_scores", {})
         if output_scores:
             bounded_scores = [
                 min(1.0, max(0.0, float(score)))
@@ -376,24 +335,6 @@ class Metrics:
             self.policy_requested_movement_time += len(raw_requested) * dt
             self.policy_rejected_movement_time += len(
                 raw_requested.difference(decoded)
-            ) * dt
-            raw_pedestrian = set(
-                getattr(
-                    light_controller,
-                    "last_raw_requested_pedestrian_outputs",
-                    (),
-                )
-            )
-            decoded_pedestrian = set(
-                getattr(
-                    light_controller,
-                    "last_decoded_pedestrian_outputs",
-                    (),
-                )
-            )
-            self.policy_requested_pedestrian_time += len(raw_pedestrian) * dt
-            self.policy_rejected_pedestrian_time += len(
-                raw_pedestrian.difference(decoded_pedestrian)
             ) * dt
         active_phase = light_controller.active_phase
         self.empty_green_gap_outs = max(
@@ -590,102 +531,6 @@ class Metrics:
             else:
                 self.right_turn_delay += delay
 
-    def register_pedestrian(self, pedestrian_id):
-        if pedestrian_id in self.pedestrians_tracked:
-            return
-        self.pedestrians_tracked[pedestrian_id] = {"wait_time": 0.0}
-        self.total_pedestrians_spawned += 1
-
-    def update_pedestrians(self, pedestrians, dt):
-        """Accumulate time spent waiting for signals or on the divider."""
-        dt = max(0.0, dt)
-        for pedestrian in pedestrians:
-            pedestrian_id = id(pedestrian)
-            self.register_pedestrian(pedestrian_id)
-            data = self.pedestrians_tracked[pedestrian_id]
-            if pedestrian.waiting:
-                data["wait_time"] += dt
-                self.max_pedestrian_wait_time = max(
-                    self.max_pedestrian_wait_time,
-                    data["wait_time"],
-                )
-
-    def update_crosswalk_safety(
-        self,
-        active_pedestrian_counts,
-        vehicle_occupancy_counts,
-        waiting_pedestrian_counts,
-        pedestrian_states,
-        dt,
-        conflict_counts=None,
-    ):
-        """Measure WALK utilization, co-occupancy, and physical conflicts.
-
-        Co-occupancy is diagnostic because users can be in different lanes of
-        one wide crosswalk. ``conflict_counts`` is the spatially precise near-
-        collision signal and should remain zero under a safe controller.
-        """
-        dt = max(0.0, float(dt))
-        conflict_counts = conflict_counts or {}
-        for direction in self._crosswalk_conflict_active:
-            active_pedestrians = max(
-                0,
-                int(active_pedestrian_counts.get(direction, 0)),
-            )
-            occupying_vehicles = max(
-                0,
-                int(vehicle_occupancy_counts.get(direction, 0)),
-            )
-            waiting_pedestrians = max(
-                0,
-                int(waiting_pedestrian_counts.get(direction, 0)),
-            )
-            cooccupancy_active = bool(
-                active_pedestrians > 0 and occupying_vehicles > 0
-            )
-            if cooccupancy_active:
-                self.vehicle_pedestrian_crosswalk_cooccupancy_time += dt
-                if not self._crosswalk_cooccupancy_active[direction]:
-                    self.vehicle_pedestrian_crosswalk_cooccupancy_events += 1
-            self._crosswalk_cooccupancy_active[direction] = cooccupancy_active
-
-            conflict_active = max(
-                0,
-                int(conflict_counts.get(direction, 0)),
-            ) > 0
-            if conflict_active:
-                self.vehicle_pedestrian_crosswalk_conflict_time += dt
-                if not self._crosswalk_conflict_active[direction]:
-                    self.vehicle_pedestrian_crosswalk_conflict_events += 1
-            self._crosswalk_conflict_active[direction] = conflict_active
-
-            if pedestrian_states.get(direction) != "green":
-                continue
-            self.pedestrian_walk_time += dt
-            if active_pedestrians > 0 or waiting_pedestrians > 0:
-                self.useful_pedestrian_walk_time += dt
-            else:
-                self.wasted_pedestrian_walk_time += dt
-
-    def pedestrian_finished(self, pedestrian_id):
-        data = self.pedestrians_tracked.pop(pedestrian_id, None)
-        if data is None:
-            return
-        self.total_pedestrians_finished += 1
-        self.total_pedestrian_wait_time += data["wait_time"]
-        if (
-            len(self.finished_pedestrian_wait_times)
-            < self.pedestrian_wait_sample_limit
-        ):
-            self.finished_pedestrian_wait_times.append(data["wait_time"])
-        else:
-            self.finished_pedestrian_wait_times[
-                self._pedestrian_wait_sample_cursor
-            ] = data["wait_time"]
-            self._pedestrian_wait_sample_cursor = (
-                self._pedestrian_wait_sample_cursor + 1
-            ) % self.pedestrian_wait_sample_limit
-
     def vehicle_exited(self, vehicle_id):
         if vehicle_id in self.vehicles_tracked:
             self.total_vehicles_exited += 1
@@ -731,53 +576,6 @@ class Metrics:
         emergency_vehicle_completion_rate = (
             self.total_emergency_vehicles_exited
             / max(1, self.total_emergency_vehicles_spawned)
-        )
-        active_pedestrian_wait_times = [
-            data["wait_time"] for data in self.pedestrians_tracked.values()
-        ]
-        avg_pedestrian_wait = self.total_pedestrian_wait_time / max(
-            1,
-            self.total_pedestrians_finished,
-        )
-        avg_active_pedestrian_wait = sum(active_pedestrian_wait_times) / max(
-            1,
-            len(active_pedestrian_wait_times),
-        )
-        total_pedestrian_wait_time = (
-            self.total_pedestrian_wait_time + sum(active_pedestrian_wait_times)
-        )
-        avg_pedestrian_wait_time_all = total_pedestrian_wait_time / max(
-            1,
-            self.total_pedestrians_spawned,
-        )
-        all_pedestrian_wait_times = sorted(
-            self.finished_pedestrian_wait_times + active_pedestrian_wait_times
-        )
-        pedestrian_wait_p95 = (
-            all_pedestrian_wait_times[
-                max(
-                    0,
-                    (95 * len(all_pedestrian_wait_times) + 99) // 100 - 1,
-                )
-            ]
-            if all_pedestrian_wait_times
-            else 0.0
-        )
-        pedestrian_completion_rate = (
-            self.total_pedestrians_finished
-            / max(1, self.total_pedestrians_spawned)
-        )
-        wasted_pedestrian_walk_fraction = (
-            self.wasted_pedestrian_walk_time
-            / max(1e-9, self.pedestrian_walk_time)
-        )
-        vehicle_pedestrian_crosswalk_conflict_fraction = (
-            self.vehicle_pedestrian_crosswalk_conflict_time
-            / max(1e-9, self.simulation_time * 4.0)
-        )
-        vehicle_pedestrian_crosswalk_cooccupancy_fraction = (
-            self.vehicle_pedestrian_crosswalk_cooccupancy_time
-            / max(1e-9, self.simulation_time * 4.0)
         )
         total_arrival_requests = sum(self.arrival_requests_by_direction.values())
         throughput_denominator = (
@@ -922,11 +720,6 @@ class Metrics:
             self.policy_rejected_movement_time
             / max(1e-9, self.policy_requested_movement_time)
         )
-        policy_pedestrian_request_rejection_fraction = (
-            self.policy_rejected_pedestrian_time
-            / max(1e-9, self.policy_requested_pedestrian_time)
-        )
-
         return {
             "throughput": self.total_vehicles_exited,
             "throughput_rate": throughput_rate,
@@ -996,40 +789,6 @@ class Metrics:
             "pre_intersection_wait_time_imbalance": (
                 pre_intersection_wait_imbalance
             ),
-            "avg_pedestrian_wait_time": avg_pedestrian_wait,
-            "avg_active_pedestrian_wait_time": avg_active_pedestrian_wait,
-            "avg_pedestrian_wait_time_all": avg_pedestrian_wait_time_all,
-            "pedestrian_wait_time_p95": pedestrian_wait_p95,
-            "max_pedestrian_wait_time": self.max_pedestrian_wait_time,
-            "total_pedestrian_wait_time": total_pedestrian_wait_time,
-            "active_pedestrians": len(self.pedestrians_tracked),
-            "total_pedestrians_spawned": self.total_pedestrians_spawned,
-            "total_pedestrians_finished": self.total_pedestrians_finished,
-            "pedestrian_completion_rate": pedestrian_completion_rate,
-            "pedestrian_walk_time": self.pedestrian_walk_time,
-            "useful_pedestrian_walk_time": self.useful_pedestrian_walk_time,
-            "wasted_pedestrian_walk_time": self.wasted_pedestrian_walk_time,
-            "wasted_pedestrian_walk_fraction": (
-                wasted_pedestrian_walk_fraction
-            ),
-            "vehicle_pedestrian_crosswalk_cooccupancy_events": (
-                self.vehicle_pedestrian_crosswalk_cooccupancy_events
-            ),
-            "vehicle_pedestrian_crosswalk_cooccupancy_time": (
-                self.vehicle_pedestrian_crosswalk_cooccupancy_time
-            ),
-            "vehicle_pedestrian_crosswalk_cooccupancy_fraction": (
-                vehicle_pedestrian_crosswalk_cooccupancy_fraction
-            ),
-            "vehicle_pedestrian_crosswalk_conflict_events": (
-                self.vehicle_pedestrian_crosswalk_conflict_events
-            ),
-            "vehicle_pedestrian_crosswalk_conflict_time": (
-                self.vehicle_pedestrian_crosswalk_conflict_time
-            ),
-            "vehicle_pedestrian_crosswalk_conflict_fraction": (
-                vehicle_pedestrian_crosswalk_conflict_fraction
-            ),
             "hard_braking_events": self.hard_braking_events,
             "hard_braking_vehicles": self.hard_braking_vehicles,
             "hard_braking_vehicle_rate": hard_braking_vehicle_rate,
@@ -1096,9 +855,6 @@ class Metrics:
             ),
             "policy_request_rejection_fraction": (
                 policy_request_rejection_fraction
-            ),
-            "policy_pedestrian_request_rejection_fraction": (
-                policy_pedestrian_request_rejection_fraction
             ),
             "phase_activation_counts": self.phase_activation_counts.copy(),
             "queue_lengths": self.queue_lengths.copy(),

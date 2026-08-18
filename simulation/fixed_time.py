@@ -18,11 +18,6 @@ from .traffic_light import MovementTrafficLightController
 
 FIXED_TIME_PLAN_FORMAT_VERSION = 1
 FIXED_TIME_PLAN_POLICY_TYPE = "fixed_time_movement"
-FIXED_TIME_CONTROL_SCOPES = frozenset(
-    ("vehicles_only", "vehicles_and_pedestrians")
-)
-
-
 @dataclass(frozen=True)
 class FixedTimeStage:
     """One unconditional green interval in a fixed-time signal cycle."""
@@ -173,7 +168,6 @@ class FixedTimeMovementPlan:
 
     stages: tuple[FixedTimeStage, ...]
     name: str = "fixed_time_baseline"
-    control_scope: str = "vehicles_only"
     metadata: dict = field(default_factory=dict)
     format_version: int = FIXED_TIME_PLAN_FORMAT_VERSION
     policy_type: str = FIXED_TIME_PLAN_POLICY_TYPE
@@ -195,11 +189,6 @@ class FixedTimeMovementPlan:
             )
         if not isinstance(self.name, str) or not self.name.strip():
             raise ValueError("fixed-time plan name must be a non-empty string")
-        if self.control_scope not in FIXED_TIME_CONTROL_SCOPES:
-            raise ValueError(
-                "fixed-time plan control_scope must be one of: "
-                + ", ".join(sorted(FIXED_TIME_CONTROL_SCOPES))
-            )
         if (
             isinstance(self.stages, (str, bytes))
             or not isinstance(self.stages, Sequence)
@@ -244,13 +233,6 @@ class FixedTimeMovementPlan:
             raise ValueError("fixed-time plan name must be a non-empty string")
         name = name.strip()
 
-        control_scope = data.get("control_scope", "vehicles_only")
-        if control_scope not in FIXED_TIME_CONTROL_SCOPES:
-            raise ValueError(
-                "fixed-time plan control_scope must be one of: "
-                + ", ".join(sorted(FIXED_TIME_CONTROL_SCOPES))
-            )
-
         raw_stages = data.get("stages")
         if (
             isinstance(raw_stages, (str, bytes))
@@ -278,7 +260,6 @@ class FixedTimeMovementPlan:
         return cls(
             stages=stages,
             name=name,
-            control_scope=control_scope,
             metadata=deepcopy(dict(metadata)),
         )
 
@@ -288,7 +269,6 @@ class FixedTimeMovementPlan:
             "format_version": self.format_version,
             "policy_type": self.policy_type,
             "name": self.name,
-            "control_scope": self.control_scope,
             "stages": [stage.to_dict() for stage in self.stages],
             "metadata": deepcopy(self.metadata),
         }
@@ -358,7 +338,6 @@ class FixedTimeMovementTrafficLightController(MovementTrafficLightController):
         self.last_decoded_main_movements = frozenset()
         self.last_decoded_movements = frozenset()
         self.last_movement_scores = None
-        self.last_pedestrian_scores = None
         self.empty_green_elapsed = 0.0
         self.empty_green_gap_out_count = 0
         self.emergency_preemption_count = 0

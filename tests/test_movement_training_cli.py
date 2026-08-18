@@ -11,9 +11,7 @@ from simulation.movement_neuroevolution import (
     MOVEMENT_INPUT_FEATURE_NAMES,
     MOVEMENT_NAMES,
     MOVEMENT_POLICY_FORMAT_VERSION,
-    PEDESTRIAN_OUTPUT_NAMES,
-    POLICY_OUTPUT_NAMES,
-    MovementPolicy,
+    VehicleMovementPolicy,
 )
 from train_movement_policy import load_warm_start_policy, parse_arguments
 
@@ -150,16 +148,15 @@ class MovementTrainingCliTests(unittest.TestCase):
             "format_version": MOVEMENT_POLICY_FORMAT_VERSION,
             "policy_type": "movement_multi_hot",
             "movements": list(MOVEMENT_NAMES),
-            "pedestrian_outputs": list(PEDESTRIAN_OUTPUT_NAMES),
-            "outputs": list(POLICY_OUTPUT_NAMES),
+            "outputs": list(MOVEMENT_NAMES),
             "network": {
-                "input_size": MovementPolicy.input_size,
+                "input_size": VehicleMovementPolicy.input_size,
                 "input_features": list(MOVEMENT_INPUT_FEATURE_NAMES),
-                "hidden_size": MovementPolicy.hidden_size,
-                "output_size": MovementPolicy.output_size,
-                "output_names": list(POLICY_OUTPUT_NAMES),
+                "hidden_size": VehicleMovementPolicy.hidden_size,
+                "output_size": VehicleMovementPolicy.output_size,
+                "output_names": list(MOVEMENT_NAMES),
             },
-            "weights": [0.125] * MovementPolicy.genome_size,
+            "weights": [0.125] * VehicleMovementPolicy.genome_size,
         }
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "policy.json"

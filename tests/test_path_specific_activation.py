@@ -8,7 +8,6 @@ from simulation.simulation import Simulation
 class PathSpecificActivationTests(unittest.TestCase):
     def setUp(self):
         config = build_runtime_config(CONFIG)
-        config["road_users"]["pedestrians_enabled"] = False
         self.simulation = Simulation(
             config,
             random_seed=1,

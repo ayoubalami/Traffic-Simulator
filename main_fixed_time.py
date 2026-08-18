@@ -3,12 +3,7 @@
 import argparse
 from pathlib import Path
 
-from config import (
-    CONFIG,
-    VEHICLES_ONLY_SCOPE,
-    apply_movement_control_scope,
-    build_runtime_config,
-)
+from config import CONFIG, build_runtime_config
 from renderer import Renderer
 from simulation import Simulation, load_fixed_time_plan
 
@@ -32,12 +27,6 @@ def main():
     args = parse_arguments()
     runtime_config = build_runtime_config(CONFIG)
     plan = load_fixed_time_plan(args.plan)
-    if getattr(plan, "control_scope", None) != VEHICLES_ONLY_SCOPE:
-        raise ValueError(
-            "main_fixed_time.py requires a vehicles_only fixed-time plan"
-        )
-    apply_movement_control_scope(runtime_config, VEHICLES_ONLY_SCOPE)
-
     time_scale = float(runtime_config["simulation"].get("time_scale", 1.0))
     if time_scale <= 0:
         raise ValueError("simulation.time_scale must be positive")

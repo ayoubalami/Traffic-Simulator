@@ -80,12 +80,6 @@ CONFIG = {
         "roi_alpha": 70,
         "boundary_color": (185, 185, 185),
     },
-    "road_users": {
-        # First paper configuration: optimize only vehicle signal movements.
-        # Set this to True, restore a positive pedestrian max_active value,
-        # and train a combined policy for the later pedestrian experiment.
-        "pedestrians_enabled": False,
-    },
     "traffic_lights": {
         # Adaptive policies decide whether to extend green every second after
         # the minimum.  The maximum is a fairness/safety guardrail, not a
@@ -136,38 +130,6 @@ CONFIG = {
         "empty_green_gap_out_s": 2.0,
         "empty_green_detection_distance_m": 15.0,
     },
-    "pedestrian_signals": {
-        # Used only when road_users.pedestrians_enabled is True. Pedestrian
-        # WALK is independent from the circular vehicle signal.
-        # Format-3 movement policies request each crosswalk separately; older
-        # controllers retain the automatic compatible-phase WALK window.
-        "enabled": True,
-        "walk_duration_s": 5.0,
-        # Neural WALK requests are held for at least this long.  The output
-        # is a request score; it never bypasses vehicle/crosswalk safety.
-        "min_walk_duration_s": 5.0,
-        # Close even a continuously requested WALK after this entry window.
-        # This produces the STOP edge required by pedestrians waiting at the
-        # protected divider before a new WALK can start their second stage.
-        "max_walk_duration_s": 10.0,
-        # After WALK closes, retain a short STOP clearance before admitting a
-        # conflicting vehicle movement. Pedestrians already in the roadway
-        # keep the vehicle guard closed until they have physically cleared.
-        "clearance_duration_s": 1.0,
-        # Fairness override: a waiting pedestrian cannot remain on STOP
-        # indefinitely even if the neural score stays low.
-        "max_red_duration_s": 45.0,
-        "output_threshold": 0.50,
-        # A reported near-conflict requires the pedestrian circle to come
-        # within this distance of the vehicle's actual body polygon. Mere
-        # occupancy of different lanes in one crosswalk remains diagnostic.
-        "conflict_safety_margin_m": 0.5,
-        # Split a crossing into two stages.  A pedestrian waits on the
-        # protected centre divider for the next WALK signal before crossing
-        # the second carriageway.
-        "stop_at_divider": True,
-        "require_new_walk_signal_at_divider": True,
-    },
     "fitness": {
         # Fitness v5 uses normalized outcomes and gives emergency delay an
         # explicit cost, so rare priority vehicles cannot be averaged away.
@@ -180,12 +142,6 @@ CONFIG = {
         # Waiting time already captures most congestion cost. Keep the stop
         # term smaller so timestep-sensitive stop/start jitter cannot dominate.
         "vehicle_stop_rate_penalty": 20.0,
-        # Mean pedestrian wait includes finished and active pedestrians.
-        "avg_pedestrian_wait_time_penalty": 10.0,
-        # Tail wait prevents a good mean from hiding one starved crosswalk.
-        "pedestrian_wait_time_p95_penalty": 2.0,
-        # Reward actual completed crossings, not merely time showing WALK.
-        "pedestrian_completion_rate_reward": 1000.0,
         # Excess deceleration intensity is normalized per spawned vehicle.
         "avg_excess_braking_penalty": 100.0,
     },
@@ -206,13 +162,6 @@ CONFIG = {
         # entering the junction, so light traffic on other sides cannot hide
         # one neglected direction in the global average.
         "worst_approach_wait_time_penalty": 5.0,
-        # Discourage WALK requests with no waiting or crossing pedestrian.
-        "wasted_pedestrian_walk_fraction_penalty": 250.0,
-        # These should stay exactly zero under the safety decoder. A spatially
-        # close vehicle/pedestrian near-conflict (not harmless occupancy in
-        # separate lanes) effectively eliminates a candidate.
-        "vehicle_pedestrian_crosswalk_conflict_event_penalty": 100000.0,
-        "vehicle_pedestrian_crosswalk_conflict_time_penalty": 10000.0,
         # Reject policies that form a persistent blockage in the physical
         # intersection. Evaluation stops as soon as this condition is met.
         "gridlock_penalty": 100000.0,
@@ -366,22 +315,6 @@ CONFIG = {
             {"length_m": 5.0, "weight": 2}
         ]
     },
-    "pedestrian_defaults": {
-        "spawn_interval_min": 0,
-        "spawn_interval_max": 0.0,
-        "max_active": 0,
-        "walking_speed_min_mps": 1.2,
-        "walking_speed_max_mps": 2.4,
-        "radius": 7
-    },
-    # "pedestrian_defaults": {
-    #     "spawn_interval_min": 5.8,
-    #     "spawn_interval_max": 10.0,
-    #     "max_active": 10,
-    #     "walking_speed_min_mps": 1.2,
-    #     "walking_speed_max_mps": 2.4,
-    #     "radius": 7
-    # },
     "roads": {
         "north": {"enabled": True, "incoming": 2, "outgoing": 2 ,"inverse": "south"},
         "south": {"enabled": True, "incoming": 2, "outgoing": 2 ,"inverse": "north"},
@@ -391,12 +324,6 @@ CONFIG = {
 }
 
 
-VEHICLES_ONLY_SCOPE = "vehicles_only"
-VEHICLES_AND_PEDESTRIANS_SCOPE = "vehicles_and_pedestrians"
-MOVEMENT_CONTROL_SCOPES = (
-    VEHICLES_ONLY_SCOPE,
-    VEHICLES_AND_PEDESTRIANS_SCOPE,
-)
 CONFIGURED_OBSERVATION_MODE = "configured"
 FULL_STATE_OBSERVATION_MODE = "full-state"
 EXACT_CAMERA_OBSERVATION_MODE = "exact-camera"
@@ -407,30 +334,6 @@ CAMERA_OBSERVATION_MODES = (
     EXACT_CAMERA_OBSERVATION_MODE,
     UNCERTAIN_CAMERA_OBSERVATION_MODE,
 )
-PEDESTRIAN_FITNESS_KEYS = (
-    "avg_pedestrian_wait_time_penalty",
-    "pedestrian_wait_time_p95_penalty",
-    "pedestrian_completion_rate_reward",
-)
-PEDESTRIAN_SIX_PHASE_FITNESS_KEYS = (
-    "wasted_pedestrian_walk_fraction_penalty",
-    "vehicle_pedestrian_crosswalk_conflict_event_penalty",
-    "vehicle_pedestrian_crosswalk_conflict_time_penalty",
-)
-
-
-def apply_movement_control_scope(runtime_config, control_scope):
-    """Apply one explicit, reversible road-user scope to a runtime config."""
-    if control_scope not in MOVEMENT_CONTROL_SCOPES:
-        raise ValueError(f"unknown movement control scope: {control_scope}")
-
-    pedestrians_enabled = control_scope == VEHICLES_AND_PEDESTRIANS_SCOPE
-    runtime_config.setdefault("road_users", {})[
-        "pedestrians_enabled"
-    ] = pedestrians_enabled
-    return runtime_config
-
-
 def apply_camera_observation_mode(runtime_config, observation_mode):
     """Apply a reproducible controller-observation boundary.
 
@@ -463,20 +366,6 @@ def camera_observation_mode(runtime_config):
     if bool(camera.get("uncertainty_enabled", False)):
         return UNCERTAIN_CAMERA_OBSERVATION_MODE
     return EXACT_CAMERA_OBSERVATION_MODE
-
-
-def movement_fitness_weights_for_scope(runtime_config, control_scope):
-    """Return the effective, publication-ready weights for one scope."""
-    if control_scope not in MOVEMENT_CONTROL_SCOPES:
-        raise ValueError(f"unknown movement control scope: {control_scope}")
-    fitness = dict(runtime_config.get("fitness", {}))
-    six_phase_fitness = dict(runtime_config.get("six_phase_fitness", {}))
-    if control_scope == VEHICLES_ONLY_SCOPE:
-        for key in PEDESTRIAN_FITNESS_KEYS:
-            fitness[key] = 0.0
-        for key in PEDESTRIAN_SIX_PHASE_FITNESS_KEYS:
-            six_phase_fitness[key] = 0.0
-    return fitness, six_phase_fitness
 
 
 def build_runtime_config(config=CONFIG):

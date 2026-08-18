@@ -13,7 +13,7 @@ from statistics import fmean, pstdev
 
 os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 
-from config import CONFIG, apply_movement_control_scope, build_runtime_config
+from config import CONFIG, build_runtime_config
 from simulation.evaluation import evaluate_fixed_time_policy_across_seeds
 from simulation.fixed_time import FixedTimeMovementPlan, load_fixed_time_plan
 
@@ -320,7 +320,6 @@ def main(argv=None):
     args = parse_arguments(argv)
     runtime_config = build_runtime_config(CONFIG)
     plan = load_fixed_time_plan(args.plan)
-    apply_movement_control_scope(runtime_config, plan.control_scope)
     profiles = tuple(
         runtime_config.get("six_phase_training", {}).get(
             "traffic_profiles",

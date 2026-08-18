@@ -75,6 +75,7 @@ class ClosedRoadRoutingTests(unittest.TestCase):
 
     def test_straight_vehicle_is_moved_out_of_exclusive_right_lane(self):
         config = self._config()
+        config["roads"]["north"]["incoming"] = 3
         right_lane = 0
 
         vehicle = self._vehicle(config, "north", right_lane)
@@ -85,6 +86,7 @@ class ClosedRoadRoutingTests(unittest.TestCase):
 
     def test_optional_right_turn_remains_in_exclusive_right_lane(self):
         config = self._config()
+        config["roads"]["north"]["incoming"] = 3
         config["simulation"]["right_turn_chance"] = 1.0
         right_lane = 0
 

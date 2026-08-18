@@ -6,13 +6,13 @@ import unittest
 
 from config import CONFIG, build_runtime_config
 from simulation.movement_neuroevolution import (
-    MovementPolicy,
-    MovementPolicyEvolution,
+    VehicleMovementPolicy,
+    VehicleMovementPolicyEvolution,
     _candidate_from_evaluation,
 )
 
 
-class DeterministicMovementEvolution(MovementPolicyEvolution):
+class DeterministicMovementEvolution(VehicleMovementPolicyEvolution):
     """Cheap deterministic evaluator used to exercise optimizer behavior."""
 
     def __init__(self, *args, **kwargs):
@@ -91,28 +91,28 @@ class MovementEvolutionTests(unittest.TestCase):
         return trainer_class(self.config, **options)
 
     def test_xavier_initialization_uses_zero_biases(self):
-        policy = MovementPolicy.random(random.Random(3), (1.0, 10.0), 60.0)
+        policy = VehicleMovementPolicy.random(random.Random(3), (1.0, 10.0), 60.0)
         hidden_limit = math.sqrt(
-            6.0 / (MovementPolicy.input_size + MovementPolicy.hidden_size)
+            6.0 / (VehicleMovementPolicy.input_size + VehicleMovementPolicy.hidden_size)
         )
         output_limit = math.sqrt(
-            6.0 / (MovementPolicy.hidden_size + MovementPolicy.output_size)
+            6.0 / (VehicleMovementPolicy.hidden_size + VehicleMovementPolicy.output_size)
         )
 
         cursor = 0
-        for _ in range(MovementPolicy.hidden_size):
-            layer_weights = policy.weights[cursor : cursor + MovementPolicy.input_size]
+        for _ in range(VehicleMovementPolicy.hidden_size):
+            layer_weights = policy.weights[cursor : cursor + VehicleMovementPolicy.input_size]
             self.assertTrue(all(abs(value) <= hidden_limit for value in layer_weights))
-            cursor += MovementPolicy.input_size
+            cursor += VehicleMovementPolicy.input_size
             self.assertEqual(policy.weights[cursor], 0.0)
             cursor += 1
-        for _ in range(MovementPolicy.output_size):
-            layer_weights = policy.weights[cursor : cursor + MovementPolicy.hidden_size]
+        for _ in range(VehicleMovementPolicy.output_size):
+            layer_weights = policy.weights[cursor : cursor + VehicleMovementPolicy.hidden_size]
             self.assertTrue(all(abs(value) <= output_limit for value in layer_weights))
-            cursor += MovementPolicy.hidden_size
+            cursor += VehicleMovementPolicy.hidden_size
             self.assertEqual(policy.weights[cursor], 0.0)
             cursor += 1
-        self.assertEqual(cursor, MovementPolicy.genome_size)
+        self.assertEqual(cursor, VehicleMovementPolicy.genome_size)
 
     def test_population_contains_mirrored_pairs_around_the_mean(self):
         trainer = self.trainer()
@@ -133,8 +133,8 @@ class MovementEvolutionTests(unittest.TestCase):
         trainer = self.trainer()
         trainer._initialize_distribution()
         policies = [
-            MovementPolicy(
-                [value] * MovementPolicy.genome_size,
+            VehicleMovementPolicy(
+                [value] * VehicleMovementPolicy.genome_size,
                 trainer.duration_bounds_s,
                 trainer.max_red_duration_s,
             )
@@ -227,8 +227,8 @@ class MovementEvolutionTests(unittest.TestCase):
             self.trainer(anchor_scenarios_count=5)
 
     def test_warm_start_is_the_initial_distribution_center(self):
-        warm_policy = MovementPolicy(
-            [0.25] * MovementPolicy.genome_size,
+        warm_policy = VehicleMovementPolicy(
+            [0.25] * VehicleMovementPolicy.genome_size,
             (5.0, 30.0),
             60.0,
         )
@@ -278,8 +278,8 @@ class MovementEvolutionTests(unittest.TestCase):
         )
 
     def test_robust_fitness_penalizes_scenario_variability(self):
-        policy = MovementPolicy(
-            [0.0] * MovementPolicy.genome_size,
+        policy = VehicleMovementPolicy(
+            [0.0] * VehicleMovementPolicy.genome_size,
             (5.0, 30.0),
             60.0,
         )
@@ -359,12 +359,12 @@ class MovementEvolutionTests(unittest.TestCase):
             "checkpoint_path": None,
         }
 
-        sequential = MovementPolicyEvolution(
+        sequential = VehicleMovementPolicyEvolution(
             config,
             workers=1,
             **options,
         ).run()
-        parallel = MovementPolicyEvolution(
+        parallel = VehicleMovementPolicyEvolution(
             config,
             workers=2,
             **options,

@@ -1,8 +1,4 @@
-"""Six-phase neural policy and evolutionary trainer.
-
-This module is intentionally separate from ``neuroevolution.py`` so the
-existing two-phase baseline and its saved policies remain compatible.
-"""
+"""Categorical phase policy and evolutionary trainer."""
 
 from concurrent.futures import ProcessPoolExecutor
 from copy import deepcopy
@@ -27,7 +23,7 @@ PHASE_NAMES = (
     "east_left",
     "west_left",
 )
-SIX_PHASE_POLICY_FORMAT_VERSION = 7
+SIX_PHASE_POLICY_FORMAT_VERSION = 8
 INPUT_FEATURE_NAMES = (
     *(f"vehicle_count_{direction}" for direction in DIRECTIONS),
     *(f"queue_length_{direction}" for direction in DIRECTIONS),
@@ -40,7 +36,6 @@ INPUT_FEATURE_NAMES = (
     *(f"red_elapsed_{direction}" for direction in DIRECTIONS),
     *(f"left_red_elapsed_{direction}" for direction in DIRECTIONS),
     *(f"right_red_elapsed_{direction}" for direction in DIRECTIONS),
-    *(f"waiting_pedestrian_count_{direction}" for direction in DIRECTIONS),
     "intersection_vehicle_count",
     "blocked_intersection_vehicle_count",
     *(f"active_phase_{phase}" for phase in PHASE_NAMES),
@@ -190,7 +185,6 @@ class SixPhasePolicy:
         red_elapsed = observation.get("red_elapsed_s", {})
         left_red_elapsed = observation.get("left_red_elapsed_s", {})
         right_red_elapsed = observation.get("right_red_elapsed_s", {})
-        waiting_pedestrians = observation.get("waiting_pedestrian_counts", {})
         active_phase = observation.get("active_phase", "ns")
 
         inputs = [min(20, vehicles.get(name, 0)) / 20.0 for name in DIRECTIONS]
@@ -226,10 +220,6 @@ class SixPhasePolicy:
                     right_red_elapsed.get(name, 0.0) / self.max_red_duration_s,
                 ),
             )
-            for name in DIRECTIONS
-        )
-        inputs.extend(
-            min(10, waiting_pedestrians.get(name, 0)) / 10.0
             for name in DIRECTIONS
         )
         inputs.append(

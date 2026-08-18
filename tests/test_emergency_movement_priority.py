@@ -12,7 +12,6 @@ class EmergencyMovementPriorityTests(unittest.TestCase):
         config = build_runtime_config(CONFIG)
         config["movement_controller"]["policy_selected_initial_phase"] = startup
         config["movement_controller"]["switch_hysteresis"] = 0.95
-        config["road_users"]["pedestrians_enabled"] = False
         return config
 
     def observation(
@@ -39,7 +38,6 @@ class EmergencyMovementPriorityTests(unittest.TestCase):
             "red_elapsed_s": zeros.copy(),
             "left_red_elapsed_s": zeros.copy(),
             "right_red_elapsed_s": zeros.copy(),
-            "waiting_pedestrian_counts": zeros.copy(),
             "active_movements": ("north_through", "south_through"),
             "green_elapsed_s": 0.0,
         }

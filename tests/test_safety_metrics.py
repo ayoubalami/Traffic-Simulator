@@ -1,7 +1,7 @@
 import unittest
 from types import SimpleNamespace
 
-from simulation.evaluation import calculate_fitness, calculate_six_phase_fitness
+from simulation.evaluation import calculate_fitness
 from simulation.metrics import Metrics
 from simulation.vehicle import Vehicle
 
@@ -192,93 +192,6 @@ class SafetyMetricTests(unittest.TestCase):
 
         self.assertAlmostEqual(metrics.hard_braking_highlight_duration_s, 4.0)
 
-    def test_pedestrian_wait_is_accumulated_and_finalized(self):
-        metrics = Metrics()
-        pedestrian = SimpleNamespace(waiting=True)
-
-        metrics.update_pedestrians([pedestrian], 2.0)
-        pedestrian.waiting = False
-        metrics.update_pedestrians([pedestrian], 1.0)
-        metrics.pedestrian_finished(id(pedestrian))
-
-        summary = metrics.get_summary()
-        self.assertEqual(summary["total_pedestrians_finished"], 1)
-        self.assertAlmostEqual(summary["avg_pedestrian_wait_time"], 2.0)
-        self.assertAlmostEqual(summary["avg_pedestrian_wait_time_all"], 2.0)
-        self.assertAlmostEqual(summary["pedestrian_wait_time_p95"], 2.0)
-        self.assertAlmostEqual(summary["max_pedestrian_wait_time"], 2.0)
-        self.assertAlmostEqual(summary["pedestrian_completion_rate"], 1.0)
-
-    def test_crosswalk_conflict_and_walk_utilization_are_explicit(self):
-        metrics = Metrics()
-        metrics.advance_time(2.0)
-        directions = ("north", "south", "east", "west")
-        active = {direction: 0 for direction in directions}
-        vehicles = {direction: 0 for direction in directions}
-        waiting = {direction: 0 for direction in directions}
-        states = {direction: "red" for direction in directions}
-        conflicts = {direction: 0 for direction in directions}
-        active["north"] = 1
-        vehicles["north"] = 1
-        conflicts["north"] = 1
-        waiting["east"] = 2
-        states["east"] = "green"
-
-        metrics.update_crosswalk_safety(
-            active,
-            vehicles,
-            waiting,
-            states,
-            1.0,
-            conflict_counts=conflicts,
-        )
-        metrics.update_crosswalk_safety(
-            active,
-            vehicles,
-            waiting,
-            states,
-            1.0,
-            conflict_counts=conflicts,
-        )
-
-        summary = metrics.get_summary()
-        self.assertEqual(
-            summary["vehicle_pedestrian_crosswalk_conflict_events"],
-            1,
-        )
-        self.assertAlmostEqual(
-            summary["vehicle_pedestrian_crosswalk_conflict_time"],
-            2.0,
-        )
-        self.assertEqual(
-            summary["vehicle_pedestrian_crosswalk_cooccupancy_events"],
-            1,
-        )
-        self.assertAlmostEqual(
-            summary["vehicle_pedestrian_crosswalk_cooccupancy_time"],
-            2.0,
-        )
-        self.assertAlmostEqual(summary["pedestrian_walk_time"], 2.0)
-        self.assertAlmostEqual(summary["useful_pedestrian_walk_time"], 2.0)
-        self.assertAlmostEqual(summary["wasted_pedestrian_walk_fraction"], 0.0)
-
-    def test_pedestrian_safety_metrics_reduce_six_phase_fitness(self):
-        metrics = {
-            "vehicle_pedestrian_crosswalk_conflict_events": 1,
-            "vehicle_pedestrian_crosswalk_conflict_time": 0.5,
-            "wasted_pedestrian_walk_fraction": 0.25,
-        }
-        weights = {
-            "vehicle_pedestrian_crosswalk_conflict_event_penalty": 100.0,
-            "vehicle_pedestrian_crosswalk_conflict_time_penalty": 10.0,
-            "wasted_pedestrian_walk_fraction_penalty": 20.0,
-        }
-
-        self.assertAlmostEqual(
-            calculate_six_phase_fitness(metrics, {}, weights),
-            -110.0,
-        )
-
     def test_hard_braking_counts_continuous_episode_once(self):
         config = {
             "simulation": {"pixels_per_meter": 10.0},
@@ -351,29 +264,26 @@ class SafetyMetricTests(unittest.TestCase):
             "throughput_rate": 0.5,
             "avg_vehicle_wait_time_all": 2.0,
             "stops_per_vehicle": 0.5,
-            "avg_pedestrian_wait_time_all": 4.0,
             "avg_excess_braking_intensity_per_vehicle": 2.0,
         }
 
-        self.assertAlmostEqual(calculate_fitness(metrics), 4650.0)
+        self.assertAlmostEqual(calculate_fitness(metrics), 4690.0)
 
     def test_all_fitness_coefficients_are_configurable(self):
         metrics = {
             "throughput_rate": 0.2,
             "avg_vehicle_wait_time_all": 3.0,
             "stops_per_vehicle": 4.0,
-            "avg_pedestrian_wait_time_all": 5.0,
             "avg_excess_braking_intensity_per_vehicle": 6.0,
         }
         weights = {
             "throughput_rate_reward": 1.0,
             "avg_vehicle_wait_time_penalty": 1.0,
             "vehicle_stop_rate_penalty": 1.0,
-            "avg_pedestrian_wait_time_penalty": 1.0,
             "avg_excess_braking_penalty": 1.0,
         }
 
-        self.assertAlmostEqual(calculate_fitness(metrics, weights), -17.8)
+        self.assertAlmostEqual(calculate_fitness(metrics, weights), -12.8)
 
 
 if __name__ == "__main__":

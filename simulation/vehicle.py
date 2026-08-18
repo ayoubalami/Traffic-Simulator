@@ -133,7 +133,6 @@ class Vehicle:
         self.lane_change_from_index = None
         self.lane_change_progress = 0.0
         self.lane_change_cooldown = 0.0
-        # self.turn_curve=None
         # Larger vehicles accelerate and brake a bit more slowly so the
         # queue feels less "same-speed" and more like mixed traffic.
         acceleration_mps2 = defaults.get("acceleration_mps2", 2.0)
@@ -165,7 +164,6 @@ class Vehicle:
         )
         self.stop_margin = self._crosswalk_stop_distance() + self.random.uniform(stop_gap_min, stop_gap_max)
 
-        # --- route/turn setup ---
         # Normally, only the outer turn lanes may probabilistically turn.
         # If the road straight ahead is disabled, every vehicle is assigned
         # a valid left or right exit instead of driving into the closed road.
@@ -406,10 +404,6 @@ class Vehicle:
         crosswalk_depth = self.config["crosswalk_width"]
         safety_buffer = self.config["crosswalk_stop_line_offset"]
 
-        # stripe_width = max(6, lane_width // 8)
-        # stripe_gap = max(6, lane_width // 4)
-        # setback = max(10, lane_width // 1.2)
-        # crosswalk_depth = max(25, lane_width // 1.5)
 
         return crosswalk_setback + crosswalk_depth + safety_buffer
 
@@ -821,121 +815,10 @@ class Vehicle:
         self.draw_angle = None
         self.cleared_intersection = True
 
-    def _turn_has_pedestrian_conflict(self, pedestrians):
-        """Whether a pedestrian overlaps the upcoming left or right turn path."""
-        if not self.turn_target_direction or not self.turn_curve:
-            return False
-
-        exit_crossing = self.config["roads"][self.turn_target_direction]["inverse"]
-        p0, p1, p2, _, _, _ = self.turn_curve
-        path_points = [
-            self._quadratic_bezier(p0, p1, p2, t / 12)
-            for t in range(math.ceil(self.turn_progress * 12), 13)
-        ]
-        curve_end = path_points[-1]
-        forward = {
-            "north": (0, 1),
-            "south": (0, -1),
-            "west": (1, 0),
-            "east": (-1, 0),
-        }[self.turn_target_direction]
-        lookahead = max(
-            self.length * 2,
-            self.config["crosswalk_width"] + self._meters_to_pixels(2),
-        )
-        path_points.append((
-            curve_end[0] + forward[0] * lookahead,
-            curve_end[1] + forward[1] * lookahead,
-        ))
-
-        def distance_to_segment(point, start, end):
-            dx, dy = end[0] - start[0], end[1] - start[1]
-            length_squared = dx * dx + dy * dy
-            if length_squared == 0:
-                return math.dist(point, start)
-            t = max(0.0, min(1.0, ((point[0] - start[0]) * dx + (point[1] - start[1]) * dy) / length_squared))
-            closest = (start[0] + t * dx, start[1] + t * dy)
-            return math.dist(point, closest)
-
-        for pedestrian in pedestrians:
-            if pedestrian.crossing != exit_crossing:
-                continue
-            # Sidewalks and a sufficiently wide centre refuge are outside
-            # the live lanes, so vehicles do not wait for pedestrians there.
-            if pedestrian.is_safely_waiting():
-                continue
-
-            clearance = self.width / 2 + pedestrian.radius + self._meters_to_pixels(0.5)
-            if any(
-                distance_to_segment(pedestrian.position, start, end) <= clearance
-                for start, end in zip(path_points, path_points[1:])
-            ):
-                return True
-        return False
-
-    def _has_crosswalk_pedestrian_conflict(self, pedestrians):
-        """Whether a pedestrian occupies this vehicle's straight path."""
-        center_x, center_y, forward_x, forward_y, _, _ = self._get_pose_vectors()
-        front = (
-            center_x + forward_x * self.length / 2,
-            center_y + forward_y * self.length / 2,
-        )
-        # Look from the current front through this lane's crosswalk. The
-        # extra distance reaches the far side of the marked crossing, while
-        # the segment check keeps pedestrians in other lanes from blocking
-        # this vehicle.
-        lookahead = max(0.0, self.distance_from_stop - self.stop_margin)
-        lookahead += self.config["crosswalk_width"] + self._meters_to_pixels(1)
-        path_end = (
-            front[0] + forward_x * lookahead,
-            front[1] + forward_y * lookahead,
-        )
-
-        def distance_to_path(point):
-            dx, dy = path_end[0] - front[0], path_end[1] - front[1]
-            length_squared = dx * dx + dy * dy
-            if length_squared == 0:
-                return math.dist(point, front)
-            progress = max(
-                0.0,
-                min(
-                    1.0,
-                    ((point[0] - front[0]) * dx + (point[1] - front[1]) * dy)
-                    / length_squared,
-                ),
-            )
-            closest = (front[0] + progress * dx, front[1] + progress * dy)
-            return math.dist(point, closest)
-
-        for pedestrian in pedestrians:
-            if pedestrian.crossing != self.road_direction:
-                continue
-            # Sidewalks and a sufficiently wide centre refuge are outside
-            # the live lanes, so vehicles do not wait for pedestrians there.
-            if pedestrian.is_safely_waiting():
-                continue
-            clearance = self.width / 2 + pedestrian.radius + self._meters_to_pixels(0.5)
-            if distance_to_path(pedestrian.position) <= clearance:
-                return True
-        return False
-
-    def _update_turn(self, dt, pedestrians=(), vehicles=()):
+    def _update_turn(self, dt, vehicles=()):
         self.stopped = False
-        pedestrian_conflict = self._turn_has_pedestrian_conflict(pedestrians)
         vehicle_ahead, dist_to_ahead, ahead_speed = self._find_vehicle_ahead(vehicles)
-        yield_stop_progress = 0.98
         turn_speed = self._selected_turn_speed()
-        if pedestrian_conflict:
-            # Brake for a stop at the end of the curve, immediately before
-            # the exit crosswalk, instead of stopping in the intersection.
-            remaining_distance = max(
-                0.0,
-                (yield_stop_progress - self.turn_progress) * self.turn_curve_length,
-            )
-            turn_speed = min(
-                turn_speed,
-                math.sqrt(2 * self.deceleration * remaining_distance),
-            )
         if vehicle_ahead is not None:
             safe_dist = self.get_safe_following_distance()
             closing_speed = max(0.0, self.current_speed - ahead_speed)
@@ -967,23 +850,13 @@ class Vehicle:
                 self._record_deceleration(previous_speed, dt, "leader")
                 self.stopped = self.current_speed == 0
 
-        next_progress = self.turn_progress + distance_travelled / self.turn_curve_length
-        if pedestrian_conflict and next_progress >= yield_stop_progress:
-            self.turn_progress = yield_stop_progress
-            previous_speed = self.current_speed
-            self.current_speed = 0.0
-            self._record_deceleration(previous_speed, dt, "pedestrian")
-            self.stopped = True
-            self._update_turn_draw_state()
-            return
-
-        self.turn_progress = next_progress
+        self.turn_progress += distance_travelled / self.turn_curve_length
         if self.turn_progress >= 1.0:
             self._finish_turn()
             return
         self._update_turn_draw_state()
  
-    def update(self, dt, light_state, vehicle_ahead=None, pedestrians=(), vehicles=()):
+    def update(self, dt, light_state, vehicle_ahead=None, vehicles=()):
         self.last_deceleration_mps2 = 0.0
         self.last_braking_reason = None
         if light_state != "yellow":
@@ -1019,13 +892,12 @@ class Vehicle:
         self.last_light_state = light_state
 
         if self.turning:
-            self._update_turn(dt, pedestrians, vehicles)
+            self._update_turn(dt, vehicles)
             return
 
         dist_to_stop = self.distance_from_stop
         turn_entry_distance = -self.width
         approaching_turn = self.is_turning_vehicle and not self.has_turned
-        pedestrian_conflict = self._has_crosswalk_pedestrian_conflict(pedestrians)
         if approaching_turn and self.turn_side == "left":
             # The yellow centre divider ends at the intersection boundary.
             # Keep going straight until the vehicle's front reaches that
@@ -1034,22 +906,19 @@ class Vehicle:
         if (
             approaching_turn
             and dist_to_stop <= turn_entry_distance
-            and not pedestrian_conflict
         ):
             self._start_turn()
-            self._update_turn(dt, pedestrians, vehicles)
+            self._update_turn(dt, vehicles)
             return
 
         if (
             dist_to_stop < -self.length
-            and not pedestrian_conflict
             and (not approaching_turn or dist_to_stop <= turn_entry_distance)
         ):
             self.cleared_intersection = True
 
         if (
             dist_to_stop < -self.width
-            and not pedestrian_conflict
             and (not approaching_turn or dist_to_stop <= turn_entry_distance)
         ):
             self.cleared_intersection = True
@@ -1121,18 +990,6 @@ class Vehicle:
 
         target_speed = min(target_speed, self._turn_target_speed(dist_to_stop))
 
-        if pedestrian_conflict and (
-            not self.cleared_intersection or self.is_emergency
-        ):
-            # Emergency vehicles may cross a red light, but pedestrians always
-            # have priority. Stop before the crosswalk and remain there until
-            # every pedestrian using this crossing has cleared the roadway.
-            distance_to_crosswalk_stop = max(0.0, dist_to_stop - self.stop_margin)
-            target_speed = min(
-                target_speed,
-                math.sqrt(2 * self.deceleration * distance_to_crosswalk_stop),
-            )
-
         if traffic_ahead is not None:
             # Keep the configured, speed-dependent gap as the final spacing.
             # Reserve a reaction buffer for the relative (closing) speed, so
@@ -1183,17 +1040,6 @@ class Vehicle:
                 self._record_deceleration(previous_speed, dt, "leader")
                 self.stopped = self.current_speed == 0
 
-        if pedestrian_conflict and (
-            not self.cleared_intersection or self.is_emergency
-        ):
-            available_space = max(0.0, dist_to_stop - self.stop_margin)
-            if distance_travelled > available_space:
-                distance_travelled = available_space
-                previous_speed = self.current_speed
-                self.current_speed = distance_travelled / dt if dt > 0 else 0.0
-                self._record_deceleration(previous_speed, dt, "pedestrian")
-                self.stopped = self.current_speed == 0
-
         self.distance_from_stop -= distance_travelled
 
         if (
@@ -1213,7 +1059,6 @@ class Vehicle:
             and 0 < self.distance_from_stop < red_stop_distance
             and not self.cleared_intersection
             and not self.committed_to_cross):
-            # self.distance_from_stop = red_stop_distance
             previous_speed = self.current_speed
             self.current_speed = 0
             self._record_deceleration(previous_speed, dt, "signal")
@@ -1414,7 +1259,7 @@ class Vehicle:
 
 
 class EmergencyVehicle(Vehicle):
-    """A vehicle allowed to cross red lights while yielding to pedestrians."""
+    """A priority vehicle allowed to cross red signals."""
 
     def __init__(
         self,

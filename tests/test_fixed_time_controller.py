@@ -20,7 +20,6 @@ class FixedTimePlanTests(unittest.TestCase):
             "format_version": 1,
             "policy_type": "fixed_time_movement",
             "name": "test_plan",
-            "control_scope": "vehicles_only",
             "stages": [
                 {
                     "name": "north_south",
@@ -108,7 +107,6 @@ class FixedTimePlanTests(unittest.TestCase):
 class FixedTimeControllerTests(unittest.TestCase):
     def setUp(self):
         self.config = build_runtime_config(CONFIG)
-        self.config["road_users"]["pedestrians_enabled"] = False
         self.config["traffic_lights"]["yellow_duration_s"] = 0.5
         self.config["traffic_lights"]["all_red_clearance_duration_s"] = 0.25
         self.config["traffic_lights"]["min_green_duration_s"] = 10.0

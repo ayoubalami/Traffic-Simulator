@@ -9,9 +9,6 @@ class TrafficLightController:
 
     def __init__(self, config):
         self.config = config
-        self.pedestrians_enabled = bool(
-            config.get("road_users", {}).get("pedestrians_enabled", True)
-        )
         timing = config.get("traffic_lights", {})
         self.yellow_duration = max(0.1, float(timing.get("yellow_duration_s", 2.0)))
         self.all_red_clearance_duration = max(
@@ -30,15 +27,6 @@ class TrafficLightController:
             0.1,
             float(timing.get("green_extension_check_interval_s", 1.0)),
         )
-        pedestrian_timing = config.get("pedestrian_signals", {})
-        self.pedestrian_signals_enabled = bool(
-            pedestrian_timing.get("enabled", True)
-        )
-        self.pedestrian_walk_duration = max(
-            0.1,
-            float(pedestrian_timing.get("walk_duration_s", 5.0)),
-        )
-
         default_green_duration = max(
             0.1,
             float(timing.get("green_duration_s", 4.0)),
@@ -80,7 +68,7 @@ class TrafficLightController:
         self.extension_decider = decider
 
     def set_phase_activation_guard(self, guard):
-        """Set a callback that must approve a new green phase (e.g. pedestrians)."""
+        """Set a callback that must approve a new green phase."""
         self.phase_activation_guard = guard
 
     def update(self, dt):
@@ -139,27 +127,6 @@ class TrafficLightController:
     def get_state(self, direction):
         """Get the current state for an approach direction."""
         return self.states.get(direction, "red")
-
-    def get_pedestrian_state(self, crossing):
-        """Return the separately timed WALK/STOP state for a crosswalk.
-
-        A WALK window opens only during the beginning of the perpendicular
-        vehicle-green phase.  Yellow and all-red are always STOP, so a new
-        pedestrian cannot enter immediately before the next traffic phase.
-        """
-        if crossing not in self.DIRECTIONS:
-            return "red"
-        if not self.pedestrians_enabled:
-            return "red"
-        if not self.pedestrian_signals_enabled:
-            return "green" if self.get_state(crossing) == "red" else "red"
-
-        can_walk = (
-            self.phase_state == "green"
-            and self.get_state(crossing) == "red"
-            and self.timer < self.pedestrian_walk_duration
-        )
-        return "green" if can_walk else "red"
 
     def get_remaining_time(self):
         """Get remaining green/yellow time; all-red clearance has no countdown."""
@@ -318,36 +285,6 @@ class SixPhaseTrafficLightController(TrafficLightController):
             )
         return self.get_state(vehicle.road_direction)
 
-    def phase_conflicting_crossings(self, phase):
-        """Return crosswalks that must be clear before this phase starts."""
-        crossings = set(self.phase_directions(phase))
-        left_direction = (
-            self.LEFT_TURN_PHASES.get(phase)
-            or self.SINGLE_APPROACH_PHASES.get(phase)
-        )
-        if left_direction is not None:
-            crossings.add(self.LEFT_TURN_EXIT_CROSSINGS[left_direction])
-        return crossings
-
-    def get_pedestrian_state(self, crossing):
-        right_arrow_conflict = any(
-            state == "green"
-            and crossing in {
-                direction,
-                self.RIGHT_TURN_EXIT_CROSSINGS[direction],
-            }
-            for direction, state in self.right_turn_states.items()
-        )
-        if (
-            self.phase_state == "green"
-            and (
-                crossing in self.phase_conflicting_crossings(self.active_phase)
-                or right_arrow_conflict
-            )
-        ):
-            return "red"
-        return super().get_pedestrian_state(crossing)
-
     def set_phase_selector(self, selector):
         """Set ``selector(active_phase, available_phases) -> phase_name``."""
         self.phase_selector = selector
@@ -357,7 +294,7 @@ class SixPhaseTrafficLightController(TrafficLightController):
         self.phase_observation_provider = provider
 
     def set_right_turn_activation_guard(self, guard):
-        """Set ``guard(direction)`` for pedestrian and scene-level safety."""
+        """Set ``guard(direction)`` for scene-level safety."""
         self.right_turn_activation_guard = guard
 
     def right_turn_is_compatible_with_phase(self, direction, phase=None):
@@ -425,8 +362,7 @@ class SixPhaseTrafficLightController(TrafficLightController):
             if not self.automatic_right_turn_arrows:
                 next_state = "off"
             elif not safety_allows:
-                # Pedestrians, conflicts, yellow, and all-red always override
-                # demand holding and minimum green immediately.
+                # Conflicts, yellow, and all-red override minimum green.
                 next_state = "red"
             elif held_demand or minimum_green_active:
                 next_state = "green"
@@ -842,21 +778,6 @@ class MovementTrafficLightController(SixPhaseTrafficLightController):
         "west_right",
     )
     MOVEMENTS = MAIN_MOVEMENTS + RIGHT_MOVEMENTS
-    # Pedestrian outputs deliberately remain separate from ``MOVEMENTS``.
-    # They request WALK windows; the controller still owns conflict masking,
-    # minimum WALK time, clearance, and starvation prevention.
-    PEDESTRIAN_OUTPUTS = (
-        "north_walk",
-        "south_walk",
-        "east_walk",
-        "west_walk",
-    )
-    THROUGH_EXIT_CROSSINGS = {
-        "north": "south",
-        "south": "north",
-        "east": "west",
-        "west": "east",
-    }
     MOVEMENT_INDEX = {
         movement: index for index, movement in enumerate(MOVEMENTS)
     }
@@ -919,9 +840,7 @@ class MovementTrafficLightController(SixPhaseTrafficLightController):
             self.phase_state = "all_red"
             self.timer = 0.0
         self.movement_score_provider = None
-        self.pedestrian_score_provider = None
         self.movement_activation_guard = None
-        self.crosswalk_vehicle_occupancy_guard = None
         self.movement_red_elapsed = {
             movement: 0.0 for movement in self.MOVEMENTS
         }
@@ -949,74 +868,6 @@ class MovementTrafficLightController(SixPhaseTrafficLightController):
         self.last_decoded_movements = self.active_movements
         self.last_controller_decision = self.active_phase
         self.next_score_update = 0.0
-
-        pedestrian_timing = config.get("pedestrian_signals", {})
-        self.pedestrian_min_walk_duration = max(
-            0.1,
-            float(
-                pedestrian_timing.get(
-                    "min_walk_duration_s",
-                    pedestrian_timing.get("walk_duration_s", 5.0),
-                )
-            ),
-        )
-        self.pedestrian_max_walk_duration = max(
-            self.pedestrian_min_walk_duration,
-            float(
-                pedestrian_timing.get(
-                    "max_walk_duration_s",
-                    pedestrian_timing.get(
-                        "walk_duration_s",
-                        self.pedestrian_min_walk_duration,
-                    ),
-                )
-            ),
-        )
-        self.pedestrian_max_red_duration = max(
-            self.pedestrian_min_walk_duration,
-            float(
-                pedestrian_timing.get(
-                    "max_red_duration_s",
-                    self.max_red_duration,
-                )
-            ),
-        )
-        self.pedestrian_clearance_duration = max(
-            0.0,
-            float(pedestrian_timing.get("clearance_duration_s", 1.0)),
-        )
-        self.pedestrian_output_threshold = min(
-            1.0,
-            max(
-                0.0,
-                float(
-                    pedestrian_timing.get(
-                        "output_threshold",
-                        self.output_threshold,
-                    )
-                ),
-            ),
-        )
-        self.pedestrian_states = {
-            crossing: "red" for crossing in self.DIRECTIONS
-        }
-        self.pedestrian_green_elapsed = {
-            crossing: 0.0 for crossing in self.DIRECTIONS
-        }
-        self.pedestrian_red_elapsed = {
-            crossing: 0.0 for crossing in self.DIRECTIONS
-        }
-        self.pedestrian_clearance_remaining = {
-            crossing: 0.0 for crossing in self.DIRECTIONS
-        }
-        self.last_pedestrian_scores = {
-            output: 0.0 for output in self.PEDESTRIAN_OUTPUTS
-        }
-        self.last_demanded_pedestrian_outputs = frozenset()
-        self.last_raw_requested_pedestrian_outputs = frozenset()
-        self.last_decoded_pedestrian_outputs = frozenset()
-        self.pending_pedestrian_outputs = frozenset()
-        self._pedestrian_policy_enabled = False
 
     @classmethod
     def movement_direction(cls, movement):
@@ -1133,85 +984,8 @@ class MovementTrafficLightController(SixPhaseTrafficLightController):
         )
 
     def set_movement_score_provider(self, provider):
-        """Set a provider for vehicle scores, optionally including WALK scores.
-
-        Existing twelve-output providers remain vehicle-only.  A provider is
-        considered pedestrian-aware only after it returns at least one key in
-        :attr:`PEDESTRIAN_OUTPUTS`.
-        """
+        """Set a provider for the twelve vehicle-movement scores."""
         self.movement_score_provider = provider
-
-    def set_pedestrian_score_provider(self, provider):
-        """Set an optional dedicated ``provider(observation)`` for WALK scores.
-
-        Passing a callback explicitly enables independent pedestrian control.
-        Passing ``None`` removes the dedicated callback; a combined provider
-        can still supply the four WALK keys.
-        """
-        self.pedestrian_score_provider = provider
-        if provider is not None:
-            self._enable_pedestrian_policy()
-
-    def set_crosswalk_vehicle_occupancy_guard(self, guard):
-        """Set ``guard(crossing) -> bool`` used before a WALK can begin.
-
-        The callback must return true only when no vehicle occupies or is
-        irreversibly committed to the named crosswalk.
-        """
-        self.crosswalk_vehicle_occupancy_guard = guard
-
-    def _enable_pedestrian_policy(self):
-        if (
-            not self.pedestrians_enabled
-            or self._pedestrian_policy_enabled
-            or not self.pedestrian_signals_enabled
-        ):
-            return
-        self._pedestrian_policy_enabled = True
-        # Never inherit an automatic WALK when changing controller modes.
-        for crossing in self.DIRECTIONS:
-            self.pedestrian_states[crossing] = "red"
-            self.pedestrian_green_elapsed[crossing] = 0.0
-
-    @classmethod
-    def pedestrian_output_crossing(cls, output):
-        if output not in cls.PEDESTRIAN_OUTPUTS:
-            raise ValueError(f"unknown pedestrian output: {output}")
-        return output.rsplit("_", 1)[0]
-
-    @classmethod
-    def crossing_pedestrian_output(cls, crossing):
-        if crossing not in cls.DIRECTIONS:
-            raise ValueError(f"unknown pedestrian crossing: {crossing}")
-        return f"{crossing}_walk"
-
-    def get_pedestrian_red_elapsed(self):
-        """Return demanded pedestrian red time for each crosswalk."""
-        return dict(self.pedestrian_red_elapsed)
-
-    def get_active_pedestrian_outputs(self):
-        """Return currently illuminated WALK output names."""
-        if not self._pedestrian_policy_enabled:
-            return frozenset()
-        return frozenset(
-            self.crossing_pedestrian_output(crossing)
-            for crossing, state in self.pedestrian_states.items()
-            if state == "green"
-        )
-
-    def get_active_pedestrian_walks(self):
-        """Return crosswalk names whose policy-controlled signal is WALK."""
-        return frozenset(
-            self.pedestrian_output_crossing(output)
-            for output in self.get_active_pedestrian_outputs()
-        )
-
-    def get_pedestrian_state(self, crossing):
-        if crossing not in self.DIRECTIONS:
-            return "red"
-        if not self._pedestrian_policy_enabled:
-            return super().get_pedestrian_state(crossing)
-        return self.pedestrian_states[crossing]
 
     def set_movement_activation_guard(self, guard):
         self.movement_activation_guard = guard
@@ -1509,217 +1283,6 @@ class MovementTrafficLightController(SixPhaseTrafficLightController):
                 return False
         return True
 
-    def _pedestrian_demand(self, observation):
-        waiting = observation.get("waiting_pedestrian_counts", {})
-        return {
-            self.crossing_pedestrian_output(crossing): max(
-                0,
-                int(waiting.get(crossing, 0)),
-            )
-            for crossing in self.DIRECTIONS
-        }
-
-    def _pedestrian_vehicle_blocking_crossings(self):
-        """Crossings reserved for WALK requests, WALK, or clearance."""
-        if not self._pedestrian_policy_enabled:
-            return frozenset()
-        outputs = set(self.last_decoded_pedestrian_outputs)
-        outputs.update(self.get_active_pedestrian_outputs())
-        crossings = {
-            self.pedestrian_output_crossing(output) for output in outputs
-        }
-        crossings.update(
-            crossing
-            for crossing, remaining in self.pedestrian_clearance_remaining.items()
-            if remaining > 0.0
-        )
-        return frozenset(crossings)
-
-    def _conflicting_vehicle_demand_is_overdue(
-        self,
-        crossing,
-        observation,
-    ):
-        movement_demand = self._movement_demand(observation)
-        return any(
-            movement_demand.get(movement, 0) > 0
-            and crossing in self._movement_crossings(movement)
-            and self.movement_red_elapsed.get(movement, 0.0)
-            >= self.max_red_duration
-            for movement in self.MOVEMENTS
-        )
-
-    def _crossing_vehicle_signals_are_clear(self, crossing):
-        if (
-            self.phase_state == "all_red"
-            and self.timer < self.all_red_clearance_duration
-        ):
-            return False
-        if self.phase_state in ("green", "yellow") and any(
-            crossing in self._movement_crossings(movement)
-            for movement in self.active_movements
-        ):
-            return False
-        for direction in self.DIRECTIONS:
-            right = f"{direction}_right"
-            if (
-                crossing in self._movement_crossings(right)
-                and self.get_right_turn_permission_state(direction)
-                in ("green", "yellow")
-            ):
-                return False
-        return True
-
-    def _crosswalk_vehicle_occupancy_allows(self, crossing):
-        return bool(
-            self.crosswalk_vehicle_occupancy_guard is None
-            or self.crosswalk_vehicle_occupancy_guard(crossing)
-        )
-
-    def _set_pedestrian_stop(self, crossing):
-        if self.pedestrian_states[crossing] != "green":
-            return
-        self.pedestrian_states[crossing] = "red"
-        self.pedestrian_green_elapsed[crossing] = 0.0
-        self.pedestrian_clearance_remaining[crossing] = max(
-            self.pedestrian_clearance_remaining[crossing],
-            self.pedestrian_clearance_duration,
-        )
-
-    def _update_pedestrian_policy(self, observation, dt):
-        if not self._pedestrian_policy_enabled:
-            return
-
-        dt = max(0.0, float(dt))
-        for crossing in self.DIRECTIONS:
-            self.pedestrian_clearance_remaining[crossing] = max(
-                0.0,
-                self.pedestrian_clearance_remaining[crossing] - dt,
-            )
-
-        demand = self._pedestrian_demand(observation)
-        demanded = frozenset(
-            output for output, count in demand.items() if count > 0
-        )
-        raw_requested = frozenset(
-            output
-            for output in demanded
-            if self.last_pedestrian_scores.get(output, 0.0)
-            >= self.pedestrian_output_threshold
-        )
-        self.last_demanded_pedestrian_outputs = demanded
-        self.last_raw_requested_pedestrian_outputs = raw_requested
-
-        for crossing in self.DIRECTIONS:
-            output = self.crossing_pedestrian_output(crossing)
-            if self.pedestrian_states[crossing] == "green":
-                self.pedestrian_green_elapsed[crossing] += dt
-                self.pedestrian_red_elapsed[crossing] = 0.0
-            else:
-                self.pedestrian_green_elapsed[crossing] = 0.0
-                if demand[output] > 0:
-                    self.pedestrian_red_elapsed[crossing] += dt
-                else:
-                    self.pedestrian_red_elapsed[crossing] = 0.0
-
-        fairness_requested = {
-            output
-            for output in demanded
-            if self.pedestrian_red_elapsed[
-                self.pedestrian_output_crossing(output)
-            ]
-            >= self.pedestrian_max_red_duration
-        }
-        decoded = set(raw_requested).union(fairness_requested)
-
-        # Once a conflicting vehicle has itself reached maximum red, a normal
-        # (non-overdue) WALK request yields after its minimum WALK.  This keeps
-        # either class of road user from permanently starving the other.
-        decoded = {
-            output
-            for output in decoded
-            if (
-                output in fairness_requested
-                or not self._conflicting_vehicle_demand_is_overdue(
-                    self.pedestrian_output_crossing(output),
-                    observation,
-                )
-            )
-        }
-
-        # WALK is an entry window, not an indefinitely held green. Closing a
-        # continuously requested WALK is especially important for the staged
-        # divider crossing: the pedestrian must observe STOP before a later
-        # WALK is accepted for the second carriageway.
-        decoded.difference_update(
-            self.crossing_pedestrian_output(crossing)
-            for crossing in self.DIRECTIONS
-            if (
-                self.pedestrian_states[crossing] == "green"
-                and self.pedestrian_green_elapsed[crossing]
-                >= self.pedestrian_max_walk_duration
-            )
-        )
-
-        # An illuminated WALK cannot be withdrawn before its guaranteed
-        # minimum, even if the neural score changes on the next inference.
-        for crossing in self.DIRECTIONS:
-            if (
-                self.pedestrian_states[crossing] == "green"
-                and self.pedestrian_green_elapsed[crossing]
-                < self.pedestrian_min_walk_duration
-            ):
-                decoded.add(self.crossing_pedestrian_output(crossing))
-
-        self.last_decoded_pedestrian_outputs = frozenset(decoded)
-
-        for crossing in self.DIRECTIONS:
-            output = self.crossing_pedestrian_output(crossing)
-            if (
-                self.pedestrian_states[crossing] == "green"
-                and output not in decoded
-                and self.pedestrian_green_elapsed[crossing]
-                >= self.pedestrian_min_walk_duration
-            ):
-                self._set_pedestrian_stop(crossing)
-
-        for output in self.PEDESTRIAN_OUTPUTS:
-            crossing = self.pedestrian_output_crossing(output)
-            if (
-                output in decoded
-                and self.pedestrian_states[crossing] != "green"
-                and self.pedestrian_clearance_remaining[crossing] <= 0.0
-                and self._crossing_vehicle_signals_are_clear(crossing)
-                and self._crosswalk_vehicle_occupancy_allows(crossing)
-            ):
-                self.pedestrian_states[crossing] = "green"
-                self.pedestrian_green_elapsed[crossing] = 0.0
-                self.pedestrian_red_elapsed[crossing] = 0.0
-
-        active = self.get_active_pedestrian_outputs()
-        self.pending_pedestrian_outputs = frozenset(decoded).difference(active)
-
-    def _movement_crossings(self, movement):
-        direction = self.movement_direction(movement)
-        crossings = {direction}
-        movement_kind = self.movement_kind(movement)
-        if movement_kind == "through":
-            # A through vehicle crosses the entry-side crosswalk and then the
-            # opposite exit-side crosswalk.  Omitting the exit crossing lets
-            # a separately controlled WALK conflict with departing traffic.
-            crossings.add(self.THROUGH_EXIT_CROSSINGS[direction])
-        elif movement_kind == "left":
-            crossings.add(self.LEFT_TURN_EXIT_CROSSINGS[direction])
-        elif movement_kind == "right":
-            crossings.add(self.RIGHT_TURN_EXIT_CROSSINGS[direction])
-        return crossings
-
-    def phase_conflicting_crossings(self, phase):
-        crossings = set()
-        for movement in self.decode_movements(phase):
-            crossings.update(self._movement_crossings(movement))
-        return crossings
-
     def right_turn_is_compatible_with_phase(self, direction, phase=None):
         movements = (
             self.active_movements
@@ -1734,19 +1297,9 @@ class MovementTrafficLightController(SixPhaseTrafficLightController):
 
     def _candidate_is_scene_safe(self, movements):
         movements = frozenset(movements)
-        pedestrian_blockers = self._pedestrian_vehicle_blocking_crossings()
-        pedestrian_safe = not any(
-            self._movement_crossings(movement).intersection(
-                pedestrian_blockers
-            )
-            for movement in movements
-        )
         return bool(
-            pedestrian_safe
-            and (
-                self.movement_activation_guard is None
-                or self.movement_activation_guard(movements)
-            )
+            self.movement_activation_guard is None
+            or self.movement_activation_guard(movements)
         )
 
     def _right_direction_is_scene_safe(self, direction, main_movements=()):
@@ -2163,28 +1716,6 @@ class MovementTrafficLightController(SixPhaseTrafficLightController):
             if self.last_movement_scores[movement] >= self.output_threshold
         )
 
-        pedestrian_scores = None
-        if self.pedestrian_score_provider is not None:
-            pedestrian_scores = (
-                self.pedestrian_score_provider(observation) or {}
-            )
-            self._enable_pedestrian_policy()
-        elif any(output in scores for output in self.PEDESTRIAN_OUTPUTS):
-            # New policies return one combined sixteen-score mapping.  Key
-            # detection keeps legacy twelve-output providers on automatic
-            # pedestrian timing without requiring a version flag.
-            pedestrian_scores = scores
-            self._enable_pedestrian_policy()
-
-        if pedestrian_scores is not None:
-            self.last_pedestrian_scores = {
-                output: min(
-                    1.0,
-                    max(0.0, float(pedestrian_scores.get(output, 0.0))),
-                )
-                for output in self.PEDESTRIAN_OUTPUTS
-            }
-
     def _set_movement_states(self, movements, state):
         for movement in movements:
             direction = self.movement_direction(movement)
@@ -2248,12 +1779,6 @@ class MovementTrafficLightController(SixPhaseTrafficLightController):
         """Actuate four neural right outputs without a global phase change."""
         if not self.network_controls_right_turns:
             super()._update_automatic_right_turns(observation, dt)
-            pedestrian_blockers = self._pedestrian_vehicle_blocking_crossings()
-            for direction in self.DIRECTIONS:
-                if self._movement_crossings(
-                    f"{direction}_right"
-                ).intersection(pedestrian_blockers):
-                    self.right_turn_states[direction] = "red"
             self._sync_decoded_movement_debug()
             return
 
@@ -2300,12 +1825,7 @@ class MovementTrafficLightController(SixPhaseTrafficLightController):
                 self.right_turn_activation_guard is None
                 or self.right_turn_activation_guard(direction)
             )
-            pedestrian_safe = not self._movement_crossings(
-                movement
-            ).intersection(
-                self._pedestrian_vehicle_blocking_crossings()
-            )
-            safety_allows = compatible and guard_allows and pedestrian_safe
+            safety_allows = compatible and guard_allows
             minimum_green_active = bool(
                 was_green
                 and self.right_turn_green_elapsed[direction]
@@ -2454,12 +1974,6 @@ class MovementTrafficLightController(SixPhaseTrafficLightController):
                 self.next_score_update = (
                     self.timer + self.extension_check_interval
                 )
-
-        # WALK requests are updated before vehicle decoding so a newly
-        # requested crosswalk masks conflicting candidates during this same
-        # decision tick.  Actual WALK activation still waits for red signals
-        # and the external crosswalk-occupancy guard.
-        self._update_pedestrian_policy(observation, dt)
 
         if (
             self._awaiting_initial_movement

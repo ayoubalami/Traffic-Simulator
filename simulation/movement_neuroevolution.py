@@ -17,16 +17,7 @@ from .traffic_light import MovementTrafficLightController
 
 DIRECTIONS = ("north", "south", "east", "west")
 MOVEMENT_NAMES = MovementTrafficLightController.MOVEMENTS
-PEDESTRIAN_OUTPUT_NAMES = getattr(
-    MovementTrafficLightController,
-    "PEDESTRIAN_OUTPUTS",
-    tuple(f"{direction}_walk" for direction in DIRECTIONS),
-)
-PEDESTRIAN_OUTPUT_NAMES = tuple(PEDESTRIAN_OUTPUT_NAMES)
-POLICY_OUTPUT_NAMES = MOVEMENT_NAMES + PEDESTRIAN_OUTPUT_NAMES
-MOVEMENT_POLICY_FORMAT_VERSION = 3
-LEGACY_MOVEMENT_POLICY_FORMAT_VERSION = 2
-VEHICLE_ONLY_POLICY_FORMAT_VERSION = 4
+MOVEMENT_POLICY_FORMAT_VERSION = 4
 MOVEMENT_INPUT_FEATURE_NAMES = (
     *(f"vehicle_count_{direction}" for direction in DIRECTIONS),
     *(f"queue_length_{direction}" for direction in DIRECTIONS),
@@ -39,159 +30,13 @@ MOVEMENT_INPUT_FEATURE_NAMES = (
     *(f"red_elapsed_{direction}" for direction in DIRECTIONS),
     *(f"left_red_elapsed_{direction}" for direction in DIRECTIONS),
     *(f"right_red_elapsed_{direction}" for direction in DIRECTIONS),
-    *(f"waiting_pedestrian_count_{direction}" for direction in DIRECTIONS),
-    *(
-        f"active_crossing_pedestrian_count_{direction}"
-        for direction in DIRECTIONS
-    ),
-    *(
-        f"crosswalk_vehicle_occupancy_count_{direction}"
-        for direction in DIRECTIONS
-    ),
-    *(f"pedestrian_red_elapsed_{direction}" for direction in DIRECTIONS),
-    *(f"active_pedestrian_walk_{direction}" for direction in DIRECTIONS),
     "intersection_vehicle_count",
     "blocked_intersection_vehicle_count",
     *(f"active_movement_{movement}" for movement in MOVEMENT_NAMES),
     "green_elapsed_ratio",
 )
-_PEDESTRIAN_INPUT_FEATURE_NAMES = frozenset(
-    feature
-    for feature in MOVEMENT_INPUT_FEATURE_NAMES
-    if feature.startswith(
-        (
-            "active_crossing_pedestrian_count_",
-            "crosswalk_vehicle_occupancy_count_",
-            "pedestrian_red_elapsed_",
-            "active_pedestrian_walk_",
-        )
-    )
-)
-LEGACY_MOVEMENT_INPUT_FEATURE_NAMES = tuple(
-    feature
-    for feature in MOVEMENT_INPUT_FEATURE_NAMES
-    if feature not in _PEDESTRIAN_INPUT_FEATURE_NAMES
-)
-# Crosswalk occupancy is vehicle-derived, but it exists to protect WALK
-# activation and overlaps the junction-count/blocking inputs. Excluding the
-# entire crosswalk group keeps this first experiment a deliberate sensor
-# ablation rather than retaining pedestrian-infrastructure state indirectly.
-_VEHICLE_ONLY_EXCLUDED_INPUT_PREFIXES = (
-    "waiting_pedestrian_count_",
-    "active_crossing_pedestrian_count_",
-    "crosswalk_vehicle_occupancy_count_",
-    "pedestrian_red_elapsed_",
-    "active_pedestrian_walk_",
-)
-VEHICLE_ONLY_INPUT_FEATURE_NAMES = tuple(
-    feature
-    for feature in MOVEMENT_INPUT_FEATURE_NAMES
-    if not feature.startswith(_VEHICLE_ONLY_EXCLUDED_INPUT_PREFIXES)
-)
-# Version 2 invalidates optimizer state scored with the pre-lock emergency
-# decoder. Mixing those anchors with the corrected controller would make
-# resumed global-best comparisons scientifically meaningless.
 MOVEMENT_OPTIMIZER_CHECKPOINT_VERSION = 2
 _INVALID_FITNESS = -1e300
-
-
-def migrate_legacy_movement_policy_weights(weights):
-    """Expand a format-2 63x10x12 genome into the 79x10x16 layout.
-
-    The original twelve outputs remain numerically identical: zero weights
-    are inserted for the new crosswalk inputs and four unused WALK neurons are
-    appended.  The returned policy must still be marked vehicle-only so those
-    placeholder WALK outputs do not enable network pedestrian control.
-    """
-    legacy_input_size = len(LEGACY_MOVEMENT_INPUT_FEATURE_NAMES)
-    hidden_size = MovementPolicy.hidden_size
-    legacy_output_size = len(MOVEMENT_NAMES)
-    legacy_genome_size = (
-        (legacy_input_size + 1) * hidden_size
-        + (hidden_size + 1) * legacy_output_size
-    )
-    if len(weights) != legacy_genome_size:
-        raise ValueError(f"expected {legacy_genome_size} legacy neural weights")
-
-    insertion_index = LEGACY_MOVEMENT_INPUT_FEATURE_NAMES.index(
-        "intersection_vehicle_count"
-    )
-    added_input_count = len(MOVEMENT_INPUT_FEATURE_NAMES) - legacy_input_size
-    migrated = []
-    cursor = 0
-    for _ in range(hidden_size):
-        incoming = list(weights[cursor : cursor + legacy_input_size])
-        cursor += legacy_input_size
-        migrated.extend(incoming[:insertion_index])
-        migrated.extend(0.0 for _ in range(added_input_count))
-        migrated.extend(incoming[insertion_index:])
-        migrated.append(weights[cursor])
-        cursor += 1
-
-    legacy_output_weights = (hidden_size + 1) * legacy_output_size
-    migrated.extend(weights[cursor : cursor + legacy_output_weights])
-    cursor += legacy_output_weights
-    migrated.extend(
-        0.0
-        for _ in range(
-            (hidden_size + 1) * len(PEDESTRIAN_OUTPUT_NAMES)
-        )
-    )
-    if cursor != len(weights) or len(migrated) != MovementPolicy.genome_size:
-        raise RuntimeError("legacy movement-policy migration produced a bad genome")
-    return migrated
-
-
-def project_vehicle_only_movement_policy_weights(
-    weights,
-    source_input_features,
-    source_output_names,
-):
-    """Project a compatible format-2/3 network into the compact format 4."""
-    source_input_features = tuple(source_input_features)
-    source_output_names = tuple(source_output_names)
-    missing_inputs = set(VEHICLE_ONLY_INPUT_FEATURE_NAMES).difference(
-        source_input_features
-    )
-    missing_outputs = set(MOVEMENT_NAMES).difference(source_output_names)
-    if missing_inputs or missing_outputs:
-        raise ValueError("source policy cannot be projected to vehicle-only")
-
-    hidden_size = MovementPolicy.hidden_size
-    expected_size = (
-        (len(source_input_features) + 1) * hidden_size
-        + (hidden_size + 1) * len(source_output_names)
-    )
-    if len(weights) != expected_size:
-        raise ValueError(f"expected {expected_size} source neural weights")
-
-    input_indices = {
-        feature: index for index, feature in enumerate(source_input_features)
-    }
-    projected = []
-    cursor = 0
-    for _ in range(hidden_size):
-        row = weights[cursor : cursor + len(source_input_features)]
-        cursor += len(source_input_features)
-        projected.extend(
-            row[input_indices[feature]]
-            for feature in VEHICLE_ONLY_INPUT_FEATURE_NAMES
-        )
-        projected.append(weights[cursor])
-        cursor += 1
-
-    output_row_size = hidden_size + 1
-    output_indices = {
-        output: index for index, output in enumerate(source_output_names)
-    }
-    output_weights = weights[cursor:]
-    for movement in MOVEMENT_NAMES:
-        start = output_indices[movement] * output_row_size
-        projected.extend(output_weights[start : start + output_row_size])
-
-    if len(projected) != VehicleMovementPolicy.genome_size:
-        raise RuntimeError("vehicle-only projection produced a bad genome")
-    return projected
 
 
 def _finite_fitness(value):
@@ -286,12 +131,11 @@ def _lists_to_tuples(value):
     return value
 
 
-class MovementPolicy:
-    """Fixed-topology network producing vehicle and pedestrian request scores."""
+class VehicleMovementPolicy:
+    """Fixed-topology network producing twelve vehicle-movement scores."""
 
-    control_scope = "vehicles_and_pedestrians"
     input_feature_names = MOVEMENT_INPUT_FEATURE_NAMES
-    output_names = POLICY_OUTPUT_NAMES
+    output_names = MOVEMENT_NAMES
     input_size = len(input_feature_names)
     hidden_size = 10
     output_size = len(output_names)
@@ -305,8 +149,6 @@ class MovementPolicy:
         weights,
         duration_bounds_s=(5.0, 30.0),
         max_red_duration_s=60.0,
-        *,
-        legacy_vehicle_only=False,
     ):
         if len(weights) != self.genome_size:
             raise ValueError(f"expected {self.genome_size} neural weights")
@@ -317,41 +159,11 @@ class MovementPolicy:
         self.minimum_duration_s = minimum
         self.maximum_duration_s = maximum
         self.max_red_duration_s = max(maximum, float(max_red_duration_s))
-        self.legacy_vehicle_only = bool(legacy_vehicle_only)
         self.decoder_config = {}
-        self.pedestrian_decoder_config = {}
-        initial_outputs = (
-            MOVEMENT_NAMES
-            if self.legacy_vehicle_only
-            else self.output_names
-        )
         self.last_output_scores = {
-            output: 0.5 for output in initial_outputs
+            output: 0.5 for output in self.output_names
         }
-        # Kept for callers written for the original vehicle-only policy. Each
-        # policy exposes its configured outputs here; migrated baselines expose
-        # only the original twelve so the controller retains automatic WALK
-        # timing.
         self.last_movement_scores = self.last_output_scores
-
-    @classmethod
-    def from_legacy_weights(
-        cls,
-        weights,
-        duration_bounds_s=(5.0, 30.0),
-        max_red_duration_s=60.0,
-    ):
-        """Load a format-2 policy without enabling pedestrian outputs."""
-        policy = cls(
-            migrate_legacy_movement_policy_weights(weights),
-            duration_bounds_s,
-            max_red_duration_s,
-            legacy_vehicle_only=True,
-        )
-        # Format 2 has vehicle outputs only. For reproducible new evaluations,
-        # treat its automatic WALK behavior as outside the policy scope.
-        policy.control_scope = "vehicles_only"
-        return policy
 
     @classmethod
     def random(cls, rng, duration_bounds_s, max_red_duration_s):
@@ -385,7 +197,7 @@ class MovementPolicy:
         return exponential / (1.0 + exponential)
 
     def predict_movement_scores(self, observation):
-        """Return independent configured-output desirabilities in [0, 1]."""
+        """Return independent movement desirabilities in [0, 1]."""
         inputs = self._build_inputs(observation)
         cursor = 0
         hidden = []
@@ -409,11 +221,6 @@ class MovementPolicy:
             total += self.weights[cursor]
             cursor += 1
             scores[output] = self._sigmoid(total)
-        if self.legacy_vehicle_only:
-            scores = {
-                movement: scores[movement]
-                for movement in MOVEMENT_NAMES
-            }
         self.last_output_scores = scores
         self.last_movement_scores = scores
         return scores.copy()
@@ -430,44 +237,7 @@ class MovementPolicy:
         red_elapsed = observation.get("red_elapsed_s", {})
         left_red_elapsed = observation.get("left_red_elapsed_s", {})
         right_red_elapsed = observation.get("right_red_elapsed_s", {})
-        waiting_pedestrians = observation.get("waiting_pedestrian_counts", {})
-        active_crossing_pedestrians = observation.get(
-            "active_crossing_pedestrian_counts",
-            {},
-        )
-        crosswalk_vehicle_occupancy = observation.get(
-            "crosswalk_vehicle_occupancy_counts",
-            {},
-        )
-        pedestrian_red_elapsed = observation.get(
-            "pedestrian_red_elapsed_s",
-            {},
-        )
-        active_pedestrian_walks = observation.get(
-            "active_pedestrian_walks",
-            {},
-        )
         active_movements = set(observation.get("active_movements", ()))
-
-        if isinstance(active_pedestrian_walks, Mapping):
-            def is_walk_active(value):
-                if isinstance(value, str):
-                    return value.lower() in ("green", "walk", "active", "on")
-                return bool(value)
-
-            pedestrian_walk_is_active = {
-                direction: is_walk_active(
-                    active_pedestrian_walks.get(direction, False)
-                )
-                for direction in DIRECTIONS
-            }
-        else:
-            active_walk_directions = set(active_pedestrian_walks or ())
-            pedestrian_walk_is_active = {
-                direction: direction in active_walk_directions
-                or f"{direction}_walk" in active_walk_directions
-                for direction in DIRECTIONS
-            }
 
         inputs = [min(20, vehicles.get(name, 0)) / 20.0 for name in DIRECTIONS]
         inputs.extend(min(20, queues.get(name, 0)) / 20.0 for name in DIRECTIONS)
@@ -492,33 +262,6 @@ class MovementPolicy:
             min(1.0, max(0.0, right_red_elapsed.get(name, 0.0) / self.max_red_duration_s))
             for name in DIRECTIONS
         )
-        inputs.extend(
-            min(10, waiting_pedestrians.get(name, 0)) / 10.0
-            for name in DIRECTIONS
-        )
-        inputs.extend(
-            min(10, active_crossing_pedestrians.get(name, 0)) / 10.0
-            for name in DIRECTIONS
-        )
-        inputs.extend(
-            min(5, crosswalk_vehicle_occupancy.get(name, 0)) / 5.0
-            for name in DIRECTIONS
-        )
-        inputs.extend(
-            min(
-                1.0,
-                max(
-                    0.0,
-                    pedestrian_red_elapsed.get(name, 0.0)
-                    / self.max_red_duration_s,
-                ),
-            )
-            for name in DIRECTIONS
-        )
-        inputs.extend(
-            1.0 if pedestrian_walk_is_active[name] else 0.0
-            for name in DIRECTIONS
-        )
         inputs.append(
             min(10, max(0, observation.get("intersection_vehicle_count", 0)))
             / 10.0
@@ -538,36 +281,12 @@ class MovementPolicy:
                 / self.maximum_duration_s,
             )
         )
-        if len(inputs) != len(MOVEMENT_INPUT_FEATURE_NAMES):
-            raise RuntimeError(
-                f"expected {len(MOVEMENT_INPUT_FEATURE_NAMES)} raw "
-                "movement-policy inputs"
-            )
-        input_values = dict(zip(MOVEMENT_INPUT_FEATURE_NAMES, inputs))
-        selected_inputs = [
-            input_values[feature]
-            for feature in self.input_feature_names
-        ]
-        if len(selected_inputs) != self.input_size:
+        if len(inputs) != self.input_size:
             raise RuntimeError(f"expected {self.input_size} movement-policy inputs")
-        return selected_inputs
+        return inputs
 
 
-class VehicleMovementPolicy(MovementPolicy):
-    """Compact vehicle-signal policy with no pedestrian observations/outputs."""
-
-    control_scope = "vehicles_only"
-    input_feature_names = VEHICLE_ONLY_INPUT_FEATURE_NAMES
-    output_names = MOVEMENT_NAMES
-    input_size = len(input_feature_names)
-    output_size = len(output_names)
-    genome_size = (
-        (input_size + 1) * MovementPolicy.hidden_size
-        + (MovementPolicy.hidden_size + 1) * output_size
-    )
-
-
-class MovementPolicyEvolution(SixPhasePolicyEvolution):
+class VehicleMovementPolicyEvolution(SixPhasePolicyEvolution):
     """Train movement policies with a legacy GA or a diagonal mirrored ES.
 
     The ES uses common scenario batches, promotes only the best screened
@@ -575,7 +294,7 @@ class MovementPolicyEvolution(SixPhasePolicyEvolution):
     selection.  The policy network and saved deployable model stay unchanged.
     """
 
-    policy_class = MovementPolicy
+    policy_class = VehicleMovementPolicy
 
     def __init__(
         self,
@@ -1321,9 +1040,3 @@ class MovementPolicyEvolution(SixPhasePolicyEvolution):
             self.random.setstate(_lists_to_tuples(checkpoint["random_state"]))
         except (KeyError, TypeError, ValueError) as error:
             raise ValueError("checkpoint contains an invalid random state") from error
-
-
-class VehicleMovementPolicyEvolution(MovementPolicyEvolution):
-    """Train the compact format-4 vehicle-only movement policy."""
-
-    policy_class = VehicleMovementPolicy

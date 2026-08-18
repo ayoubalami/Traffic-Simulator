@@ -2,7 +2,6 @@
   "format_version": 1,
   "policy_type": "fixed_time_movement",
   "name": "conventional_six_stage_vehicle_baseline_v1",
-  "control_scope": "vehicles_only",
   "stages": [
     {
       "name": "north_protected",

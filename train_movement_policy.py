@@ -11,34 +11,19 @@ os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 from config import (
     CAMERA_OBSERVATION_MODES,
     CONFIG,
-    MOVEMENT_CONTROL_SCOPES,
-    VEHICLES_AND_PEDESTRIANS_SCOPE,
-    VEHICLES_ONLY_SCOPE,
     apply_camera_observation_mode,
-    apply_movement_control_scope,
     build_runtime_config,
     camera_observation_mode,
-    movement_fitness_weights_for_scope,
 )
 from simulation import (
-    MovementPolicyEvolution,
     VehicleMovementPolicyEvolution,
     evaluate_movement_policy_across_seeds,
 )
 from simulation.movement_neuroevolution import (
-    LEGACY_MOVEMENT_INPUT_FEATURE_NAMES,
-    LEGACY_MOVEMENT_POLICY_FORMAT_VERSION,
     MOVEMENT_INPUT_FEATURE_NAMES,
     MOVEMENT_NAMES,
     MOVEMENT_POLICY_FORMAT_VERSION,
-    PEDESTRIAN_OUTPUT_NAMES,
-    POLICY_OUTPUT_NAMES,
-    VEHICLE_ONLY_INPUT_FEATURE_NAMES,
-    VEHICLE_ONLY_POLICY_FORMAT_VERSION,
-    MovementPolicy,
     VehicleMovementPolicy,
-    migrate_legacy_movement_policy_weights,
-    project_vehicle_only_movement_policy_weights,
     summarize_scenario_fitness,
 )
 
@@ -60,17 +45,7 @@ def parse_profile_names(value):
 def parse_arguments():
     parser = argparse.ArgumentParser(
         description=(
-            "Train independent multi-hot traffic-signal request scores for "
-            "the configured road-user scope."
-        ),
-    )
-    parser.add_argument(
-        "--control-scope",
-        choices=MOVEMENT_CONTROL_SCOPES,
-        default=None,
-        help=(
-            "road users controlled by the policy; default follows "
-            "road_users.pedestrians_enabled in config.py"
+            "Train a vehicle-only, multi-output traffic-signal policy."
         ),
     )
     parser.add_argument(
@@ -235,8 +210,8 @@ def parse_arguments():
     parser.add_argument(
         "--output",
         type=Path,
-        default=None,
-        help="model JSON path (default depends on --control-scope)",
+        default=Path("models/vehicle_movement_policy.json"),
+        help="model JSON path",
     )
     return parser.parse_args()
 
@@ -245,98 +220,22 @@ def load_warm_start_policy(
     path,
     duration_bounds_s,
     max_red_duration_s,
-    control_scope=VEHICLES_AND_PEDESTRIANS_SCOPE,
 ):
-    """Load or project a compatible policy for optimizer seeding."""
+    """Load a compatible vehicle-movement policy for optimizer seeding."""
     if not path.exists():
         raise FileNotFoundError(f"warm-start policy not found: {path}")
     data = json.loads(path.read_text(encoding="utf-8"))
-    format_version = data.get("format_version")
     if (
-        format_version
-        not in (
-            LEGACY_MOVEMENT_POLICY_FORMAT_VERSION,
-            MOVEMENT_POLICY_FORMAT_VERSION,
-            VEHICLE_ONLY_POLICY_FORMAT_VERSION,
-        )
+        data.get("format_version") != MOVEMENT_POLICY_FORMAT_VERSION
         or data.get("policy_type") != "movement_multi_hot"
         or tuple(data.get("movements", ())) != MOVEMENT_NAMES
     ):
         raise ValueError("warm-start file is not a compatible movement policy")
     network = data.get("network", {})
-
-    if format_version == LEGACY_MOVEMENT_POLICY_FORMAT_VERSION:
-        if (
-            network.get("input_size")
-            != len(LEGACY_MOVEMENT_INPUT_FEATURE_NAMES)
-            or tuple(network.get("input_features", ()))
-            != LEGACY_MOVEMENT_INPUT_FEATURE_NAMES
-            or network.get("hidden_size") != MovementPolicy.hidden_size
-            or network.get("output_size") != len(MOVEMENT_NAMES)
-        ):
-            raise ValueError(
-                "warm-start policy has an incompatible network schema"
-            )
-        if control_scope == VEHICLES_ONLY_SCOPE:
-            weights = project_vehicle_only_movement_policy_weights(
-                data.get("weights", ()),
-                LEGACY_MOVEMENT_INPUT_FEATURE_NAMES,
-                MOVEMENT_NAMES,
-            )
-            return VehicleMovementPolicy(
-                weights,
-                duration_bounds_s,
-                max_red_duration_s,
-            )
-        # Warm-starts seed the new 16-output search, so unlike deployment of
-        # a legacy baseline they must enable the appended WALK neurons. This
-        # keeps the evaluated champion identical to the saved format-3 model.
-        return MovementPolicy(
-            migrate_legacy_movement_policy_weights(
-                data.get("weights", ())
-            ),
-            duration_bounds_s,
-            max_red_duration_s,
-        )
-
-    if format_version == MOVEMENT_POLICY_FORMAT_VERSION:
-        if (
-            tuple(data.get("pedestrian_outputs", ()))
-            != PEDESTRIAN_OUTPUT_NAMES
-            or tuple(data.get("outputs", ())) != POLICY_OUTPUT_NAMES
-            or network.get("input_size") != MovementPolicy.input_size
-            or tuple(network.get("input_features", ()))
-            != MOVEMENT_INPUT_FEATURE_NAMES
-            or network.get("hidden_size") != MovementPolicy.hidden_size
-            or network.get("output_size") != MovementPolicy.output_size
-            or tuple(network.get("output_names", ())) != POLICY_OUTPUT_NAMES
-        ):
-            raise ValueError("warm-start policy has an incompatible network schema")
-        if control_scope == VEHICLES_ONLY_SCOPE:
-            weights = project_vehicle_only_movement_policy_weights(
-                data.get("weights", ()),
-                MOVEMENT_INPUT_FEATURE_NAMES,
-                POLICY_OUTPUT_NAMES,
-            )
-            return VehicleMovementPolicy(
-                weights,
-                duration_bounds_s,
-                max_red_duration_s,
-            )
-        return MovementPolicy(
-            data.get("weights", ()),
-            duration_bounds_s,
-            max_red_duration_s,
-        )
-
     if (
-        control_scope != VEHICLES_ONLY_SCOPE
-        or data.get("control_scope") != VEHICLES_ONLY_SCOPE
-        or tuple(data.get("pedestrian_outputs", ()))
-        or tuple(data.get("outputs", ())) != MOVEMENT_NAMES
-        or network.get("input_size") != VehicleMovementPolicy.input_size
+        network.get("input_size") != VehicleMovementPolicy.input_size
         or tuple(network.get("input_features", ()))
-        != VEHICLE_ONLY_INPUT_FEATURE_NAMES
+        != MOVEMENT_INPUT_FEATURE_NAMES
         or network.get("hidden_size") != VehicleMovementPolicy.hidden_size
         or network.get("output_size") != VehicleMovementPolicy.output_size
         or tuple(network.get("output_names", ())) != MOVEMENT_NAMES
@@ -463,62 +362,6 @@ def main():
     runtime_config = build_runtime_config(CONFIG)
     apply_camera_observation_mode(runtime_config, args.observation_mode)
     effective_observation_mode = camera_observation_mode(runtime_config)
-    configured_scope = (
-        VEHICLES_AND_PEDESTRIANS_SCOPE
-        if runtime_config.get("road_users", {}).get(
-            "pedestrians_enabled",
-            True,
-        )
-        else VEHICLES_ONLY_SCOPE
-    )
-    control_scope = args.control_scope or configured_scope
-    apply_movement_control_scope(runtime_config, control_scope)
-    vehicle_only = control_scope == VEHICLES_ONLY_SCOPE
-    if (
-        not vehicle_only
-        and int(
-            runtime_config.get("pedestrian_defaults", {}).get(
-                "max_active",
-                0,
-            )
-        )
-        <= 0
-    ):
-        raise SystemExit(
-            "vehicles_and_pedestrians training requires "
-            "pedestrian_defaults.max_active > 0 in config.py"
-        )
-    policy_class = VehicleMovementPolicy if vehicle_only else MovementPolicy
-    evolution_class = (
-        VehicleMovementPolicyEvolution
-        if vehicle_only
-        else MovementPolicyEvolution
-    )
-    format_version = (
-        VEHICLE_ONLY_POLICY_FORMAT_VERSION
-        if vehicle_only
-        else MOVEMENT_POLICY_FORMAT_VERSION
-    )
-    input_feature_names = (
-        VEHICLE_ONLY_INPUT_FEATURE_NAMES
-        if vehicle_only
-        else MOVEMENT_INPUT_FEATURE_NAMES
-    )
-    output_names = MOVEMENT_NAMES if vehicle_only else POLICY_OUTPUT_NAMES
-    pedestrian_output_names = () if vehicle_only else PEDESTRIAN_OUTPUT_NAMES
-    (
-        effective_fitness_weights,
-        effective_six_phase_fitness_weights,
-    ) = movement_fitness_weights_for_scope(
-        runtime_config,
-        control_scope,
-    )
-    if args.output is None:
-        args.output = Path(
-            "models/vehicle_movement_policy_v1.json"
-            if vehicle_only
-            else "models/movement_policy_v3.json"
-        )
     timing = runtime_config["traffic_lights"]
     timing["min_green_duration_s"] = args.minimum_green
     timing["max_green_duration_s"] = args.maximum_green
@@ -552,13 +395,12 @@ def main():
             args.warm_start,
             duration_bounds_s,
             timing.get("max_red_duration_s", 60.0),
-            control_scope,
         )
     checkpoint_path = args.checkpoint or args.resume
     if checkpoint_path is None:
         checkpoint_path = Path(f"{args.output}.checkpoint.json")
 
-    trainer = evolution_class(
+    trainer = VehicleMovementPolicyEvolution(
         runtime_config,
         duration_bounds_s=duration_bounds_s,
         population_size=args.population,
@@ -605,7 +447,6 @@ def main():
         "Training movement neural policy "
         f"({args.population} candidates, {args.generations} generations, "
         f"{len(traffic_profiles)} profiles, seeds={args.seeds}, "
-        f"scope={control_scope}, "
         f"observation={effective_observation_mode}, "
         f"optimizer={args.optimizer}, dt={args.timestep:g}s, "
         f"workers={trainer.workers})..."
@@ -656,37 +497,24 @@ def main():
         )
     output = {
         "fitness_version": 5,
-        "format_version": format_version,
+        "format_version": MOVEMENT_POLICY_FORMAT_VERSION,
         "policy_type": "movement_multi_hot",
-        "control_scope": control_scope,
-        "road_users": (
-            ["vehicles"]
-            if vehicle_only
-            else ["vehicles", "pedestrians"]
-        ),
+        "road_users": ["vehicles"],
         "movements": list(MOVEMENT_NAMES),
-        "pedestrian_outputs": list(pedestrian_output_names),
-        "outputs": list(output_names),
+        "outputs": list(MOVEMENT_NAMES),
         "network": {
-            "input_size": policy_class.input_size,
-            "input_features": list(input_feature_names),
-            "hidden_size": policy_class.hidden_size,
-            "output_size": policy_class.output_size,
-            "output_names": list(output_names),
+            "input_size": VehicleMovementPolicy.input_size,
+            "input_features": list(MOVEMENT_INPUT_FEATURE_NAMES),
+            "hidden_size": VehicleMovementPolicy.hidden_size,
+            "output_size": VehicleMovementPolicy.output_size,
+            "output_names": list(MOVEMENT_NAMES),
             "output_activation": "sigmoid",
         },
-        # Record the observation boundary used during optimization without
-        # forcing deployment to it; this supports full-state/FOV ablations.
         "observation_model": {
             "type": "camera_distance_from_stop_line",
             **dict(runtime_config.get("camera_observation", {})),
         },
         "decoder": dict(runtime_config.get("movement_controller", {})),
-        "pedestrian_decoder": (
-            {}
-            if vehicle_only
-            else dict(runtime_config.get("pedestrian_signals", {}))
-        ),
         "duration_bounds_s": duration_bounds_s,
         "max_red_duration_s": timing.get("max_red_duration_s", 60.0),
         "weights": best["policy"].weights,
@@ -709,11 +537,10 @@ def main():
             "validation_duration_s": validation_duration,
             "workers": trainer.workers,
             "training_time_s": result["training_time_s"],
-            "control_scope": control_scope,
             "observation_mode": effective_observation_mode,
-            "fitness_weights": effective_fitness_weights,
-            "six_phase_fitness_weights": (
-                effective_six_phase_fitness_weights
+            "fitness_weights": dict(runtime_config.get("fitness", {})),
+            "six_phase_fitness_weights": dict(
+                runtime_config.get("six_phase_fitness", {})
             ),
             "traffic_profiles": traffic_profiles,
             "random_seed": args.random_seed,
@@ -747,8 +574,6 @@ def main():
             "robustness_penalty": args.robustness_penalty,
             "completed_generations": len(result["history"]),
             "stopped_early": result.get("stopped_early", False),
-            # Full distribution vectors live in the resumable checkpoint;
-            # deployable model JSON only needs a compact diagnostic summary.
             "optimizer_summary": optimizer_summary,
         },
     }
